@@ -18,6 +18,9 @@ pub struct Bitmap {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
+    /// Size in CSS px when it differs from the pixel size (SVG is rendered
+    /// larger than its natural size so it stays sharp).
+    pub natural: Option<(f32, f32)>,
     /// Last scaled copy handed to paint, so a scrolled page does not
     /// resample a large photo every frame.
     scaled: Mutex<Option<(usize, usize, Arc<Vec<u8>>)>>,
@@ -34,7 +37,16 @@ pub type ImageMap = HashMap<String, Arc<Bitmap>>;
 
 impl Bitmap {
     fn new(width: usize, height: usize, rgba: Vec<u8>) -> Bitmap {
-        Bitmap { width, height, rgba, scaled: Mutex::new(None) }
+        Bitmap { width, height, rgba, natural: None, scaled: Mutex::new(None) }
+    }
+
+    pub fn from_premultiplied(width: usize, height: usize, rgba: Vec<u8>) -> Bitmap {
+        Bitmap::new(width, height, rgba)
+    }
+
+    /// Size for layout, in CSS px.
+    pub fn natural_size(&self) -> (f32, f32) {
+        self.natural.unwrap_or((self.width as f32, self.height as f32))
     }
 
     /// From straight (non-premultiplied) RGBA.
@@ -72,6 +84,8 @@ pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
         decode_jpeg(bytes)
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         decode_gif(bytes)
+    } else if crate::svg::sniff(bytes) {
+        crate::svg::decode(bytes)
     } else {
         None
     }
@@ -169,10 +183,29 @@ fn decode_gif(bytes: &[u8]) -> Option<Bitmap> {
 pub fn decode_data_uri(src: &str) -> Option<Bitmap> {
     let rest = src.trim().strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
-    if !meta.ends_with(";base64") {
-        return None;
+    if meta.ends_with(";base64") {
+        return decode(&base64(payload)?);
     }
-    decode(&base64(payload)?)
+    // URL-encoded text, the usual way to inline an SVG
+    decode(&percent_decode(payload))
+}
+
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 fn base64(input: &str) -> Option<Vec<u8>> {

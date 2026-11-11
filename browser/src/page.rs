@@ -70,8 +70,8 @@ pub fn load(
     }
 }
 
-/// How to fetch a page's images: the page's own chain and resolver, so an
-/// image request leaves exactly like the page request did.
+/// How to fetch a page's images and stylesheets: the page's own chain and
+/// resolver, so these requests leave exactly like the page request did.
 struct ImageFetch<'a> {
     chain: &'a Chain,
     resolver: Option<&'a Resolver>,
@@ -84,14 +84,12 @@ const IMAGE_PARALLEL: usize = 6;
 const IMAGE_BUDGET: Duration = Duration::from_secs(8);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// Requests not worth making: formats we cannot draw (SVG), and 1×1 images,
-/// which show nothing and exist to report that the page was viewed.
+/// Requests not worth making: 1×1 images, which show nothing and exist to
+/// report that the page was viewed.
 fn worth_fetching(node: &dom::Node, url: &Url) -> bool {
     let tiny = |name: &str| node.attr(name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).is_some_and(|v| v <= 1.0);
-    if tiny("width") && tiny("height") {
-        return false;
-    }
-    !url.path.to_ascii_lowercase().ends_with(".svg")
+    let _ = url;
+    !(tiny("width") && tiny("height"))
 }
 
 /// Decode every `<img src>` of the document. `data:` URIs are decoded in
@@ -173,9 +171,6 @@ fn finish(
     fetch: Option<ImageFetch>,
 ) -> Loaded {
     let document = dom::parse_document(&html);
-    let mut sheet = Stylesheet::default();
-    collect_styles(&document, &mut sheet);
-    let rules = sheet.rules.len() + extra_rules;
     let title = {
         let from_doc = Layout::title(&document);
         if from_doc.is_empty() {
@@ -184,17 +179,27 @@ fn finish(
             from_doc
         }
     };
-    let images = match &fetch {
+    // stylesheets and images come in parallel; layout needs both
+    let (mut sheet, images) = match &fetch {
         Some(how) => {
-            let (images, found, loaded) = fetch_images(&document, url, how);
+            let (sheet, external, (images, found, loaded)) = std::thread::scope(|scope| {
+                let images = scope.spawn(|| fetch_images(&document, url, how));
+                let (sheet, external) = load_styles(&document, url, Some(how));
+                (sheet, external, images.join().unwrap_or_else(|_| (ImageMap::new(), 0, 0)))
+            });
+            if external > 0 {
+                note = format!("{note} · css {external}");
+            }
             if found > 0 {
                 note = format!("{note} · images {loaded}/{found}");
             }
-            images
+            (sheet, images)
         }
-        None => ImageMap::new(),
+        None => (load_styles(&document, url, None).0, ImageMap::new()),
     };
-    let page = Layout::new(fonts, &sheet, width).with_images(&images).build(dom::body(&document));
+    sheet.viewport_width = width;
+    let rules = sheet.rules.len() + extra_rules;
+    let page = Layout::new(fonts, &sheet, width).with_images(&images).build(&document);
     Loaded {
         url: url.clone(),
         title,
@@ -205,14 +210,129 @@ fn finish(
     }
 }
 
+const MAX_STYLESHEETS: usize = 24;
+const MAX_CSS_BYTES: usize = 2 * 1024 * 1024;
+/// Stylesheets never hold a page back longer than this.
+const CSS_BUDGET: Duration = Duration::from_secs(8);
+
+/// Inline `<style>` only (no network): what tests and text pages use.
 pub fn collect_styles(document: &dom::Node, sheet: &mut Stylesheet) {
-    fn walk(node: &dom::Node, sheet: &mut Stylesheet) {
-        if node.tag == "style" {
-            sheet.rules.extend(Stylesheet::parse(&node.text_content()).rules);
+    if let Some(base) = Url::parse("http://localhost/") {
+        sheet.append(load_styles(document, &base, None).0);
+    }
+}
+
+/// Every stylesheet of the document in cascade order: `<style>` blocks and
+/// `<link rel=stylesheet>` files (and their `@import`s) where they appear.
+/// Files are fetched through the page's own path when `how` is given, six at
+/// a time within `CSS_BUDGET`; print-only sheets are skipped. Returns the
+/// combined sheet and how many external files were loaded.
+fn load_styles(document: &dom::Node, base: &Url, how: Option<&ImageFetch>) -> (Stylesheet, usize) {
+    enum Source {
+        Inline(String),
+        Link(Url),
+    }
+    fn print_only(media: Option<&str>) -> bool {
+        media.is_some_and(|m| {
+            let m = m.to_ascii_lowercase();
+            m.contains("print") && !m.contains("screen") && !m.contains("all")
+        })
+    }
+    fn walk(node: &dom::Node, base: &Url, out: &mut Vec<Source>) {
+        match node.tag.as_str() {
+            "style" if !print_only(node.attr("media")) => out.push(Source::Inline(node.text_content())),
+            "link" => {
+                let rel = node.attr("rel").unwrap_or("").to_ascii_lowercase();
+                let is_sheet = rel.split_whitespace().any(|r| r == "stylesheet") && !rel.contains("alternate");
+                if is_sheet && !print_only(node.attr("media")) {
+                    if let Some(url) = node.attr("href").and_then(|h| base.resolve(h)) {
+                        if matches!(url.scheme.as_str(), "http" | "https") {
+                            out.push(Source::Link(url));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         for child in &node.children {
-            walk(child, sheet);
+            walk(child, base, out);
         }
     }
-    walk(document, sheet);
+    let mut sources = Vec::new();
+    walk(document, base, &mut sources);
+
+    // fetch every linked file up front, in parallel
+    let links: Vec<&Url> = sources
+        .iter()
+        .filter_map(|s| match s {
+            Source::Link(u) => Some(u),
+            _ => None,
+        })
+        .take(MAX_STYLESHEETS)
+        .collect();
+    let started = Instant::now();
+    let mut fetched: Vec<(Url, String)> = Vec::new();
+    if let Some(how) = how {
+        for batch in links.chunks(IMAGE_PARALLEL) {
+            let left = CSS_BUDGET.saturating_sub(started.elapsed());
+            if left < Duration::from_millis(300) {
+                break;
+            }
+            let timeout = how.timeout.min(left);
+            let got: Vec<(Url, Option<String>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|url| scope.spawn(move || ((*url).clone(), fetch_css(url, how, timeout))))
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+            fetched.extend(got.into_iter().filter_map(|(u, css)| css.map(|c| (u, c))));
+        }
+    }
+
+    let mut sheet = Stylesheet::default();
+    let mut external = 0;
+    let mut imports_left = 8;
+    for source in &sources {
+        let (text, sheet_url) = match source {
+            Source::Inline(text) => (text.clone(), base.clone()),
+            Source::Link(url) => match fetched.iter().find(|(u, _)| u == url) {
+                Some((_, css)) => {
+                    external += 1;
+                    (css.clone(), url.clone())
+                }
+                None => continue,
+            },
+        };
+        let parsed = Stylesheet::parse(&text);
+        // @import comes before the rules of the sheet that imports it
+        if let Some(how) = how {
+            for import in &parsed.imports {
+                if imports_left == 0 || started.elapsed() > CSS_BUDGET {
+                    break;
+                }
+                imports_left -= 1;
+                let Some(url) = sheet_url.resolve(import) else { continue };
+                let left = CSS_BUDGET.saturating_sub(started.elapsed());
+                if let Some(css) = fetch_css(&url, how, how.timeout.min(left)) {
+                    external += 1;
+                    let mut imported = Stylesheet::parse(&css);
+                    imported.imports.clear();
+                    sheet.append(imported);
+                }
+            }
+        }
+        let mut parsed = parsed;
+        parsed.imports.clear();
+        sheet.append(parsed);
+    }
+    (sheet, external)
+}
+
+fn fetch_css(url: &Url, how: &ImageFetch, timeout: Duration) -> Option<String> {
+    let response = fetch_with(url, how.chain, how.resolver, timeout).ok()?;
+    if response.status >= 400 || response.body.len() > MAX_CSS_BYTES {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&response.body).into_owned())
 }

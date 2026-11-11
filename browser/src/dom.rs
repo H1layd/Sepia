@@ -131,6 +131,7 @@ pub fn parse_document(source: &str) -> Node {
 }
 
 /// Body content, or the whole document when there is no body element.
+#[allow(dead_code)] // kept for callers outside the engine
 pub fn body(document: &Node) -> &Node {
     document.find_first("body").unwrap_or(document)
 }

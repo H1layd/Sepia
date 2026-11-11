@@ -1,6 +1,9 @@
 //! Computed style: user-agent defaults, inheritance, the cascade, shorthand boxes.
 
-use crate::css::{parse_color, parse_declarations, Color, Declaration, Stylesheet};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use crate::css::{parse_color, parse_declarations, substitute_vars, Color, Declaration, Stylesheet};
 use crate::dom::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +18,67 @@ pub enum Display {
     Row,
     Cell,
     Flex,
+    Grid,
+    /// inline-level box with a block inside (inline-block, inline-flex, inline-grid, form controls)
+    InlineBlock,
+}
+
+/// How an inline-block lays out its own children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inner {
+    Flow,
+    Flex,
+    Grid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTransform {
+    None,
+    Upper,
+    Lower,
+    Capitalize,
+}
+
+/// Where a colour stop sits on the gradient line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StopAt {
+    Auto,
+    Px(f32),
+    Fraction(f32),
+}
+
+/// `linear-gradient()`: angle in degrees (180 = to bottom) and colour stops.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gradient {
+    pub angle: f32,
+    pub stops: Vec<(Color, StopAt)>,
+}
+
+/// An outer `box-shadow`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shadow {
+    pub dx: f32,
+    pub dy: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Color,
+}
+
+/// Grid placement of an item: `grid-column: span n` or `1 / -1`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridSpan {
+    Auto,
+    Span(usize),
+    /// spans every column of its row
+    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +128,8 @@ pub struct Flex {
     pub grow: f32,
     pub shrink: f32,
     pub basis: Option<f32>,
+    /// align-self on an item (None: the container's align-items)
+    pub align_self: Option<AlignItems>,
 }
 
 impl Default for Flex {
@@ -78,6 +144,7 @@ impl Default for Flex {
             grow: 0.0,
             shrink: 1.0,
             basis: None,
+            align_self: None,
         }
     }
 }
@@ -147,6 +214,35 @@ pub struct Style {
     pub valign: Option<VAlign>,
     pub border_collapse: bool,
     pub flex: Flex,
+    /// inner layout of an InlineBlock
+    pub inner: Inner,
+    /// per-side border widths and colours (top, right, bottom, left)
+    pub border: Edges,
+    pub border_colors: [Color; 4],
+    pub radius: f32,
+    pub gradient: Option<Gradient>,
+    pub shadow: Option<Shadow>,
+    pub min_height: Option<f32>,
+    pub min_width: Option<f32>,
+    /// box-sizing: border-box (width includes padding and border)
+    pub border_box: bool,
+    pub text_transform: TextTransform,
+    /// white-space: nowrap (inherited)
+    pub nowrap: bool,
+    /// visibility: hidden (inherited)
+    pub hidden: bool,
+    pub position: Position,
+    pub left: Option<f32>,
+    pub top: Option<f32>,
+    /// a transform that moves the box a whole box-length or more off its place
+    pub moved_away: bool,
+    /// grid-template-columns, resolved at layout (it needs the width)
+    pub grid_columns: Option<String>,
+    pub grid_span: GridSpan,
+    /// custom properties in scope (inherited), last definition wins
+    pub vars: Arc<Vec<(String, String)>>,
+    /// font-family asks for a monospace face (inherited)
+    pub monospace: bool,
 }
 
 impl Default for Style {
@@ -176,6 +272,26 @@ impl Default for Style {
             valign: None,
             border_collapse: false,
             flex: Flex::default(),
+            inner: Inner::Flow,
+            border: Edges::default(),
+            border_colors: [Color::BLACK; 4],
+            radius: 0.0,
+            gradient: None,
+            shadow: None,
+            min_height: None,
+            min_width: None,
+            border_box: false,
+            text_transform: TextTransform::None,
+            nowrap: false,
+            hidden: false,
+            position: Position::Static,
+            left: None,
+            top: None,
+            moved_away: false,
+            grid_columns: None,
+            grid_span: GridSpan::Auto,
+            vars: Arc::new(Vec::new()),
+            monospace: false,
         }
     }
 }
@@ -184,7 +300,11 @@ impl Default for Style {
 pub fn default_style(tag: &str) -> Style {
     let mut style = Style::default();
     match tag {
-        "html" | "body" | "div" | "section" | "article" | "header" | "footer" | "main"
+        "body" => {
+            style.display = Display::Block;
+            style.margin = Edges::all(8.0);
+        }
+        "html" | "div" | "section" | "article" | "header" | "footer" | "main"
         | "nav" | "aside" | "figure" | "figcaption" | "form" | "fieldset" | "address"
         | "blockquote" | "dl" | "dt" | "dd" | "caption" | "#document" => {
             style.display = Display::Block;
@@ -248,10 +368,14 @@ pub fn default_style(tag: &str) -> Style {
         "i" | "em" | "cite" | "var" => style.italic = true,
         "u" | "ins" => style.underline = true,
         "s" | "strike" | "del" => style.underline = true,
-        "code" | "kbd" | "samp" | "tt" => style.font_size = 14.0,
+        "code" | "kbd" | "samp" | "tt" => {
+            style.font_size = 14.0;
+            style.monospace = true;
+        }
         "pre" => {
             style.display = Display::Block;
             style.pre = true;
+            style.monospace = true;
             style.font_size = 14.0;
             style.margin = Edges { top: 13.0, right: 0.0, bottom: 13.0, left: 0.0 };
             style.background = Some(Color::rgb(245, 245, 245));
@@ -261,17 +385,26 @@ pub fn default_style(tag: &str) -> Style {
         "big" => style.font_size = 20.0,
         "hr" => {
             style.display = Display::Block;
-            style.border_width = 1.0;
-            style.border_color = Color::GRAY;
+            set_border(&mut style, 0, Some(1.0), Some(Color::rgb(200, 200, 200)));
             style.margin = Edges { top: 8.0, right: 0.0, bottom: 8.0, left: 0.0 };
         }
         "br" => style.display = Display::Inline,
         "input" | "button" | "select" | "textarea" => {
-            style.display = Display::Inline;
-            style.border_width = 1.0;
-            style.border_color = Color::GRAY;
-            style.background = Some(Color::WHITE);
-            style.padding = Edges { top: 2.0, right: 4.0, bottom: 2.0, left: 4.0 };
+            // form controls are inline-blocks with a frame, like every browser draws them
+            style.display = Display::InlineBlock;
+            for side in 0..4 {
+                set_border(&mut style, side, Some(1.0), Some(Color::rgb(118, 118, 118)));
+            }
+            style.radius = 3.0;
+            style.font_size = 13.3;
+            if tag == "button" {
+                style.background = Some(Color::rgb(239, 239, 239));
+                style.padding = Edges { top: 1.0, right: 6.0, bottom: 1.0, left: 6.0 };
+                style.align = Align::Center;
+            } else {
+                style.background = Some(Color::WHITE);
+                style.padding = Edges { top: 2.0, right: 3.0, bottom: 2.0, left: 3.0 };
+            }
         }
         "img" => style.display = Display::Inline,
         "head" | "style" | "script" | "title" | "meta" | "link" | "base" | "noscript" => {
@@ -283,10 +416,56 @@ pub fn default_style(tag: &str) -> Style {
 }
 
 /// Lengths: px, em, rem, % (of the containing width), and bare numbers as px.
+/// Viewport size in CSS px, for vw / vh (set by the layout).
+static VIEWPORT_W: AtomicU32 = AtomicU32::new(0x4480_0000); // 1024.0
+static VIEWPORT_H: AtomicU32 = AtomicU32::new(0x4448_0000); // 800.0
+
+pub fn set_viewport(width: f32, height: f32) {
+    VIEWPORT_W.store(width.to_bits(), Ordering::Relaxed);
+    VIEWPORT_H.store(height.to_bits(), Ordering::Relaxed);
+}
+
+/// Lengths: px, em, rem, %, vw/vh/vmin/vmax, pt, ch/ex, bare numbers as px,
+/// and calc() / min() / max() / clamp() over them.
 pub fn parse_length(value: &str, font_size: f32, percent_base: f32) -> Option<f32> {
     let value = value.trim().to_lowercase();
     if value == "0" {
         return Some(0.0);
+    }
+    for (prefix, kind) in [("calc(", 0), ("min(", 1), ("max(", 2), ("clamp(", 3), ("-webkit-calc(", 0)] {
+        if let Some(inner) = value.strip_prefix(prefix).and_then(|v| v.strip_suffix(')')) {
+            if kind == 0 {
+                return eval_calc(inner, font_size, percent_base);
+            }
+            let args: Vec<f32> = split_args(inner).iter().map(|a| parse_length(a, font_size, percent_base)).collect::<Option<Vec<f32>>>()?;
+            return match kind {
+                1 => args.into_iter().reduce(f32::min),
+                2 => args.into_iter().reduce(f32::max),
+                _ if args.len() == 3 => Some(args[1].clamp(args[0], args[2].max(args[0]))),
+                _ => None,
+            };
+        }
+    }
+    let vw = f32::from_bits(VIEWPORT_W.load(Ordering::Relaxed));
+    let vh = f32::from_bits(VIEWPORT_H.load(Ordering::Relaxed));
+    let unit = |suffix: &str| value.strip_suffix(suffix).and_then(|n| n.trim().parse::<f32>().ok());
+    if let Some(n) = unit("vw") {
+        return Some(n * vw / 100.0);
+    }
+    if let Some(n) = unit("vh").or_else(|| unit("dvh")).or_else(|| unit("svh")).or_else(|| unit("lvh")) {
+        return Some(n * vh / 100.0);
+    }
+    if let Some(n) = unit("vmin") {
+        return Some(n * vw.min(vh) / 100.0);
+    }
+    if let Some(n) = unit("vmax") {
+        return Some(n * vw.max(vh) / 100.0);
+    }
+    if let Some(n) = unit("pt") {
+        return Some(n * 4.0 / 3.0);
+    }
+    if let Some(n) = unit("ch").or_else(|| unit("ex")) {
+        return Some(n * font_size * 0.5);
     }
     if let Some(px) = value.strip_suffix("px") {
         return px.trim().parse().ok();
@@ -304,6 +483,119 @@ pub fn parse_length(value: &str, font_size: f32, percent_base: f32) -> Option<f3
         return Some(factor / 100.0 * percent_base);
     }
     value.parse().ok()
+}
+
+fn split_args(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    for c in inner.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    out.push(current);
+    out.into_iter().map(|a| a.trim().to_string()).collect()
+}
+
+/// calc(): + - * / and parentheses over lengths and plain numbers.
+fn eval_calc(expr: &str, font_size: f32, percent_base: f32) -> Option<f32> {
+    struct P<'a> {
+        s: &'a [u8],
+        i: usize,
+        font: f32,
+        base: f32,
+    }
+    impl P<'_> {
+        fn ws(&mut self) {
+            while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+        }
+        fn expr(&mut self) -> Option<f32> {
+            let mut v = self.term()?;
+            loop {
+                self.ws();
+                match self.s.get(self.i) {
+                    Some(b'+') => {
+                        self.i += 1;
+                        v += self.term()?;
+                    }
+                    Some(b'-') => {
+                        self.i += 1;
+                        v -= self.term()?;
+                    }
+                    _ => return Some(v),
+                }
+            }
+        }
+        fn term(&mut self) -> Option<f32> {
+            let mut v = self.factor()?;
+            loop {
+                self.ws();
+                match self.s.get(self.i) {
+                    Some(b'*') => {
+                        self.i += 1;
+                        v *= self.factor()?;
+                    }
+                    Some(b'/') => {
+                        self.i += 1;
+                        let d = self.factor()?;
+                        if d == 0.0 {
+                            return None;
+                        }
+                        v /= d;
+                    }
+                    _ => return Some(v),
+                }
+            }
+        }
+        fn factor(&mut self) -> Option<f32> {
+            self.ws();
+            if self.s.get(self.i) == Some(&b'(') {
+                self.i += 1;
+                let v = self.expr()?;
+                self.ws();
+                if self.s.get(self.i) == Some(&b')') {
+                    self.i += 1;
+                }
+                return Some(v);
+            }
+            // a nested function or a dimension token
+            let start = self.i;
+            let mut depth = 0;
+            while self.i < self.s.len() {
+                let c = self.s[self.i];
+                if c == b'(' {
+                    depth += 1;
+                } else if c == b')' {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                } else if depth == 0 && (c.is_ascii_whitespace() || c == b'*' || c == b'/' || ((c == b'+' || c == b'-') && self.i > start)) {
+                    break;
+                }
+                self.i += 1;
+            }
+            let token = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+            if let Ok(n) = token.parse::<f32>() {
+                return Some(n);
+            }
+            parse_length(token, self.font, self.base)
+        }
+    }
+    let mut p = P { s: expr.as_bytes(), i: 0, font: font_size, base: percent_base };
+    p.expr()
 }
 
 fn parse_four(value: &str, font_size: f32, percent_base: f32) -> Option<Edges> {
@@ -343,6 +635,11 @@ pub fn inherited(parent: &Style) -> Style {
     style.line_height = parent.line_height;
     style.letter_spacing = parent.letter_spacing;
     style.text_indent = parent.text_indent;
+    style.text_transform = parent.text_transform;
+    style.nowrap = parent.nowrap;
+    style.hidden = parent.hidden;
+    style.vars = parent.vars.clone();
+    style.monospace = parent.monospace;
     style.pre = parent.pre;
     style
 }
@@ -355,11 +652,14 @@ pub fn compute(
     containing_width: f32,
 ) -> Style {
     let mut style = default_style(&node.tag);
+    let parent_size = parent.map(|p| p.font_size).unwrap_or(16.0);
     if let Some(parent_style) = parent {
         let inherit = inherited(parent_style);
-        if style.font_size == 16.0 {
-            style.font_size = inherit.font_size;
-        }
+        // UA sizes are relative to the parent (h1 is 2em), not absolute
+        style.font_size = match ua_font_ratio(&node.tag) {
+            Some(ratio) => parent_size * ratio,
+            None => inherit.font_size,
+        };
         if !style.bold {
             style.bold = inherit.bold;
         }
@@ -371,6 +671,11 @@ pub fn compute(
         style.line_height = inherit.line_height;
         style.letter_spacing = inherit.letter_spacing;
         style.text_indent = inherit.text_indent;
+        style.text_transform = inherit.text_transform;
+        style.nowrap = inherit.nowrap;
+        style.hidden = inherit.hidden;
+        style.vars = inherit.vars.clone();
+        style.monospace = style.monospace || inherit.monospace;
         style.pre = style.pre || inherit.pre;
     }
 
@@ -380,8 +685,51 @@ pub fn compute(
     if let Some(inline) = node.attr("style") {
         declarations.extend(parse_declarations(inline));
     }
-    for declaration in declarations {
-        apply(&mut style, &declaration.name, &declaration.value, containing_width);
+    // custom properties first (they inherit), then everything else with var() resolved
+    let mut own_vars: Vec<(String, String)> = Vec::new();
+    for declaration in declarations.iter().filter(|d| d.name.starts_with("--")) {
+        own_vars.push((declaration.name.clone(), declaration.value.clone()));
+    }
+    if !own_vars.is_empty() {
+        let mut all = (*style.vars).clone();
+        for (name, value) in own_vars {
+            // a custom property may itself use var()
+            let value = substitute_vars(&value, &all).unwrap_or(value);
+            all.retain(|(k, _)| *k != name);
+            all.push((name, value));
+        }
+        style.vars = Arc::new(all);
+    }
+    for declaration in declarations.iter().filter(|d| !d.name.starts_with("--")) {
+        if let Some(value) = substitute_vars(&declaration.value, &style.vars) {
+            let keyword = value.trim().to_ascii_lowercase();
+            if keyword == "inherit" {
+                if let Some(p) = parent {
+                    inherit_property(&mut style, p, &declaration.name);
+                }
+                continue;
+            }
+            if keyword == "initial" || keyword == "unset" || keyword == "revert" {
+                continue;
+            }
+            if declaration.name == "font-size" {
+                // em and % in font-size are relative to the parent's size
+                if let Some(size) = font_size_value(&keyword, parent_size) {
+                    style.font_size = size.max(4.0);
+                }
+                continue;
+            }
+            apply(&mut style, &declaration.name, &value, containing_width);
+        }
+    }
+    if style.position == Position::Absolute || style.position == Position::Fixed {
+        // Out-of-flow boxes we cannot place: screen-reader-only text (1px,
+        // clipped) and skip links parked off-screen stay invisible.
+        let tiny = style.width.is_some_and(|w| w <= 1.0) || style.height.is_some_and(|h| h <= 1.0);
+        let offscreen = style.left.is_some_and(|l| l < -100.0) || style.top.is_some_and(|t| t < -100.0) || style.moved_away;
+        if tiny || offscreen {
+            style.display = Display::None;
+        }
     }
     style
 }
@@ -390,6 +738,9 @@ pub fn compute(
 /// them). They rank below any CSS, so they are applied first.
 fn presentational_hints(node: &Node, style: &mut Style, containing_width: f32) {
     let tag = node.tag.as_str();
+    if node.attr("hidden").is_some() {
+        style.display = Display::None;
+    }
     if tag == "th" {
         style.align = Align::Center; // not inherited from the row
     }
@@ -425,6 +776,239 @@ fn presentational_hints(node: &Node, style: &mut Style, containing_width: f32) {
     }
 }
 
+/// The user-agent font size of `tag` as a fraction of its parent's.
+fn ua_font_ratio(tag: &str) -> Option<f32> {
+    Some(match tag {
+        "h1" => 2.0,
+        "h2" => 1.5,
+        "h3" => 1.17,
+        "h5" => 0.83,
+        "h6" => 0.67,
+        "small" => 0.83,
+        "big" => 1.2,
+        "code" | "kbd" | "samp" | "tt" | "pre" => 0.875,
+        "sub" | "sup" => 0.83,
+        "input" | "button" | "select" | "textarea" => 0.833,
+        _ => return None,
+    })
+}
+
+/// A `font-size` value against the parent's size: lengths, %, em,
+/// keywords (small, larger…), and math.
+fn font_size_value(value: &str, parent: f32) -> Option<f32> {
+    let keyword = match value {
+        "xx-small" => Some(9.0),
+        "x-small" => Some(10.0),
+        "small" => Some(13.0),
+        "medium" => Some(16.0),
+        "large" => Some(18.0),
+        "x-large" => Some(24.0),
+        "xx-large" => Some(32.0),
+        "xxx-large" => Some(48.0),
+        "smaller" => Some(parent / 1.2),
+        "larger" => Some(parent * 1.2),
+        _ => None,
+    };
+    keyword.or_else(|| parse_length(value, parent, parent))
+}
+
+/// `property: inherit` (form controls use `font: inherit` to drop their UA font).
+fn inherit_property(style: &mut Style, parent: &Style, name: &str) {
+    match name {
+        "font" => {
+            style.font_size = parent.font_size;
+            style.bold = parent.bold;
+            style.italic = parent.italic;
+            style.line_height = parent.line_height;
+            style.monospace = parent.monospace;
+        }
+        "font-size" => style.font_size = parent.font_size,
+        "font-weight" => style.bold = parent.bold,
+        "font-style" => style.italic = parent.italic,
+        "font-family" => style.monospace = parent.monospace,
+        "line-height" => style.line_height = parent.line_height,
+        "color" => style.color = parent.color,
+        "text-align" => style.align = parent.align,
+        "background" | "background-color" => {
+            style.background = parent.background;
+            style.gradient = parent.gradient.clone();
+        }
+        _ => {}
+    }
+}
+
+/// Which sides a border property names: "border" -> all, "border-top" -> top…
+fn sides(name: &str) -> Vec<usize> {
+    match name {
+        "border-top" => vec![0],
+        "border-right" => vec![1],
+        "border-bottom" => vec![2],
+        "border-left" => vec![3],
+        _ => vec![0, 1, 2, 3],
+    }
+}
+
+fn set_border(style: &mut Style, side: usize, width: Option<f32>, color: Option<Color>) {
+    if let Some(w) = width {
+        match side {
+            0 => style.border.top = w,
+            1 => style.border.right = w,
+            2 => style.border.bottom = w,
+            _ => style.border.left = w,
+        }
+    }
+    if let Some(c) = color {
+        style.border_colors[side] = c;
+    }
+    // the uniform fields tables use: the widest side and the last colour
+    style.border_width = style.border.top.max(style.border.right).max(style.border.bottom).max(style.border.left);
+    if let Some(c) = color {
+        style.border_color = c;
+    }
+}
+
+/// Split on top-level whitespace, keeping function arguments together.
+fn split_space(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    for c in value.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn is_monospace(family: &str) -> bool {
+    let f = family.to_ascii_lowercase();
+    ["monospace", "mono", "courier", "consolas", "menlo", "monaco", "terminal"].iter().any(|m| f.contains(m))
+}
+
+/// Colour stops of a gradient's argument list (after the opening parenthesis).
+fn gradient_stops(args: &str) -> Vec<(Color, StopAt)> {
+    let inner = match args.rfind(')') {
+        Some(end) => &args[..end],
+        None => args,
+    };
+    let mut stops = Vec::new();
+    for arg in split_args(inner) {
+        let tokens = split_space(&arg);
+        let Some(color) = tokens.first().and_then(|t| parse_color(t)) else { continue };
+        let mut positions: Vec<StopAt> = tokens[1..]
+            .iter()
+            .filter_map(|t| {
+                if let Some(p) = t.strip_suffix('%') {
+                    p.parse::<f32>().ok().map(|v| StopAt::Fraction(v / 100.0))
+                } else {
+                    parse_length(t, 16.0, 0.0).map(StopAt::Px)
+                }
+            })
+            .collect();
+        if positions.is_empty() {
+            positions.push(StopAt::Auto);
+        }
+        for at in positions {
+            stops.push((color, at));
+        }
+    }
+    stops
+}
+
+/// `linear-gradient(...)` (also repeating-, drawn once) anywhere in a background value.
+pub fn parse_gradient(value: &str) -> Option<Gradient> {
+    let start = value.find("linear-gradient(")?;
+    let args = &value[start + "linear-gradient(".len()..];
+    // the gradient's own closing parenthesis
+    let mut depth = 1;
+    let mut end = args.len();
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let inner = &args[..end];
+    let parts = split_args(inner);
+    let first = parts.first()?.trim().to_ascii_lowercase();
+    let (angle, skip) = if let Some(deg) = first.strip_suffix("deg") {
+        (deg.trim().parse::<f32>().ok()?, 1)
+    } else if let Some(turn) = first.strip_suffix("turn") {
+        (turn.trim().parse::<f32>().ok()? * 360.0, 1)
+    } else if let Some(side) = first.strip_prefix("to ") {
+        let a = match side.trim() {
+            "top" => 0.0,
+            "right" => 90.0,
+            "bottom" => 180.0,
+            "left" => 270.0,
+            "top right" | "right top" => 45.0,
+            "bottom right" | "right bottom" => 135.0,
+            "bottom left" | "left bottom" => 225.0,
+            "top left" | "left top" => 315.0,
+            _ => 180.0,
+        };
+        (a, 1)
+    } else {
+        (180.0, 0)
+    };
+    let stops = gradient_stops(&(parts[skip..].join(",") + ")"));
+    (stops.len() >= 1).then_some(Gradient { angle, stops })
+}
+
+fn parse_shadow(value: &str, font_size: f32) -> Option<Shadow> {
+    if value == "none" {
+        return None;
+    }
+    for layer in split_args(value) {
+        let tokens = split_space(&layer);
+        if tokens.iter().any(|t| t == "inset") {
+            continue;
+        }
+        let mut lengths = Vec::new();
+        let mut color = Color::rgba(0, 0, 0, 64);
+        for t in &tokens {
+            if let Some(c) = parse_color(t) {
+                color = c;
+            } else if let Some(l) = parse_length(t, font_size, 0.0) {
+                lengths.push(l);
+            }
+        }
+        if lengths.len() >= 2 {
+            return Some(Shadow {
+                dx: lengths[0],
+                dy: lengths[1],
+                blur: lengths.get(2).copied().unwrap_or(0.0),
+                spread: lengths.get(3).copied().unwrap_or(0.0),
+                color,
+            });
+        }
+    }
+    None
+}
+
 fn parse_valign(value: &str) -> Option<VAlign> {
     match value {
         "top" | "text-top" | "baseline" => Some(VAlign::Top),
@@ -441,8 +1025,17 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "display" => {
             style.display = match value {
                 "none" => Display::None,
-                "flex" | "inline-flex" => Display::Flex,
-                "block" | "grid" | "inline-grid" => Display::Block,
+                "flex" => Display::Flex,
+                "grid" => Display::Grid,
+                "inline-block" | "inline-flex" | "inline-grid" | "inline-flow-root" => {
+                    style.inner = match value {
+                        "inline-flex" => Inner::Flex,
+                        "inline-grid" => Inner::Grid,
+                        _ => Inner::Flow,
+                    };
+                    Display::InlineBlock
+                }
+                "block" | "flow-root" | "contents" => Display::Block,
                 "table" | "inline-table" => Display::Table,
                 "table-row-group" | "table-header-group" | "table-footer-group" => Display::RowGroup,
                 "table-row" => Display::Row,
@@ -456,10 +1049,139 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.color = color;
             }
         }
-        "background-color" | "background" => {
-            if let Some(color) = parse_color(value) {
+        "background-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.background = Some(style.color);
+            } else if let Some(color) = parse_color(value) {
                 style.background = Some(color);
             }
+        }
+        "background" | "background-image" => {
+            // a gradient layer, and/or a colour; url() images are not drawn
+            if value == "none" || value == "transparent" {
+                if name == "background" {
+                    style.background = None;
+                }
+                style.gradient = None;
+                return;
+            }
+            if let Some(gradient) = parse_gradient(value) {
+                style.gradient = Some(gradient);
+            } else if name == "background-image" {
+                style.gradient = None;
+            }
+            if name == "background" {
+                // the colour is the last layer's token that parses as one
+                let color = split_space(value).iter().rev().find_map(|t| parse_color(t));
+                style.background = color;
+                if let Some(radial) = value.find("radial-gradient(") {
+                    // drawn as its first colour
+                    if style.background.is_none() {
+                        style.background = gradient_stops(&value[radial + 16..]).first().map(|(c, _)| *c);
+                    }
+                }
+            }
+        }
+        "font-family" => style.monospace = is_monospace(value),
+        "font" => {
+            // [style] [weight] size[/line-height] family
+            if value == "inherit" || value.starts_with("var(") {
+                return;
+            }
+            let tokens = split_space(value);
+            for (i, token) in tokens.iter().enumerate() {
+                let (size, line) = match token.split_once('/') {
+                    Some((s, l)) => (s, Some(l)),
+                    None => (token.as_str(), None),
+                };
+                let keyword_size = match size {
+                    "small" => Some(13.0),
+                    "medium" => Some(16.0),
+                    "large" => Some(18.0),
+                    "x-large" => Some(24.0),
+                    _ => None,
+                };
+                if let Some(px) = keyword_size.or_else(|| if size.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '.') { parse_length(size, font_size, font_size) } else { None }) {
+                    style.font_size = px.max(4.0);
+                    if let Some(line) = line {
+                        apply(style, "line-height", line, containing_width);
+                    }
+                    style.monospace = is_monospace(&tokens[i + 1..].join(" "));
+                    break;
+                }
+                match token.as_str() {
+                    "italic" | "oblique" => style.italic = true,
+                    "bold" | "bolder" => style.bold = true,
+                    "normal" => {}
+                    w if w.parse::<u32>().is_ok() => style.bold = w.parse::<u32>().unwrap_or(400) >= 600,
+                    _ => {}
+                }
+            }
+        }
+        "border-radius" => {
+            let first = split_space(value).into_iter().next().unwrap_or_default();
+            let first = first.split('/').next().unwrap_or("").trim().to_string();
+            style.radius = if first.ends_with('%') {
+                // 50% of an unknown box: as round as the box allows
+                if first.trim_end_matches('%').parse::<f32>().unwrap_or(0.0) >= 50.0 { 9999.0 } else { 6.0 }
+            } else {
+                parse_length(&first, font_size, containing_width).unwrap_or(0.0)
+            };
+        }
+        "box-shadow" => style.shadow = parse_shadow(value, font_size),
+        "min-height" => style.min_height = parse_length(value, font_size, containing_width),
+        "min-width" => style.min_width = parse_length(value, font_size, containing_width),
+        "box-sizing" => style.border_box = value == "border-box",
+        "text-transform" => {
+            style.text_transform = match value {
+                "uppercase" => TextTransform::Upper,
+                "lowercase" => TextTransform::Lower,
+                "capitalize" => TextTransform::Capitalize,
+                _ => TextTransform::None,
+            }
+        }
+        "visibility" => style.hidden = value == "hidden" || value == "collapse",
+        // fully transparent things (checkbox hacks, fade-in content before JS) are not drawn
+        "opacity" => {
+            if value.trim_end_matches('%').parse::<f32>().is_ok_and(|o| o <= 0.0) {
+                style.hidden = true;
+            }
+        }
+        "position" => {
+            style.position = match value {
+                "absolute" => Position::Absolute,
+                "fixed" => Position::Fixed,
+                "relative" | "sticky" | "-webkit-sticky" => Position::Relative,
+                _ => Position::Static,
+            }
+        }
+        "left" => style.left = parse_length(value, font_size, containing_width),
+        "transform" => {
+            // translate(-100%…) and friends park skip links and drawers off-screen
+            let v = value.replace(' ', "");
+            style.moved_away = ["translatey(-", "translatex(-", "translate(-", "translate(0,-", "translate3d(0,-", "translate3d(-"]
+                .iter()
+                .any(|p| {
+                    v.to_ascii_lowercase().find(p).is_some_and(|at| {
+                        let rest = &v[at + p.len()..];
+                        let number: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                        let n = number.parse::<f32>().unwrap_or(0.0);
+                        let unit = &rest[number.len()..];
+                        (unit.starts_with('%') && n >= 100.0) || (unit.starts_with("px") && n >= 500.0)
+                    })
+                });
+        }
+        "top" => style.top = parse_length(value, font_size, containing_width),
+        "grid-template-columns" => style.grid_columns = (value != "none").then(|| value.to_string()),
+        "grid-column" => {
+            let v = value.replace(' ', "");
+            style.grid_span = if v == "1/-1" || v.ends_with("/-1") && v.starts_with('1') {
+                GridSpan::Full
+            } else if let Some(n) = v.strip_prefix("span").and_then(|n| n.split('/').next().and_then(|n| n.parse::<usize>().ok())) {
+                GridSpan::Span(n.max(1))
+            } else {
+                GridSpan::Auto
+            };
         }
         "font-size" => {
             if let Some(size) = parse_length(value, font_size, font_size) {
@@ -469,7 +1191,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "font-weight" => {
             style.bold = match value {
                 "bold" | "bolder" => true,
-                "normal" => false,
+                "normal" | "lighter" => false,
                 other => other.parse::<u32>().map(|w| w >= 600).unwrap_or(style.bold),
             }
         }
@@ -499,6 +1221,15 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 "space-around" => Justify::SpaceAround,
                 "space-evenly" => Justify::SpaceEvenly,
                 _ => Justify::Start,
+            }
+        }
+        "align-self" => {
+            style.flex.align_self = match value {
+                "auto" | "normal" => None,
+                "flex-start" | "start" | "self-start" | "baseline" => Some(AlignItems::Start),
+                "flex-end" | "end" | "self-end" => Some(AlignItems::End),
+                "center" => Some(AlignItems::Center),
+                _ => Some(AlignItems::Stretch),
             }
         }
         "align-items" => {
@@ -617,23 +1348,62 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 }
             }
         }
-        "border" | "border-top" | "border-bottom" | "border-left" | "border-right" => {
-            for part in value.split_whitespace() {
-                if let Some(color) = parse_color(part) {
-                    style.border_color = color;
-                } else if let Some(width) = parse_length(part, font_size, containing_width) {
-                    style.border_width = width;
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            // width style colour, any order; without a visible style there is no border
+            let mut width = 3.0;
+            let mut visible = false;
+            let mut color = style.color;
+            for part in split_space(value) {
+                match part.as_str() {
+                    "none" | "hidden" => visible = false,
+                    "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => visible = true,
+                    "thin" => width = 1.0,
+                    "medium" => width = 3.0,
+                    "thick" => width = 5.0,
+                    p => {
+                        if let Some(c) = parse_color(p) {
+                            color = c;
+                        } else if p.eq_ignore_ascii_case("currentcolor") {
+                            color = style.color;
+                        } else if let Some(w) = parse_length(p, font_size, containing_width) {
+                            width = w;
+                            if w == 0.0 {
+                                visible = false;
+                            }
+                        }
+                    }
+                }
+            }
+            if value == "0" {
+                visible = false;
+            }
+            let w = if visible { width } else { 0.0 };
+            for side in sides(name) {
+                set_border(style, side, Some(w), Some(color));
+            }
+        }
+        "border-width" | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
+            if let Some(edges) = parse_four(value, font_size, containing_width) {
+                let widths = [edges.top, edges.right, edges.bottom, edges.left];
+                for side in sides(name.trim_end_matches("-width")) {
+                    set_border(style, side, Some(widths[side]), None);
                 }
             }
         }
-        "border-width" => {
-            if let Some(width) = parse_length(value, font_size, containing_width) {
-                style.border_width = width;
+        "border-color" | "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            let colors: Vec<Color> = split_space(value).iter().filter_map(|t| parse_color(t)).collect();
+            if !colors.is_empty() {
+                let at = |i: usize| colors[match colors.len() { 1 => 0, 2 => i % 2, 3 => [0, 1, 2, 1][i], _ => i.min(3) }];
+                for side in sides(name.trim_end_matches("-color")) {
+                    set_border(style, side, None, Some(at(side)));
+                }
             }
         }
-        "border-color" => {
-            if let Some(color) = parse_color(value) {
-                style.border_color = color;
+        "border-style" | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            if value == "none" || value == "hidden" {
+                for side in sides(name.trim_end_matches("-style")) {
+                    set_border(style, side, Some(0.0), None);
+                }
             }
         }
         "width" => style.width = parse_length(value, font_size, containing_width),
@@ -659,7 +1429,10 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "max-width" => style.max_width = if value == "none" { None } else { parse_length(value, font_size, containing_width) },
-        "white-space" => style.pre = value == "pre" || value == "pre-wrap",
+        "white-space" => {
+            style.pre = value == "pre" || value == "pre-wrap" || value == "break-spaces";
+            style.nowrap = value == "nowrap" || value == "pre";
+        }
         "list-style-type" => {
             style.marker = Some(match value {
                 "none" => "",

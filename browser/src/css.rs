@@ -16,6 +16,7 @@ impl Color {
     pub const WHITE: Color = Color::rgb(255, 255, 255);
     pub const BLUE: Color = Color::rgb(0, 0, 238);
     pub const GRAY: Color = Color::rgb(128, 128, 128);
+    #[allow(dead_code)]
     pub const LIGHT_GRAY: Color = Color::rgb(238, 238, 238);
 
     pub fn with_alpha(self, a: u8) -> Color {
@@ -27,166 +28,602 @@ impl Color {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Colours
+// ---------------------------------------------------------------------------
+
+/// CSS colours: #rgb #rgba #rrggbb #rrggbbaa, rgb()/rgba()/hsl()/hsla() in
+/// both the comma and the space/slash syntax, every named colour, transparent.
+/// `currentcolor` is resolved by the caller.
 pub fn parse_color(value: &str) -> Option<Color> {
-    let value = value.trim().to_lowercase();
+    let value = value.trim().to_ascii_lowercase();
     if let Some(hex) = value.strip_prefix('#') {
+        let digit = |s: &str| u8::from_str_radix(s, 16).ok();
+        let double = |c: &str| digit(&c.repeat(2));
         return match hex.len() {
-            3 => {
-                let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
-                let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
-                let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
-                Some(Color::rgb(r, g, b))
+            3 => Some(Color::rgb(double(&hex[0..1])?, double(&hex[1..2])?, double(&hex[2..3])?)),
+            4 => Some(Color::rgba(double(&hex[0..1])?, double(&hex[1..2])?, double(&hex[2..3])?, double(&hex[3..4])?)),
+            6 => Some(Color::rgb(digit(&hex[0..2])?, digit(&hex[2..4])?, digit(&hex[4..6])?)),
+            8 => Some(Color::rgba(digit(&hex[0..2])?, digit(&hex[2..4])?, digit(&hex[4..6])?, digit(&hex[6..8])?)),
+            _ => None,
+        };
+    }
+    if let Some((func, rest)) = value.split_once('(') {
+        let inner = rest.strip_suffix(')')?;
+        let parts: Vec<&str> = inner.split(|c: char| c == ',' || c == '/' || c.is_whitespace()).filter(|p| !p.is_empty()).collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let alpha = match parts.get(3) {
+            Some(a) => {
+                let v = if let Some(p) = a.strip_suffix('%') { p.parse::<f32>().ok()? / 100.0 } else { a.parse::<f32>().ok()? };
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
             }
-            6 => {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                Some(Color::rgb(r, g, b))
+            None => 255,
+        };
+        return match func.trim() {
+            "rgb" | "rgba" => {
+                let channel = |p: &str| -> Option<u8> {
+                    let v = if let Some(pct) = p.strip_suffix('%') { pct.parse::<f32>().ok()? * 2.55 } else { p.parse::<f32>().ok()? };
+                    Some(v.round().clamp(0.0, 255.0) as u8)
+                };
+                Some(Color::rgba(channel(parts[0])?, channel(parts[1])?, channel(parts[2])?, alpha))
             }
-            8 => {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
-                Some(Color { r, g, b, a })
+            "hsl" | "hsla" => {
+                let h = parts[0].trim_end_matches("deg").parse::<f32>().ok()?.rem_euclid(360.0);
+                let s = parts[1].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+                let l = parts[2].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+                let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+                let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+                let (r, g, b) = match (h / 60.0) as u32 {
+                    0 => (c, x, 0.0),
+                    1 => (x, c, 0.0),
+                    2 => (0.0, c, x),
+                    3 => (0.0, x, c),
+                    4 => (x, 0.0, c),
+                    _ => (c, 0.0, x),
+                };
+                let m = l - c / 2.0;
+                let to = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+                Some(Color::rgba(to(r), to(g), to(b), alpha))
             }
             _ => None,
         };
     }
-    if let Some(inner) = value.strip_prefix("rgb(").and_then(|v| v.strip_suffix(')')) {
-        let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
-        if parts.len() == 3 {
-            return Some(Color::rgb(
-                parts[0].parse().ok()?,
-                parts[1].parse().ok()?,
-                parts[2].parse().ok()?,
-            ));
-        }
+    if value == "transparent" {
+        return Some(Color::rgba(0, 0, 0, 0));
     }
-    match value.as_str() {
-        "black" => Some(Color::BLACK),
-        "white" => Some(Color::WHITE),
-        "red" => Some(Color::rgb(255, 0, 0)),
-        "green" => Some(Color::rgb(0, 128, 0)),
-        "blue" => Some(Color::BLUE),
-        "yellow" => Some(Color::rgb(255, 255, 0)),
-        "orange" => Some(Color::rgb(255, 165, 0)),
-        "purple" => Some(Color::rgb(128, 0, 128)),
-        "gray" | "grey" => Some(Color::GRAY),
-        "silver" => Some(Color::rgb(192, 192, 192)),
-        "lightgray" | "lightgrey" => Some(Color::LIGHT_GRAY),
-        "darkgray" | "darkgrey" => Some(Color::rgb(169, 169, 169)),
-        "navy" => Some(Color::rgb(0, 0, 128)),
-        "teal" => Some(Color::rgb(0, 128, 128)),
-        "maroon" => Some(Color::rgb(128, 0, 0)),
-        "olive" => Some(Color::rgb(128, 128, 0)),
-        "aqua" | "cyan" => Some(Color::rgb(0, 255, 255)),
-        "fuchsia" | "magenta" => Some(Color::rgb(255, 0, 255)),
-        "lime" => Some(Color::rgb(0, 255, 0)),
-        "transparent" => Some(Color { r: 0, g: 0, b: 0, a: 0 }),
-        _ => None,
-    }
+    NAMED.iter().find(|(name, _)| *name == value).map(|(_, rgb)| Color::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, *rgb as u8))
 }
+
+const NAMED: &[(&str, u32)] = &[
+    ("aliceblue", 0xf0f8ff), ("antiquewhite", 0xfaebd7), ("aqua", 0x00ffff), ("aquamarine", 0x7fffd4), ("azure", 0xf0ffff),
+    ("beige", 0xf5f5dc), ("bisque", 0xffe4c4), ("black", 0x000000), ("blanchedalmond", 0xffebcd), ("blue", 0x0000ff),
+    ("blueviolet", 0x8a2be2), ("brown", 0xa52a2a), ("burlywood", 0xdeb887), ("cadetblue", 0x5f9ea0), ("chartreuse", 0x7fff00),
+    ("chocolate", 0xd2691e), ("coral", 0xff7f50), ("cornflowerblue", 0x6495ed), ("cornsilk", 0xfff8dc), ("crimson", 0xdc143c),
+    ("cyan", 0x00ffff), ("darkblue", 0x00008b), ("darkcyan", 0x008b8b), ("darkgoldenrod", 0xb8860b), ("darkgray", 0xa9a9a9),
+    ("darkgreen", 0x006400), ("darkgrey", 0xa9a9a9), ("darkkhaki", 0xbdb76b), ("darkmagenta", 0x8b008b), ("darkolivegreen", 0x556b2f),
+    ("darkorange", 0xff8c00), ("darkorchid", 0x9932cc), ("darkred", 0x8b0000), ("darksalmon", 0xe9967a), ("darkseagreen", 0x8fbc8f),
+    ("darkslateblue", 0x483d8b), ("darkslategray", 0x2f4f4f), ("darkslategrey", 0x2f4f4f), ("darkturquoise", 0x00ced1), ("darkviolet", 0x9400d3),
+    ("deeppink", 0xff1493), ("deepskyblue", 0x00bfff), ("dimgray", 0x696969), ("dimgrey", 0x696969), ("dodgerblue", 0x1e90ff),
+    ("firebrick", 0xb22222), ("floralwhite", 0xfffaf0), ("forestgreen", 0x228b22), ("fuchsia", 0xff00ff), ("gainsboro", 0xdcdcdc),
+    ("ghostwhite", 0xf8f8ff), ("gold", 0xffd700), ("goldenrod", 0xdaa520), ("gray", 0x808080), ("green", 0x008000),
+    ("greenyellow", 0xadff2f), ("grey", 0x808080), ("honeydew", 0xf0fff0), ("hotpink", 0xff69b4), ("indianred", 0xcd5c5c),
+    ("indigo", 0x4b0082), ("ivory", 0xfffff0), ("khaki", 0xf0e68c), ("lavender", 0xe6e6fa), ("lavenderblush", 0xfff0f5),
+    ("lawngreen", 0x7cfc00), ("lemonchiffon", 0xfffacd), ("lightblue", 0xadd8e6), ("lightcoral", 0xf08080), ("lightcyan", 0xe0ffff),
+    ("lightgoldenrodyellow", 0xfafad2), ("lightgray", 0xd3d3d3), ("lightgreen", 0x90ee90), ("lightgrey", 0xd3d3d3), ("lightpink", 0xffb6c1),
+    ("lightsalmon", 0xffa07a), ("lightseagreen", 0x20b2aa), ("lightskyblue", 0x87cefa), ("lightslategray", 0x778899), ("lightslategrey", 0x778899),
+    ("lightsteelblue", 0xb0c4de), ("lightyellow", 0xffffe0), ("lime", 0x00ff00), ("limegreen", 0x32cd32), ("linen", 0xfaf0e6),
+    ("magenta", 0xff00ff), ("maroon", 0x800000), ("mediumaquamarine", 0x66cdaa), ("mediumblue", 0x0000cd), ("mediumorchid", 0xba55d3),
+    ("mediumpurple", 0x9370db), ("mediumseagreen", 0x3cb371), ("mediumslateblue", 0x7b68ee), ("mediumspringgreen", 0x00fa9a), ("mediumturquoise", 0x48d1cc),
+    ("mediumvioletred", 0xc71585), ("midnightblue", 0x191970), ("mintcream", 0xf5fffa), ("mistyrose", 0xffe4e1), ("moccasin", 0xffe4b5),
+    ("navajowhite", 0xffdead), ("navy", 0x000080), ("oldlace", 0xfdf5e6), ("olive", 0x808000), ("olivedrab", 0x6b8e23),
+    ("orange", 0xffa500), ("orangered", 0xff4500), ("orchid", 0xda70d6), ("palegoldenrod", 0xeee8aa), ("palegreen", 0x98fb98),
+    ("paleturquoise", 0xafeeee), ("palevioletred", 0xdb7093), ("papayawhip", 0xffefd5), ("peachpuff", 0xffdab9), ("peru", 0xcd853f),
+    ("pink", 0xffc0cb), ("plum", 0xdda0dd), ("powderblue", 0xb0e0e6), ("purple", 0x800080), ("rebeccapurple", 0x663399),
+    ("red", 0xff0000), ("rosybrown", 0xbc8f8f), ("royalblue", 0x4169e1), ("saddlebrown", 0x8b4513), ("salmon", 0xfa8072),
+    ("sandybrown", 0xf4a460), ("seagreen", 0x2e8b57), ("seashell", 0xfff5ee), ("sienna", 0xa0522d), ("silver", 0xc0c0c0),
+    ("skyblue", 0x87ceeb), ("slateblue", 0x6a5acd), ("slategray", 0x708090), ("slategrey", 0x708090), ("snow", 0xfffafa),
+    ("springgreen", 0x00ff7f), ("steelblue", 0x4682b4), ("tan", 0xd2b48c), ("teal", 0x008080), ("thistle", 0xd8bfd8),
+    ("tomato", 0xff6347), ("turquoise", 0x40e0d0), ("violet", 0xee82ee), ("wheat", 0xf5deb3), ("white", 0xffffff),
+    ("whitesmoke", 0xf5f5f5), ("yellow", 0xffff00), ("yellowgreen", 0x9acd32),
+];
+
+// ---------------------------------------------------------------------------
+// Rules and selectors
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Declaration {
     pub name: String,
     pub value: String,
+    pub important: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AttrOp {
+    Exists,
+    Equals,
+    /// ~= whitespace-separated list contains
+    Includes,
+    /// |= equals or starts with value-
+    Dash,
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttrSelector {
+    pub name: String,
+    pub op: AttrOp,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pseudo {
+    Root,
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    FirstOfType,
+    LastOfType,
+    Empty,
+    /// :nth-child(an+b); `last` counts from the end
+    Nth { a: i32, b: i32, last: bool, of_type: bool },
+    /// :not(list)
+    Not(Vec<Compound>),
+    /// :is / :where / :matches (list); `zero` = :where (no specificity)
+    Is(Vec<Compound>, bool),
+    /// :link / :any-link: an element with href
+    Link,
+    Disabled,
+    Enabled,
+    Checked,
+    /// interaction states and pseudo-elements: a static page never matches them
+    Never,
+}
+
+/// One compound selector: `div.card#main[href]:first-child`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Compound {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub classes: Vec<String>,
+    pub attrs: Vec<AttrSelector>,
+    pub pseudos: Vec<Pseudo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Combinator {
+    Descendant,
+    Child,
+    Adjacent,
+    Sibling,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Selector {
-    /// Descendant chain, outermost first: `div.card a` -> [div.card, a]
+    /// Compounds outermost first; `links[i]` joins `chain[i]` to `chain[i + 1]`.
     pub chain: Vec<Compound>,
+    pub links: Vec<Combinator>,
+}
+
+impl Compound {
+    fn specificity(&self) -> (u32, u32, u32) {
+        let mut s = (self.id.is_some() as u32, (self.classes.len() + self.attrs.len()) as u32, self.tag.is_some() as u32);
+        for pseudo in &self.pseudos {
+            match pseudo {
+                Pseudo::Not(list) | Pseudo::Is(list, false) => {
+                    let best = list.iter().map(|c| c.specificity()).max().unwrap_or((0, 0, 0));
+                    s = (s.0 + best.0, s.1 + best.1, s.2 + best.2);
+                }
+                Pseudo::Is(_, true) => {}
+                _ => s.1 += 1,
+            }
+        }
+        s
+    }
 }
 
 impl Selector {
     pub fn parse(text: &str) -> Option<Selector> {
-        let text = text.trim();
-        if text.is_empty() || text.starts_with('@') {
+        let mut chain = Vec::new();
+        let mut links = Vec::new();
+        let mut pending: Option<Combinator> = None;
+        for token in split_selector(text.trim())? {
+            match token.as_str() {
+                ">" => pending = Some(Combinator::Child),
+                "+" => pending = Some(Combinator::Adjacent),
+                "~" => pending = Some(Combinator::Sibling),
+                compound => {
+                    if !chain.is_empty() {
+                        links.push(pending.take().unwrap_or(Combinator::Descendant));
+                    } else if pending.is_some() {
+                        return None; // leading combinator
+                    }
+                    chain.push(parse_compound(compound)?);
+                }
+            }
+        }
+        if chain.is_empty() || pending.is_some() {
             return None;
         }
-        let mut chain = Vec::new();
-        for part in text.split_whitespace() {
-            if part.contains('>') || part.contains('+') || part.contains('[') || part.contains(':') {
-                // Combinators, attributes and pseudo classes are not supported;
-                // skip the whole rule rather than mis-style the page.
-                return None;
-            }
-            chain.push(parse_compound(part)?);
-        }
-        if chain.is_empty() {
-            None
-        } else {
-            Some(Selector { chain })
-        }
+        Some(Selector { chain, links })
     }
 
+    /// ids × 100 + classes/attributes/pseudo-classes × 10 + types.
     pub fn specificity(&self) -> u32 {
-        self.chain
-            .iter()
-            .map(|c| {
-                let mut score = 0;
-                if c.id.is_some() {
-                    score += 100;
-                }
-                score += 10 * c.classes.len() as u32;
-                if c.tag.is_some() {
-                    score += 1;
-                }
-                score
-            })
-            .sum()
+        let (a, b, c) = self.chain.iter().fold((0, 0, 0), |acc, part| {
+            let s = part.specificity();
+            (acc.0 + s.0, acc.1 + s.1, acc.2 + s.2)
+        });
+        a * 100 + b * 10 + c
     }
 }
 
-fn parse_compound(part: &str) -> Option<Compound> {
-    let mut tag = None;
-    let mut id = None;
-    let mut classes = Vec::new();
-    let mut token = String::new();
-    let mut mode = 't';
-    for ch in part.chars().chain(std::iter::once(' ')) {
+/// Split a complex selector into compounds and combinators, keeping
+/// brackets and parentheses whole.
+fn split_selector(text: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let flush = |current: &mut String, out: &mut Vec<String>| {
+        if !current.is_empty() {
+            out.push(std::mem::take(current));
+        }
+    };
+    for ch in text.chars() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
-            '.' | '#' => {
-                if !token.is_empty() {
-                    match mode {
-                        't' => tag = Some(token.clone()),
-                        '#' => id = Some(token.clone()),
-                        _ => classes.push(token.clone()),
-                    }
-                    token.clear();
-                }
-                mode = ch;
+            '"' | '\'' => {
+                quote = Some(ch);
+                current.push(ch);
             }
-            ' ' => {
-                if !token.is_empty() {
-                    match mode {
-                        't' => tag = Some(token.clone()),
-                        '#' => id = Some(token.clone()),
-                        _ => classes.push(token.clone()),
-                    }
-                    token.clear();
-                }
+            '(' | '[' => {
+                depth += 1;
+                current.push(ch);
             }
-            '*' => {}
-            other => token.push(other),
+            ')' | ']' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            '>' | '+' | '~' if depth == 0 => {
+                flush(&mut current, &mut out);
+                out.push(ch.to_string());
+            }
+            c if c.is_whitespace() && depth == 0 => flush(&mut current, &mut out),
+            c => current.push(c),
         }
     }
-    if tag.as_deref() == Some("*") {
-        tag = None;
+    flush(&mut current, &mut out);
+    (depth == 0).then_some(out)
+}
+
+fn split_top_level(text: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for ch in text.chars() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            c if c == sep && depth == 0 => out.push(std::mem::take(&mut current)),
+            c => current.push(c),
+        }
     }
-    if tag.is_none() && id.is_none() && classes.is_empty() {
-        None
+    out.push(current);
+    out
+}
+
+fn ident_end(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_' || chars[i] == '\\' || !chars[i].is_ascii()) {
+        if chars[i] == '\\' {
+            i += 1;
+        }
+        i += 1;
+    }
+    i.min(chars.len())
+}
+
+fn unescape(s: &str) -> String {
+    s.replace('\\', "")
+}
+
+fn parse_compound(text: &str) -> Option<Compound> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut compound = Compound::default();
+    let mut i = 0;
+    if i < chars.len() && chars[i] == '*' {
+        i += 1;
+    } else if i < chars.len() && (chars[i].is_alphabetic() || chars[i] == '_') {
+        let end = ident_end(&chars, i);
+        compound.tag = Some(chars[i..end].iter().collect::<String>().to_ascii_lowercase());
+        i = end;
+    }
+    while i < chars.len() {
+        match chars[i] {
+            '.' => {
+                let end = ident_end(&chars, i + 1);
+                if end == i + 1 {
+                    return None;
+                }
+                compound.classes.push(unescape(&chars[i + 1..end].iter().collect::<String>()));
+                i = end;
+            }
+            '#' => {
+                let end = ident_end(&chars, i + 1);
+                if end == i + 1 {
+                    return None;
+                }
+                compound.id = Some(unescape(&chars[i + 1..end].iter().collect::<String>()));
+                i = end;
+            }
+            '[' => {
+                let close = chars[i..].iter().position(|c| *c == ']')? + i;
+                let inner: String = chars[i + 1..close].iter().collect();
+                compound.attrs.push(parse_attr(&inner)?);
+                i = close + 1;
+            }
+            ':' => {
+                let element = i + 1 < chars.len() && chars[i + 1] == ':';
+                let start = if element { i + 2 } else { i + 1 };
+                let end = ident_end(&chars, start);
+                let name: String = chars[start..end].iter().collect::<String>().to_ascii_lowercase();
+                let mut arg = None;
+                i = end;
+                if i < chars.len() && chars[i] == '(' {
+                    let mut depth = 0;
+                    let mut j = i;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    arg = Some(chars[i + 1..j.min(chars.len())].iter().collect::<String>());
+                    i = j + 1;
+                }
+                // ::before, ::after, ::placeholder…: generated content we do not draw
+                if element || matches!(name.as_str(), "before" | "after" | "first-line" | "first-letter") {
+                    compound.pseudos.push(Pseudo::Never);
+                    continue;
+                }
+                compound.pseudos.push(parse_pseudo(&name, arg.as_deref())?);
+            }
+            _ => return None,
+        }
+    }
+    Some(compound)
+}
+
+fn parse_attr(inner: &str) -> Option<AttrSelector> {
+    let inner = inner.trim();
+    let ops = [("~=", AttrOp::Includes), ("|=", AttrOp::Dash), ("^=", AttrOp::Prefix), ("$=", AttrOp::Suffix), ("*=", AttrOp::Substring), ("=", AttrOp::Equals)];
+    for (token, op) in ops {
+        if let Some((name, value)) = inner.split_once(token) {
+            let value = value.trim().trim_end_matches(" i").trim_end_matches(" s").trim().trim_matches(|c| c == '"' || c == '\'');
+            return Some(AttrSelector { name: name.trim().to_ascii_lowercase(), op, value: value.to_string() });
+        }
+    }
+    Some(AttrSelector { name: inner.to_ascii_lowercase(), op: AttrOp::Exists, value: String::new() })
+}
+
+fn parse_nth(arg: &str) -> Option<(i32, i32)> {
+    let s: String = arg.split(" of ").next()?.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    match s.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    if let Some((a, b)) = s.split_once('n') {
+        let a = match a {
+            "" | "+" => 1,
+            "-" => -1,
+            v => v.parse().ok()?,
+        };
+        let b = if b.is_empty() { 0 } else { b.parse().ok()? };
+        Some((a, b))
     } else {
-        Some(Compound { tag, id, classes })
+        Some((0, s.parse().ok()?))
+    }
+}
+
+fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Pseudo> {
+    let list = |arg: Option<&str>| -> Option<Vec<Compound>> {
+        // selector lists of compounds; complex selectors inside are not supported
+        split_top_level(arg?, ',').iter().map(|s| parse_compound(s.trim())).collect()
+    };
+    Some(match name {
+        "root" => Pseudo::Root,
+        "first-child" => Pseudo::FirstChild,
+        "last-child" => Pseudo::LastChild,
+        "only-child" => Pseudo::OnlyChild,
+        "first-of-type" => Pseudo::FirstOfType,
+        "last-of-type" => Pseudo::LastOfType,
+        "empty" => Pseudo::Empty,
+        "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
+            let (a, b) = parse_nth(arg?)?;
+            Pseudo::Nth { a, b, last: name.contains("last"), of_type: name.ends_with("of-type") }
+        }
+        "not" => Pseudo::Not(list(arg)?),
+        "is" | "matches" | "any" | "-webkit-any" => Pseudo::Is(list(arg)?, false),
+        "where" => Pseudo::Is(list(arg)?, true),
+        "link" | "any-link" => Pseudo::Link,
+        "disabled" => Pseudo::Disabled,
+        "enabled" => Pseudo::Enabled,
+        "checked" => Pseudo::Checked,
+        // states a page without scripting or a pointer over it never shows
+        "hover" | "focus" | "focus-visible" | "focus-within" | "active" | "visited" | "target" | "placeholder-shown"
+        | "autofill" | "invalid" | "valid" | "required" | "optional" | "read-only" | "read-write" | "indeterminate"
+        | "has" | "lang" | "dir" | "defined" | "fullscreen" | "modal" | "popover-open" | "open" | "closed" | "scope" => Pseudo::Never,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stylesheets
+// ---------------------------------------------------------------------------
+
+/// A media condition, evaluated when matching (the viewport is known then).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Media {
+    All,
+    Never,
+    /// (min-width) / (max-width) pairs, all must hold
+    Width { min: Option<f32>, max: Option<f32> },
+    /// a comma list: any may hold
+    Any(Vec<Media>),
+    Both(Box<Media>, Box<Media>),
+}
+
+impl Media {
+    fn parse(text: &str) -> Media {
+        let text = text.trim().to_ascii_lowercase();
+        if text.is_empty() {
+            return Media::All;
+        }
+        let alternatives: Vec<Media> = split_top_level(&text, ',').iter().map(|q| Media::parse_one(q.trim())).collect();
+        if alternatives.len() == 1 {
+            alternatives.into_iter().next().unwrap_or(Media::All)
+        } else {
+            Media::Any(alternatives)
+        }
+    }
+
+    fn parse_one(query: &str) -> Media {
+        let (negate, query) = match query.strip_prefix("not ") {
+            Some(rest) => (true, rest),
+            None => (false, query.strip_prefix("only ").unwrap_or(query)),
+        };
+        let mut result = Media::All;
+        let mut min = None;
+        let mut max = None;
+        for part in query.split(" and ") {
+            let part = part.trim();
+            let feature = part.trim_start_matches('(').trim_end_matches(')');
+            if part == "screen" || part == "all" {
+                continue;
+            }
+            if part == "print" || part == "speech" {
+                result = Media::Never;
+                continue;
+            }
+            let (name, value) = match feature.split_once(':') {
+                Some((n, v)) => (n.trim(), v.trim()),
+                None => {
+                    // range syntax: (width <= 600px), (width >= 600px)
+                    if let Some((_, v)) = feature.split_once("<=").or_else(|| feature.split_once('<')) {
+                        if feature.trim_start().starts_with("width") {
+                            max = px_value(v.trim());
+                            continue;
+                        }
+                    }
+                    if let Some((_, v)) = feature.split_once(">=").or_else(|| feature.split_once('>')) {
+                        if feature.trim_start().starts_with("width") {
+                            min = px_value(v.trim());
+                            continue;
+                        }
+                    }
+                    if feature == "color" || feature == "hover" || feature == "pointer" {
+                        continue;
+                    }
+                    result = Media::Never;
+                    continue;
+                }
+            };
+            match name {
+                "min-width" => min = px_value(value),
+                "max-width" => max = px_value(value),
+                // a light screen, no motion preferences, a fine pointer, no hover
+                "prefers-color-scheme" if value != "light" => result = Media::Never,
+                "prefers-reduced-motion" | "prefers-contrast" | "orientation" | "pointer" | "any-pointer"
+                | "prefers-color-scheme" | "min-resolution" | "max-resolution" | "-webkit-min-device-pixel-ratio"
+                | "min-height" | "max-height" | "display-mode" | "forced-colors" | "scripting" => {
+                    if name == "scripting" && value != "none" {
+                        result = Media::Never;
+                    }
+                    if name == "forced-colors" && value == "active" {
+                        result = Media::Never;
+                    }
+                }
+                "hover" | "any-hover" if value == "hover" => result = Media::Never,
+                _ => {}
+            }
+        }
+        let width = Media::Width { min, max };
+        let combined = match result {
+            Media::Never => Media::Never,
+            _ => width,
+        };
+        if negate {
+            // `not` over a simple query: invert width ranges approximately
+            match combined {
+                Media::Never => Media::All,
+                Media::Width { min: None, max: None } => Media::Never,
+                Media::Width { min, max } => Media::Any(vec![
+                    Media::Width { min: None, max: min.map(|m| m - 0.01) },
+                    Media::Width { min: max.map(|m| m + 0.01), max: None },
+                ]),
+                other => other,
+            }
+        } else {
+            combined
+        }
+    }
+
+    pub fn matches(&self, width: f32) -> bool {
+        match self {
+            Media::All => true,
+            Media::Never => false,
+            Media::Width { min, max } => min.map_or(true, |m| width >= m) && max.map_or(true, |m| width <= m),
+            Media::Any(list) => list.iter().any(|m| m.matches(width)),
+            Media::Both(a, b) => a.matches(width) && b.matches(width),
+        }
+    }
+}
+
+fn px_value(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(v) = value.strip_suffix("px") {
+        v.trim().parse().ok()
+    } else if let Some(v) = value.strip_suffix("rem").or_else(|| value.strip_suffix("em")) {
+        v.trim().parse::<f32>().ok().map(|v| v * 16.0)
+    } else {
+        value.parse().ok()
     }
 }
 
@@ -194,120 +631,279 @@ fn parse_compound(part: &str) -> Option<Compound> {
 pub struct Rule {
     pub selector: Selector,
     pub declarations: Vec<Declaration>,
+    pub media: Media,
+    /// position in the cascade (later wins between equal specificity)
+    pub order: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// `@import` URLs, in order, for the loader to fetch
+    pub imports: Vec<String>,
+    /// width the `@media` queries are evaluated against
+    pub viewport_width: f32,
+}
+
+impl Default for Stylesheet {
+    fn default() -> Stylesheet {
+        Stylesheet { rules: Vec::new(), imports: Vec::new(), viewport_width: 1024.0 }
+    }
 }
 
 impl Stylesheet {
     pub fn parse(css: &str) -> Stylesheet {
         let mut sheet = Stylesheet::default();
-        let mut rest = strip_comments(css);
-        // Drop @media / @font-face blocks wholesale; keep their simple bodies out.
-        rest = strip_at_blocks(&rest);
-        let mut i = 0usize;
-        let chars: Vec<char> = rest.chars().collect();
+        let css = strip_comments(css);
+        sheet.parse_block(&css, &Media::All);
+        sheet
+    }
+
+    /// Append another sheet after this one (later in the cascade).
+    pub fn append(&mut self, other: Stylesheet) {
+        let base = self.rules.len();
+        for mut rule in other.rules {
+            rule.order += base;
+            self.rules.push(rule);
+        }
+        self.imports.extend(other.imports);
+    }
+
+    fn parse_block(&mut self, css: &str, media: &Media) {
+        let chars: Vec<char> = css.chars().collect();
+        let mut i = 0;
         while i < chars.len() {
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            let start = i;
-            while i < chars.len() && chars[i] != '{' {
+            while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ';' || chars[i] == '}') {
                 i += 1;
             }
             if i >= chars.len() {
                 break;
             }
-            let selector_text: String = chars[start..i].iter().collect();
-            i += 1;
-            let body_start = i;
-            let mut depth = 1;
-            while i < chars.len() && depth > 0 {
-                match chars[i] {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    _ => {}
+            // prelude up to `{` or a statement `;`
+            let start = i;
+            let mut quote: Option<char> = None;
+            let mut depth = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                if let Some(q) = quote {
+                    if c == q {
+                        quote = None;
+                    }
+                } else if c == '"' || c == '\'' {
+                    quote = Some(c);
+                } else if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                } else if depth == 0 && (c == '{' || (c == ';' && chars[start] == '@')) {
+                    break;
                 }
                 i += 1;
             }
-            let body: String = chars[body_start..i.saturating_sub(1)].iter().collect();
+            let prelude: String = chars[start..i.min(chars.len())].iter().collect();
+            let prelude = prelude.trim().to_string();
+            if i >= chars.len() {
+                break;
+            }
+            if chars[i] == ';' {
+                // statement at-rule: @import, @charset, @namespace, @layer a, b;
+                if let Some(rest) = prelude.strip_prefix("@import") {
+                    if matches!(media, Media::All) {
+                        if let Some(url) = import_url(rest) {
+                            self.imports.push(url);
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            // block: find its matching `}`
+            let body_start = i + 1;
+            let mut depth = 1;
+            let mut quote: Option<char> = None;
+            i += 1;
+            while i < chars.len() && depth > 0 {
+                let c = chars[i];
+                if let Some(q) = quote {
+                    if c == q {
+                        quote = None;
+                    }
+                } else if c == '"' || c == '\'' {
+                    quote = Some(c);
+                } else if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let body: String = chars[body_start..i.saturating_sub(1).max(body_start)].iter().collect();
+            if let Some(at) = prelude.strip_prefix('@') {
+                let (name, condition) = at.split_once(|c: char| c.is_whitespace() || c == '(').map(|(n, _)| (n, &at[n.len()..])).unwrap_or((at, ""));
+                match name.to_ascii_lowercase().as_str() {
+                    "media" => {
+                        let inner = Media::parse(condition);
+                        let combined = match media {
+                            Media::All => inner,
+                            outer => Media::Both(Box::new(outer.clone()), Box::new(inner)),
+                        };
+                        self.parse_block(&body, &combined);
+                    }
+                    // feature queries: we take the first branch, as most sites
+                    // write fallbacks outside and enhancements inside
+                    "supports" | "layer" | "container" | "document" | "-moz-document" | "scope" | "starting-style" => {
+                        if !condition.contains("not ") {
+                            self.parse_block(&body, media);
+                        }
+                    }
+                    // @font-face (fonts are local only), @keyframes, @page, @property…
+                    _ => {}
+                }
+                continue;
+            }
             let declarations = parse_declarations(&body);
-            for selector_text_part in selector_text.split(',') {
-                if let Some(selector) = Selector::parse(selector_text_part) {
-                    sheet.rules.push(Rule { selector, declarations: declarations.clone() });
+            if declarations.is_empty() {
+                continue;
+            }
+            for selector_text in split_top_level(&prelude, ',') {
+                if let Some(selector) = Selector::parse(&selector_text) {
+                    let order = self.rules.len();
+                    self.rules.push(Rule { selector, declarations: declarations.clone(), media: media.clone(), order });
                 }
             }
         }
-        sheet
     }
 
-    /// Declarations that apply to `node`, sorted by ascending specificity.
-    pub fn matching(
-        &self,
-        node: &crate::dom::Node,
-        ancestors: &[&crate::dom::Node],
-    ) -> Vec<Declaration> {
-        let mut matched: Vec<(u32, usize, Declaration)> = Vec::new();
-        for (order, rule) in self.rules.iter().enumerate() {
-            if matches_selector(&rule.selector, node, ancestors) {
-                let score = rule.selector.specificity();
-                for declaration in &rule.declarations {
-                    matched.push((score, order, declaration.clone()));
+    /// Declarations that apply to `node`, in cascade order: normal ones by
+    /// (specificity, source order), then `!important` ones the same way.
+    /// `ancestors` runs outermost first and ends with the parent.
+    pub fn matching(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> Vec<Declaration> {
+        let mut hits: Vec<(u32, usize, &Rule)> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.media.matches(self.viewport_width) && matches_selector(&rule.selector, node, ancestors))
+            .map(|rule| (rule.selector.specificity(), rule.order, rule))
+            .collect();
+        hits.sort_by_key(|(spec, order, _)| (*spec, *order));
+        let mut normal = Vec::new();
+        let mut important = Vec::new();
+        for (_, _, rule) in hits {
+            for d in &rule.declarations {
+                if d.important {
+                    important.push(d.clone());
+                } else {
+                    normal.push(d.clone());
                 }
             }
         }
-        matched.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        matched.into_iter().map(|(_, _, d)| d).collect()
+        normal.extend(important);
+        normal
     }
+}
+
+fn import_url(rest: &str) -> Option<String> {
+    let rest = rest.trim();
+    let target = rest.strip_prefix("url(").map(|r| r.split(')').next().unwrap_or("")).unwrap_or_else(|| rest.split_whitespace().next().unwrap_or(""));
+    let url = target.trim().trim_matches(|c| c == '"' || c == '\'');
+    // an @import with a media list only applies under it: skip conditional ones
+    let after = rest.split_once(')').map(|(_, a)| a).unwrap_or_else(|| rest.split_once(char::is_whitespace).map(|(_, a)| a).unwrap_or(""));
+    if !after.trim().is_empty() && !after.trim().starts_with("layer") && !after.contains("screen") && !after.contains("all") {
+        return None;
+    }
+    (!url.is_empty()).then(|| url.to_string())
 }
 
 pub fn parse_declarations(body: &str) -> Vec<Declaration> {
     let mut out = Vec::new();
-    for part in body.split(';') {
+    for part in split_top_level(body, ';') {
         if let Some((name, value)) = part.split_once(':') {
-            let name = name.trim().to_lowercase();
-            let value = value.trim().to_string();
-            if !name.is_empty() && !value.is_empty() {
-                out.push(Declaration { name, value });
+            let name = name.trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                continue;
             }
+            let mut value = value.trim().to_string();
+            let mut important = false;
+            if let Some(pos) = value.to_ascii_lowercase().rfind("!important") {
+                value.truncate(pos);
+                value = value.trim().to_string();
+                important = true;
+            }
+            if value.is_empty() {
+                continue;
+            }
+            // custom properties keep their case; everything else is case-insensitive
+            let name = if name.starts_with("--") { name.to_string() } else { name.to_ascii_lowercase() };
+            out.push(Declaration { name, value, important });
         }
     }
     out
 }
 
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
 fn matches_selector(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
-    if node.is_text() {
-        return false;
-    }
-    let Some(last) = selector.chain.last() else {
-        return false;
-    };
-    if !compound_matches(last, node) {
-        return false;
-    }
-    match_prefix(&selector.chain[..selector.chain.len() - 1], ancestors)
+    let last = selector.chain.len() - 1;
+    match_from(selector, last, node, ancestors)
 }
 
-/// A descendant chain matches if each compound has some ancestor, in order.
-fn match_prefix(chain: &[Compound], ancestors: &[&crate::dom::Node]) -> bool {
-    let Some(target) = chain.last() else {
+/// Does `selector.chain[..=index]` match with `chain[index]` on `node`?
+fn match_from(selector: &Selector, index: usize, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
+    if !compound_matches(&selector.chain[index], node, ancestors) {
+        return false;
+    }
+    if index == 0 {
         return true;
-    };
-    for index in (0..ancestors.len()).rev() {
-        if compound_matches(target, ancestors[index])
-            && match_prefix(&chain[..chain.len() - 1], &ancestors[..index])
-        {
-            return true;
+    }
+    match selector.links[index - 1] {
+        Combinator::Descendant => (0..ancestors.len()).rev().any(|i| match_from(selector, index - 1, ancestors[i], &ancestors[..i])),
+        Combinator::Child => match ancestors.split_last() {
+            Some((parent, rest)) => match_from(selector, index - 1, parent, rest),
+            None => false,
+        },
+        Combinator::Adjacent => previous_elements(node, ancestors).first().is_some_and(|prev| match_from(selector, index - 1, prev, ancestors)),
+        Combinator::Sibling => previous_elements(node, ancestors).iter().any(|prev| match_from(selector, index - 1, prev, ancestors)),
+    }
+}
+
+/// Element siblings before `node`, nearest first.
+fn previous_elements<'n>(node: &crate::dom::Node, ancestors: &[&'n crate::dom::Node]) -> Vec<&'n crate::dom::Node> {
+    let Some(parent) = ancestors.last() else { return Vec::new() };
+    let mut out = Vec::new();
+    for child in &parent.children {
+        if std::ptr::eq(child, node) {
+            out.reverse();
+            return out;
+        }
+        if child.text.is_none() {
+            out.push(child);
         }
     }
-    false
+    Vec::new()
 }
 
-fn compound_matches(compound: &Compound, node: &crate::dom::Node) -> bool {
+/// (position, count) of `node` among its parent's element children (1-based),
+/// optionally counting only same-tag siblings.
+fn position(node: &crate::dom::Node, ancestors: &[&crate::dom::Node], of_type: bool) -> Option<(usize, usize)> {
+    let parent = ancestors.last()?;
+    let mut index = None;
+    let mut count = 0;
+    for child in parent.children.iter().filter(|c| c.text.is_none() && (!of_type || c.tag == node.tag)) {
+        count += 1;
+        if std::ptr::eq(child, node) {
+            index = Some(count);
+        }
+    }
+    index.map(|i| (i, count))
+}
+
+fn compound_matches(compound: &Compound, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
+    if node.text.is_some() {
+        return false;
+    }
     if let Some(tag) = &compound.tag {
-        if &node.tag != tag {
+        if !node.tag.eq_ignore_ascii_case(tag) {
             return false;
         }
     }
@@ -316,67 +912,125 @@ fn compound_matches(compound: &Compound, node: &crate::dom::Node) -> bool {
             return false;
         }
     }
-    for class in &compound.classes {
+    if !compound.classes.is_empty() {
         let classes = node.attr("class").unwrap_or("");
-        if !classes.split_whitespace().any(|c| c == class) {
+        if !compound.classes.iter().all(|c| classes.split_whitespace().any(|have| have == c)) {
+            return false;
+        }
+    }
+    for attr in &compound.attrs {
+        let Some(value) = node.attr(&attr.name) else { return false };
+        let want = attr.value.as_str();
+        let ok = match attr.op {
+            AttrOp::Exists => true,
+            AttrOp::Equals => value == want,
+            AttrOp::Includes => value.split_whitespace().any(|v| v == want),
+            AttrOp::Dash => value == want || value.starts_with(&format!("{want}-")),
+            AttrOp::Prefix => !want.is_empty() && value.starts_with(want),
+            AttrOp::Suffix => !want.is_empty() && value.ends_with(want),
+            AttrOp::Substring => !want.is_empty() && value.contains(want),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    for pseudo in &compound.pseudos {
+        let ok = match pseudo {
+            Pseudo::Never => false,
+            Pseudo::Root => node.tag == "html",
+            Pseudo::FirstChild => position(node, ancestors, false).is_some_and(|(i, _)| i == 1),
+            Pseudo::LastChild => position(node, ancestors, false).is_some_and(|(i, n)| i == n),
+            Pseudo::OnlyChild => position(node, ancestors, false).is_some_and(|(_, n)| n == 1),
+            Pseudo::FirstOfType => position(node, ancestors, true).is_some_and(|(i, _)| i == 1),
+            Pseudo::LastOfType => position(node, ancestors, true).is_some_and(|(i, n)| i == n),
+            Pseudo::Empty => node.children.iter().all(|c| c.text.as_ref().is_some_and(|t| t.is_empty())),
+            Pseudo::Nth { a, b, last, of_type } => position(node, ancestors, *of_type).is_some_and(|(i, n)| {
+                let k = if *last { (n - i + 1) as i32 } else { i as i32 };
+                if *a == 0 {
+                    k == *b
+                } else {
+                    (k - b) % a == 0 && (k - b) / a >= 0
+                }
+            }),
+            Pseudo::Not(list) => !list.iter().any(|c| compound_matches(c, node, ancestors)),
+            Pseudo::Is(list, _) => list.iter().any(|c| compound_matches(c, node, ancestors)),
+            Pseudo::Link => matches!(node.tag.as_str(), "a" | "area") && node.attr("href").is_some(),
+            Pseudo::Disabled => node.attr("disabled").is_some(),
+            Pseudo::Enabled => matches!(node.tag.as_str(), "button" | "input" | "select" | "textarea") && node.attr("disabled").is_none(),
+            Pseudo::Checked => node.attr("checked").is_some() || node.attr("selected").is_some(),
+        };
+        if !ok {
             return false;
         }
     }
     true
 }
 
-fn strip_comments(css: &str) -> String {
-    let mut out = String::with_capacity(css.len());
-    let chars: Vec<char> = css.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i = (i + 2).min(chars.len());
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1;
+// ---------------------------------------------------------------------------
+// Custom properties
+// ---------------------------------------------------------------------------
+
+/// Replace every `var(--name, fallback)` in `value` from `vars` (last
+/// definition wins). Unresolvable references with no fallback make the
+/// whole value invalid (None), as in CSS.
+pub fn substitute_vars(value: &str, vars: &[(String, String)]) -> Option<String> {
+    if !value.contains("var(") {
+        return Some(value.to_string());
     }
-    out
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut guard = 0;
+    while let Some(start) = rest.find("var(") {
+        guard += 1;
+        if guard > 64 {
+            return None;
+        }
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        // matching parenthesis
+        let mut depth = 1;
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let inner = &after[..end];
+        let (name, fallback) = match inner.split_once(',') {
+            Some((n, f)) => (n.trim(), Some(f.trim())),
+            None => (inner.trim(), None),
+        };
+        let resolved = vars.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+        match resolved.or(fallback) {
+            Some(v) => out.push_str(&substitute_vars(v, vars)?),
+            None => return None,
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
-fn strip_at_blocks(css: &str) -> String {
-    let chars: Vec<char> = css.chars().collect();
+fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '@' {
-            while i < chars.len() && chars[i] != '{' && chars[i] != ';' {
-                i += 1;
-            }
-            if i < chars.len() && chars[i] == ';' {
-                i += 1;
-                continue;
-            }
-            let mut depth = 0;
-            while i < chars.len() {
-                match chars[i] {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-            continue;
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => return out,
         }
-        out.push(chars[i]);
-        i += 1;
     }
+    out.push_str(rest);
     out
 }
 
@@ -385,59 +1039,106 @@ mod tests {
     use super::*;
     use crate::dom::parse_document;
 
+    fn values(sheet: &Stylesheet, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> Vec<String> {
+        sheet.matching(node, ancestors).into_iter().map(|d| d.value).collect()
+    }
+
     #[test]
     fn parses_rules_and_declarations() {
-        let sheet = Stylesheet::parse(
-            "body { color: red; margin: 0 } .note, #main { background-color: #eee }",
-        );
+        let sheet = Stylesheet::parse("body { color: red; margin: 0 } .note, #main { background-color: #eee }");
         assert_eq!(sheet.rules.len(), 3);
         assert_eq!(sheet.rules[0].declarations[0].name, "color");
         assert_eq!(sheet.rules[0].declarations[0].value, "red");
     }
 
     #[test]
-    fn skips_unsupported_selectors_and_at_blocks() {
-        let sheet = Stylesheet::parse(
-            "@media screen { body { color: blue } } a:hover { color: red } a[href] { color: red } \
-             p { color: green }",
+    fn media_queries_follow_the_viewport() {
+        let mut sheet = Stylesheet::parse(
+            "p { color: black } @media (max-width: 600px) { p { color: red } } @media print { p { color: green } } \
+             @media screen and (min-width: 900px) { p { color: blue } }",
         );
-        assert_eq!(sheet.rules.len(), 1);
-        assert_eq!(sheet.rules[0].selector.chain[0].tag.as_deref(), Some("p"));
+        let doc = parse_document("<p>t</p>");
+        let p = doc.find_first("p").unwrap();
+        sheet.viewport_width = 500.0;
+        assert_eq!(values(&sheet, p, &[&doc]).last().unwrap(), "red");
+        sheet.viewport_width = 1000.0;
+        assert_eq!(values(&sheet, p, &[&doc]).last().unwrap(), "blue");
+        assert!(!values(&sheet, p, &[&doc]).contains(&"green".to_string()), "print never applies");
     }
 
     #[test]
-    fn specificity_ordering() {
-        let sheet = Stylesheet::parse("p { color: red } .note { color: blue } #x { color: green }");
+    fn specificity_order_and_important() {
+        let sheet = Stylesheet::parse("p { color: red } .note { color: blue } #x { color: green } p { color: pink !important }");
         let doc = parse_document(r#"<p id="x" class="note">t</p>"#);
         let node = doc.find_first("p").unwrap();
-        let declarations = sheet.matching(node, &[&doc]);
-        assert_eq!(declarations.last().unwrap().value, "green");
-        assert_eq!(
-            sheet.rules[0].selector.specificity(),
-            1,
-            "tag selector specificity"
-        );
+        assert_eq!(values(&sheet, node, &[&doc]).last().unwrap(), "pink");
+        assert_eq!(sheet.rules[0].selector.specificity(), 1);
         assert_eq!(sheet.rules[2].selector.specificity(), 100);
+        let later = Stylesheet::parse(".a { color: red } .b { color: blue }");
+        let doc = parse_document(r#"<p class="b a">t</p>"#);
+        assert_eq!(values(&later, doc.find_first("p").unwrap(), &[&doc]).last().unwrap(), "blue", "source order breaks ties");
     }
 
     #[test]
-    fn descendant_matching() {
-        let sheet = Stylesheet::parse("ul li { color: red } ol li { color: blue }");
-        let doc = parse_document("<div><ul><li>in list</li></ul><ol><li>other</li></ol></div>");
-        let ul = doc.find_first("ul").unwrap();
-        let li = ul.find_first("li").unwrap();
-        let matched = sheet.matching(li, &[&ul, &doc]);
-        let colors: Vec<&str> = matched.iter().map(|d| d.value.as_str()).collect();
-        assert!(colors.contains(&"red"));
-        assert!(!colors.contains(&"blue"));
+    fn combinators_attributes_and_pseudo_classes() {
+        let sheet = Stylesheet::parse(
+            "ul > li { color: red } li + li { color: blue } h1 ~ p { color: green } a[href^=\"https\"] { color: teal } \
+             li:first-child { font-weight: bold } li:nth-child(2n) { color: navy } li:not(.skip) { margin: 1px } \
+             [role=tablist] { display: flex } a:hover { color: pink } p::after { content: 'x' }",
+        );
+        let doc = parse_document(
+            "<div><ul><li>a</li><li class='skip'>b</li><li>c</li></ul><h1>t</h1><p>p</p><a href='https://x'>l</a><nav role='tablist'></nav></div>",
+        );
+        let div = doc.find_first("div").unwrap();
+        let ul = div.find_first("ul").unwrap();
+        let lis: Vec<&crate::dom::Node> = ul.children.iter().filter(|c| c.tag == "li").collect();
+        let anc = [&doc, div, ul];
+        let first = values(&sheet, lis[0], &anc);
+        assert!(first.contains(&"red".into()) && first.contains(&"bold".into()) && first.contains(&"1px".into()));
+        assert!(!first.contains(&"blue".into()), "first li has no previous li");
+        let second = values(&sheet, lis[1], &anc);
+        assert!(second.contains(&"blue".into()) && second.contains(&"navy".into()));
+        assert!(!second.contains(&"1px".into()), ":not(.skip)");
+        let p = div.find_first("p").unwrap();
+        assert!(values(&sheet, p, &[&doc, div]).contains(&"green".into()));
+        let a = div.find_first("a").unwrap();
+        let link = values(&sheet, a, &[&doc, div]);
+        assert!(link.contains(&"teal".into()) && !link.contains(&"pink".into()), "no :hover on a static page");
+        assert!(values(&sheet, div.find_first("nav").unwrap(), &[&doc, div]).contains(&"flex".into()));
+        assert!(!values(&sheet, p, &[&doc, div]).contains(&"'x'".into()), "pseudo-elements never match");
+    }
+
+    #[test]
+    fn custom_properties() {
+        let vars = vec![("--ink".to_string(), "#202c39".to_string()), ("--pad".to_string(), "4px var(--unit, 8px)".to_string())];
+        assert_eq!(substitute_vars("1px solid var(--ink)", &vars).unwrap(), "1px solid #202c39");
+        assert_eq!(substitute_vars("var(--pad)", &vars).unwrap(), "4px 8px");
+        assert_eq!(substitute_vars("var(--missing, red)", &vars).unwrap(), "red");
+        assert!(substitute_vars("var(--missing)", &vars).is_none());
+    }
+
+    #[test]
+    fn at_rules_and_imports() {
+        let sheet = Stylesheet::parse(
+            "@import url(\"base.css\"); @import 'print.css' print; @charset \"utf-8\"; \
+             @font-face { font-family: X; src: url(x.ttf) } @keyframes spin { from { color: red } } \
+             @supports (display: grid) { .g { display: grid } } p { color: red }",
+        );
+        assert_eq!(sheet.imports, vec!["base.css".to_string()]);
+        let selectors: Vec<String> = sheet.rules.iter().map(|r| format!("{:?}", r.selector.chain[0].tag.as_deref().or(r.selector.chain[0].classes.first().map(|s| s.as_str())))).collect();
+        assert_eq!(sheet.rules.len(), 2, "{selectors:?}");
     }
 
     #[test]
     fn colors() {
         assert_eq!(parse_color("#fff"), Some(Color::rgb(255, 255, 255)));
         assert_eq!(parse_color("#1a2b3c"), Some(Color::rgb(26, 43, 60)));
+        assert_eq!(parse_color("#263b521f"), Some(Color::rgba(0x26, 0x3b, 0x52, 0x1f)));
         assert_eq!(parse_color("rgb(1, 2, 3)"), Some(Color::rgb(1, 2, 3)));
-        assert_eq!(parse_color("red"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color("rgb(1 2 3 / 50%)"), Some(Color::rgba(1, 2, 3, 128)));
+        assert_eq!(parse_color("rgba(0,0,0,.5)"), Some(Color::rgba(0, 0, 0, 128)));
+        assert_eq!(parse_color("hsl(0, 100%, 50%)"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color("rebeccapurple"), Some(Color::rgb(0x66, 0x33, 0x99)));
         assert_eq!(parse_color("nope"), None);
     }
 }

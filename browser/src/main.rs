@@ -10,6 +10,7 @@ mod dom;
 mod fonts;
 mod html;
 mod images;
+mod svg;
 mod layout;
 mod net;
 mod page;
@@ -160,7 +161,10 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!("requests a page triggers");
     println!("  {:<16} {}", "images", "<img src> of http(s) pages, up to 64, 6 at a time: same path, DoH and");
     println!("  {:<16} {}", "", "headers as the page (no Referer, no cookies); data: URIs decoded locally;");
-    println!("  {:<16} {}", "", "SVG and 1x1 (tracking) images are never requested; 8 s budget per page");
+    println!("  {:<16} {}", "", "1x1 (tracking) images are never requested; 8 s budget per page");
+    println!("  {:<16} {}", "stylesheets", "<link rel=stylesheet> and @import, up to 24 (+8 imports), any origin, same");
+    println!("  {:<16} {}", "", "path and headers as the page; 8 s budget; fonts and url() images in CSS");
+    println!("  {:<16} {}", "", "are never requested; scripts are never fetched or run");
     println!();
     println!("network path");
     match resolver {
