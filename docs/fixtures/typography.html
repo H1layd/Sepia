@@ -1,0 +1,18 @@
+<html><head><title>typography</title><style>
+.column { max-width: 560px; margin: 0 auto; }
+h1 { letter-spacing: -0.5px; margin-bottom: 8px; }
+.lede { font-size: 20px; line-height: 1.5; color: #444444; }
+p.body { line-height: 1.6; text-indent: 2em; }
+.caps { letter-spacing: 3px; font-size: 12px; color: #887766; }
+.box { margin: 24px 0; padding: 12px; background: #f3f0e8; }
+</style></head><body>
+<div class="column">
+<div class="caps">SEPIA · ENGINE NOTES</div>
+<h1>Margins, lines and letters</h1>
+<p class="lede">A lede paragraph at 20px with a line-height of 1.5, wrapping onto a second line to show the spacing.</p>
+<p class="body">Body text uses line-height 1.6 and a first-line indent of 2em. The paragraphs above and below are separated by collapsed margins: sixteen pixels between two paragraphs, not thirty-two.</p>
+<p class="body">A second paragraph, indented again, follows directly so the collapse is visible between the two blocks of text.</p>
+<div class="box">A box with 24px margins above and below; the larger margin wins against the paragraph's 16px.</div>
+<p class="body">The whole column is limited to 560px with max-width and centred with margin: 0 auto.</p>
+</div>
+</body></html>

@@ -159,7 +159,8 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!();
     println!("requests a page triggers");
     println!("  {:<16} {}", "images", "<img src> of http(s) pages, up to 64, 6 at a time: same path, DoH and");
-    println!("  {:<16} {}", "", "headers as the page (no Referer, no cookies); data: URIs decoded locally");
+    println!("  {:<16} {}", "", "headers as the page (no Referer, no cookies); data: URIs decoded locally;");
+    println!("  {:<16} {}", "", "SVG and 1x1 (tracking) images are never requested; 8 s budget per page");
     println!();
     println!("network path");
     match resolver {

@@ -80,18 +80,30 @@ struct ImageFetch<'a> {
 
 const MAX_IMAGES: usize = 64;
 const IMAGE_PARALLEL: usize = 6;
-const IMAGE_BUDGET: Duration = Duration::from_secs(20);
+/// Images never hold a page back longer than this, whatever the network does.
+const IMAGE_BUDGET: Duration = Duration::from_secs(8);
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Requests not worth making: formats we cannot draw (SVG), and 1×1 images,
+/// which show nothing and exist to report that the page was viewed.
+fn worth_fetching(node: &dom::Node, url: &Url) -> bool {
+    let tiny = |name: &str| node.attr(name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).is_some_and(|v| v <= 1.0);
+    if tiny("width") && tiny("height") {
+        return false;
+    }
+    !url.path.to_ascii_lowercase().ends_with(".svg")
+}
 
 /// Decode every `<img src>` of the document. `data:` URIs are decoded in
 /// place; http(s) ones go through `fetch_with` (chain + DoH, the fixed header
 /// set, no Referer, no cookies), six at a time, within one overall budget.
 /// Returns the images and (found, loaded) counts.
 fn fetch_images(document: &dom::Node, base: &Url, how: &ImageFetch) -> (ImageMap, usize, usize) {
-    fn collect<'n>(node: &'n dom::Node, out: &mut Vec<&'n str>) {
+    fn collect<'n>(node: &'n dom::Node, out: &mut Vec<(&'n str, &'n dom::Node)>) {
         if node.tag == "img" {
             if let Some(src) = node.attr("src").map(str::trim).filter(|s| !s.is_empty()) {
-                if !out.contains(&src) {
-                    out.push(src);
+                if !out.iter().any(|(s, _)| *s == src) {
+                    out.push((src, node));
                 }
             }
         }
@@ -105,23 +117,24 @@ fn fetch_images(document: &dom::Node, base: &Url, how: &ImageFetch) -> (ImageMap
 
     let mut images = ImageMap::new();
     let mut remote: Vec<(&str, Url)> = Vec::new();
-    for src in &sources {
+    for (src, node) in &sources {
         if src.starts_with("data:") {
             if let Some(bitmap) = images::decode_data_uri(src) {
                 images.insert(src.to_string(), Arc::new(bitmap));
             }
         } else if let Some(url) = base.resolve(src) {
-            if matches!(url.scheme.as_str(), "http" | "https") {
+            if matches!(url.scheme.as_str(), "http" | "https") && worth_fetching(node, &url) {
                 remote.push((src, url));
             }
         }
     }
-    let per_image = how.timeout.min(Duration::from_secs(10));
     let started = Instant::now();
     for batch in remote.chunks(IMAGE_PARALLEL) {
-        if started.elapsed() > IMAGE_BUDGET {
+        let left = IMAGE_BUDGET.saturating_sub(started.elapsed());
+        if left < Duration::from_millis(500) {
             break;
         }
+        let per_image = how.timeout.min(IMAGE_TIMEOUT).min(left);
         let decoded: Vec<(&str, Option<images::Bitmap>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()

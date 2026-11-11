@@ -43,6 +43,15 @@ pub enum AlignItems {
     Center,
 }
 
+/// `line-height`: inherited as specified (a factor stays a factor, so a
+/// child with a bigger font gets proportionally taller lines).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    Normal,
+    Factor(f32),
+    Px(f32),
+}
+
 /// The flexbox subset: container and item properties together.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Flex {
@@ -124,7 +133,14 @@ pub struct Style {
     pub border_color: Color,
     pub width: Option<f32>,
     pub height: Option<f32>,
-    pub line_height: f32,
+    pub line_height: LineHeight,
+    /// extra px after every character (inherited)
+    pub letter_spacing: f32,
+    /// first-line indent of a block's text, px (inherited)
+    pub text_indent: f32,
+    pub max_width: Option<f32>,
+    /// `margin-left` / `margin-right: auto` (centring with a width or max-width)
+    pub margin_auto: (bool, bool),
     pub pre: bool,
     pub marker: Option<&'static str>,
     /// None = not specified (a cell then takes its row's, else middle).
@@ -150,7 +166,11 @@ impl Default for Style {
             border_color: Color::BLACK,
             width: None,
             height: None,
-            line_height: 1.35,
+            line_height: LineHeight::Normal,
+            letter_spacing: 0.0,
+            text_indent: 0.0,
+            max_width: None,
+            margin_auto: (false, false),
             pre: false,
             marker: None,
             valign: None,
@@ -321,6 +341,8 @@ pub fn inherited(parent: &Style) -> Style {
     style.underline = false;
     style.align = parent.align;
     style.line_height = parent.line_height;
+    style.letter_spacing = parent.letter_spacing;
+    style.text_indent = parent.text_indent;
     style.pre = parent.pre;
     style
 }
@@ -347,6 +369,8 @@ pub fn compute(
         style.color = inherit.color;
         style.align = inherit.align;
         style.line_height = inherit.line_height;
+        style.letter_spacing = inherit.letter_spacing;
+        style.text_indent = inherit.text_indent;
         style.pre = style.pre || inherit.pre;
     }
 
@@ -539,17 +563,42 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "margin" => {
-            if let Some(edges) = parse_four(value, font_size, containing_width) {
+            // `auto` counts as 0 for the box and is remembered for centring
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let (right, left) = match parts.len() {
+                1 => (parts[0], parts[0]),
+                2 | 3 => (parts[1], parts[1]),
+                4 => (parts[1], parts[3]),
+                _ => ("", ""),
+            };
+            let zeroed: Vec<&str> = parts.iter().map(|p| if *p == "auto" { "0" } else { p }).collect();
+            if let Some(edges) = parse_four(&zeroed.join(" "), font_size, containing_width) {
                 style.margin = edges;
+                style.margin_auto = (left == "auto", right == "auto");
+            }
+        }
+        "margin-left" | "margin-right" if value == "auto" => {
+            if name == "margin-left" {
+                style.margin.left = 0.0;
+                style.margin_auto.0 = true;
+            } else {
+                style.margin.right = 0.0;
+                style.margin_auto.1 = true;
             }
         }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             if let Some(v) = parse_length(value, font_size, containing_width) {
                 match name {
                     "margin-top" => style.margin.top = v,
-                    "margin-right" => style.margin.right = v,
+                    "margin-right" => {
+                        style.margin.right = v;
+                        style.margin_auto.1 = false;
+                    }
                     "margin-bottom" => style.margin.bottom = v,
-                    _ => style.margin.left = v,
+                    _ => {
+                        style.margin.left = v;
+                        style.margin_auto.0 = false;
+                    }
                 }
             }
         }
@@ -590,16 +639,26 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "width" => style.width = parse_length(value, font_size, containing_width),
         "height" => style.height = parse_length(value, font_size, containing_width),
         "line-height" => {
-            if let Some(height) = parse_length(value, font_size, font_size) {
-                style.line_height = if value.ends_with("px") {
-                    (height / font_size).max(1.0)
-                } else if value.parse::<f32>().is_ok() && !value.ends_with('%') {
-                    height.max(1.0)
-                } else {
-                    height.max(1.0)
-                };
+            style.line_height = if value == "normal" {
+                LineHeight::Normal
+            } else if let Ok(factor) = value.parse::<f32>() {
+                LineHeight::Factor(factor.max(0.0))
+            } else if let Some(px) = parse_length(value, font_size, font_size) {
+                // em and % resolve against this element's font now, like CSS
+                LineHeight::Px(px.max(0.0))
+            } else {
+                style.line_height
+            };
+        }
+        "letter-spacing" => {
+            style.letter_spacing = if value == "normal" { 0.0 } else { parse_length(value, font_size, font_size).unwrap_or(style.letter_spacing) };
+        }
+        "text-indent" => {
+            if let Some(v) = parse_length(value, font_size, containing_width) {
+                style.text_indent = v;
             }
         }
+        "max-width" => style.max_width = if value == "none" { None } else { parse_length(value, font_size, containing_width) },
         "white-space" => style.pre = value == "pre" || value == "pre-wrap",
         "list-style-type" => {
             style.marker = Some(match value {

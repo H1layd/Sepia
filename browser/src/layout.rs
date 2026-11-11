@@ -8,7 +8,7 @@ use fontdue::{Font, FontSettings};
 use crate::css::{Color, Stylesheet};
 use crate::dom::Node;
 use crate::images::{Bitmap, ImageMap};
-use crate::style::{compute, Align, Display, Edges, Style, VAlign};
+use crate::style::{compute, Align, Display, Edges, LineHeight, Style, VAlign};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -37,6 +37,8 @@ pub enum Draw {
         bold: bool,
         italic: bool,
         underline: bool,
+        /// extra px after each character (CSS letter-spacing)
+        letter_spacing: f32,
     },
     /// An `<img>`; `image` is None when it could not be fetched or decoded
     /// and paint shows a placeholder with the `alt` text.
@@ -192,12 +194,18 @@ pub struct Layout<'a> {
     /// Measuring min/max-content for table columns: lines start at the left
     /// edge whatever their alignment, so the extent of the draws is the width.
     measuring: bool,
+    /// text-indent waiting for the next line flushed (the block's first)
+    pending_indent: f32,
+    /// bottom margin of the block laid out last, for collapsing with what follows
+    last_margin_bottom: f32,
+    /// bottom margin of the last block child, escaping its parent
+    trailing_margin: f32,
     page: Page,
 }
 
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -206,11 +214,21 @@ impl<'a> Layout<'a> {
         self
     }
 
+    /// Advance of `text` in `style`, letter-spacing included.
+    fn text_width(&self, text: &str, style: &Style) -> f32 {
+        let base = self.fonts.advance(text, style.font_size, style.bold, style.italic);
+        if style.letter_spacing == 0.0 {
+            base
+        } else {
+            base + style.letter_spacing * text.chars().count() as f32
+        }
+    }
+
     /// Width a line entry occupies: the image box, or the text advance.
     fn item_width(&self, text: &str, item: &InlineItem) -> f32 {
         match &item.img {
             Some(img) => img.w,
-            None => self.fonts.advance(text, item.style.font_size, item.style.bold, item.style.italic),
+            None => self.text_width(text, &item.style),
         }
     }
 
@@ -219,13 +237,30 @@ impl<'a> Layout<'a> {
         let style = compute(root, None, self.sheet, &ancestors, self.viewport_width);
         let _ = style;
         // The document root lays its children out as blocks at the origin.
-        let mut cursor = 0.0f32;
         let margin = 8.0f32;
+        // the body's 8px margin, which the first block's top margin collapses with
+        let mut cursor = margin;
         let content_x = margin;
         let content_width = self.viewport_width - margin * 2.0;
+        let mut previous_margin: Option<f32> = Some(margin);
         for child in &root.children {
+            if child.text.as_ref().is_some_and(|t| t.trim().is_empty()) {
+                continue;
+            }
+            let child_style = (child.text.is_none()).then(|| compute(child, None, self.sheet, &ancestors, content_width));
+            let is_block = child_style.as_ref().is_some_and(|s| !matches!(s.display, Display::Inline | Display::None));
+            if is_block {
+                let top = child_style.as_ref().map(|s| s.margin.top.max(0.0)).unwrap_or(0.0);
+                cursor -= previous_margin.map(|m| m.min(top)).unwrap_or(0.0);
+            }
             cursor += self.layout_block(child, &ancestors, None, content_x, cursor, content_width);
+            if child_style.as_ref().is_some_and(|s| s.display == Display::None) {
+                continue;
+            }
+            previous_margin = is_block.then_some(self.last_margin_bottom);
         }
+        // the last block's bottom margin and the body's collapse too
+        cursor += previous_margin.map(|m| m.max(margin) - m).unwrap_or(margin);
         self.page.height = cursor.max(1.0);
         self.page
     }
@@ -255,6 +290,7 @@ impl<'a> Layout<'a> {
                 return 0.0;
             }
             // Stray text at block level: lay it out as an inline line.
+            self.last_margin_bottom = 0.0;
             let style = parent.map(crate::style::inherited).unwrap_or_default();
             let items = vec![InlineItem {
                 text: collapse_ws(&text),
@@ -276,6 +312,7 @@ impl<'a> Layout<'a> {
 
         if style.display == Display::Table {
             let outer_align = parent_style.as_ref().map(|p| p.align).unwrap_or(Align::Left);
+            self.last_margin_bottom = style.margin.bottom.max(0.0);
             return self.layout_table(node, ancestors, &style, outer_align, x, y, containing_width);
         }
 
@@ -284,6 +321,7 @@ impl<'a> Layout<'a> {
 
         if style.display == Display::Inline {
             // Inline elements at block level are laid out as their own line.
+            self.last_margin_bottom = 0.0;
             let mut items: Vec<InlineItem> = Vec::new();
             self.collect_inline(node, &ancestors2, &style, None, &mut items);
             return self.layout_inline(&items, x, y, containing_width);
@@ -292,15 +330,23 @@ impl<'a> Layout<'a> {
         let border = style.border_width;
         let pad = style.padding;
         let margin = style.margin;
-        let box_x = x + margin.left;
+        // width / max-width size the border box; auto margins share what is left
+        let available = containing_width - margin.horizontal();
+        let mut box_width = style.width.unwrap_or(available);
+        if let Some(max_width) = style.max_width {
+            box_width = box_width.min(max_width);
+        }
+        let content_width = (box_width - pad.horizontal() - border * 2.0).max(10.0);
+        let free = (available - (content_width + pad.horizontal() + border * 2.0)).max(0.0);
+        let auto_shift = match style.margin_auto {
+            (true, true) => free / 2.0,
+            (true, false) => free,
+            _ => 0.0,
+        };
+        let box_x = x + margin.left + auto_shift;
         let box_y = y + margin.top;
         let inner_x = box_x + border + pad.left;
         let inner_y = box_y + border + pad.top;
-        let content_width = style
-            .width
-            .map(|w| w - pad.horizontal() - border * 2.0)
-            .unwrap_or(containing_width - margin.horizontal() - pad.horizontal() - border * 2.0)
-            .max(10.0);
 
         // Background first, so children paint over it.
         if let Some(background) = style.background {
@@ -333,16 +379,28 @@ impl<'a> Layout<'a> {
                         bold: false,
                         italic: false,
                         underline: false,
+                        letter_spacing: 0.0,
                     });
                 }
             }
         }
 
+        // Margins collapse through a block with no border or padding on that side.
+        let open_top = border == 0.0 && pad.top == 0.0;
+        let open_bottom = border == 0.0 && pad.bottom == 0.0 && style.height.is_none();
+        let mut escaping = 0.0;
         cursor += if style.display == Display::Flex {
             self.layout_flex(node, &ancestors2, &style, inner_x, cursor, content_width)
         } else {
-            self.layout_children(node, &ancestors2, &style, inner_x, cursor, content_width)
+            let collapse_top = if open_top { margin.top.max(0.0) } else { 0.0 };
+            let used = self.layout_children(node, &ancestors2, &style, inner_x, cursor, content_width, collapse_top);
+            if open_bottom {
+                // the last child's bottom margin leaves the box and joins ours
+                escaping = self.trailing_margin;
+            }
+            used - escaping
         };
+        let margin_bottom = margin.bottom.max(0.0).max(escaping);
 
         let mut content_height = cursor - inner_y;
         if let Some(height) = style.height {
@@ -368,38 +426,57 @@ impl<'a> Layout<'a> {
                 color: style.border_color,
             });
         }
-        total + margin.top + margin.bottom
+        self.last_margin_bottom = margin_bottom;
+        total + margin.top + margin_bottom
     }
 
     /// Lay out the children of `node` (whose own box is already placed) in a
     /// column of `width` starting at (x, y); returns the height used.
     /// `ancestors` ends with `node` itself.
-    fn layout_children(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
+    /// Adjacent block margins collapse to the larger of the two; the first
+    /// block child also collapses with `collapse_top` (the parent's own top
+    /// margin, when nothing separates them). The bottom margin of a trailing
+    /// block child is left in `self.trailing_margin` for the parent.
+    #[allow(clippy::too_many_arguments)]
+    fn layout_children(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32, collapse_top: f32) -> f32 {
         let mut cursor = y;
+        let mut previous_margin: Option<f32> = Some(collapse_top);
+        let mut last_was_block = false;
         let mut items: Vec<InlineItem> = Vec::new();
         let current_href: Option<String> =
             if node.tag == "a" { node.attr("href").map(|h| h.to_string()) } else { None };
         for child in &node.children {
-            let child_is_block = match child.text {
-                Some(_) => false,
-                None => {
-                    let child_style = compute(child, Some(style), self.sheet, ancestors, width);
-                    !matches!(child_style.display, Display::Inline | Display::None)
-                }
-            };
+            let child_style = child.text.is_none().then(|| compute(child, Some(style), self.sheet, ancestors, width));
+            let child_is_block = child_style.as_ref().is_some_and(|s| !matches!(s.display, Display::Inline | Display::None));
             if child_is_block {
                 if !items.is_empty() {
-                    cursor += self.layout_inline(&items, x, cursor, width);
+                    let used = self.layout_inline(&items, x, cursor, width);
                     items.clear();
+                    // whitespace between tags draws nothing and must not stop margins collapsing
+                    if used > 0.0 {
+                        cursor += used;
+                        previous_margin = None;
+                    }
                 }
+                let top = child_style.as_ref().map(|s| s.margin.top.max(0.0)).unwrap_or(0.0);
+                cursor -= previous_margin.map(|m| m.min(top)).unwrap_or(0.0);
                 cursor += self.layout_block(child, ancestors, Some(style), x, cursor, width);
+                previous_margin = Some(self.last_margin_bottom);
+                last_was_block = true;
+            } else if child_style.as_ref().is_some_and(|s| s.display == Display::None) {
+                continue;
             } else {
                 self.collect_inline(child, ancestors, style, current_href.clone(), &mut items);
             }
         }
         if !items.is_empty() {
-            cursor += self.layout_inline(&items, x, cursor, width);
+            let used = self.layout_inline(&items, x, cursor, width);
+            if used > 0.0 {
+                cursor += used;
+                last_was_block = false;
+            }
         }
+        self.trailing_margin = if last_was_block { previous_margin.unwrap_or(0.0) } else { 0.0 };
         cursor - y
     }
 
@@ -561,6 +638,9 @@ impl<'a> Layout<'a> {
         let mut cursor_y = y;
         let mut line: Vec<(String, InlineItem)> = Vec::new();
         let mut line_width = 0.0f32;
+        // text-indent: the first line of the block starts further right
+        let mut indent = items.first().map(|i| i.style.text_indent).unwrap_or(0.0);
+        self.pending_indent = indent;
         let mut max_size = 0.0f32;
         let mut line_done = false;
         // Whitespace is a property of the boundary between two runs, so it has
@@ -584,12 +664,13 @@ impl<'a> Layout<'a> {
                     None => 0.0,
                 };
                 let space = if need_space && line_width > 0.0 {
-                    self.fonts.advance(" ", item.style.font_size, item.style.bold, item.style.italic)
+                    self.text_width(" ", &item.style)
                 } else {
                     0.0
                 };
-                if line_width + space + w > width && line_width > 0.0 {
+                if line_width + space + w > width - indent && line_width > 0.0 {
                     self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                    indent = 0.0;
                     line.clear();
                     line_width = 0.0;
                     max_size = 0.0;
@@ -605,9 +686,10 @@ impl<'a> Layout<'a> {
                 line.push((String::new(), boxed));
                 need_space = false;
             } else if item.image {
-                let advance = self.fonts.advance(&item.text, item.style.font_size, item.style.bold, item.style.italic);
-                if line_width + advance > width && line_width > 0.0 {
+                let advance = self.text_width(&item.text, &item.style);
+                if line_width + advance > width - indent && line_width > 0.0 {
                     self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                    indent = 0.0;
                     line.clear();
                     line_width = 0.0;
                     max_size = 0.0;
@@ -626,6 +708,7 @@ impl<'a> Layout<'a> {
                     }
                     if word == "\n" {
                         self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                        indent = 0.0;
                         line.clear();
                         line_width = 0.0;
                         max_size = 0.0;
@@ -633,13 +716,14 @@ impl<'a> Layout<'a> {
                         continue;
                     }
                     let mut piece = word;
-                    let mut piece_width = self.fonts.advance(&piece, item.style.font_size, item.style.bold, item.style.italic);
+                    let mut piece_width = self.text_width(&piece, &item.style);
                     if need_space && line_width > 0.0 {
                         piece = format!(" {piece}");
-                        piece_width += self.fonts.advance(" ", item.style.font_size, item.style.bold, item.style.italic);
+                        piece_width += self.text_width(" ", &item.style);
                     }
-                    if line_width + piece_width > width && line_width > 0.0 {
+                    if line_width + piece_width > width - indent && line_width > 0.0 {
                         self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                        indent = 0.0;
                         line.clear();
                         line_width = 0.0;
                         max_size = 0.0;
@@ -648,7 +732,7 @@ impl<'a> Layout<'a> {
                         if piece.is_empty() {
                             continue;
                         }
-                        piece_width = self.fonts.advance(&piece, item.style.font_size, item.style.bold, item.style.italic);
+                        piece_width = self.text_width(&piece, &item.style);
                     }
                     max_size = max_size.max(item.style.font_size);
                     line_width += piece_width;
@@ -658,6 +742,7 @@ impl<'a> Layout<'a> {
             }
             if line_done {
                 self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                indent = 0.0;
                 line.clear();
                 line_width = 0.0;
                 max_size = 0.0;
@@ -668,6 +753,7 @@ impl<'a> Layout<'a> {
         if !line.is_empty() {
             self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
         }
+        self.pending_indent = 0.0;
         cursor_y - y
     }
 
@@ -679,6 +765,7 @@ impl<'a> Layout<'a> {
         width: f32,
         max_size: f32,
     ) {
+        let indent = std::mem::take(&mut self.pending_indent);
         if line.is_empty() {
             *cursor_y += max_size.max(16.0) * 1.35;
             return;
@@ -686,10 +773,30 @@ impl<'a> Layout<'a> {
         let size = if max_size > 0.0 { max_size } else { 16.0 };
         let ascent = self.fonts.ascent(size, false);
         let descent = self.fonts.descent(size, false);
+        // Each run asks for its own line-height; the line is as tall as the
+        // tallest. `normal` keeps the leading under the text (as before); an
+        // explicit line-height splits it above and below (half-leading).
+        let mut line_box = 0.0f32;
+        let mut explicit = false;
+        for (_, item) in line.iter() {
+            let size = item.style.font_size;
+            line_box = line_box.max(match item.style.line_height {
+                LineHeight::Normal => (self.fonts.ascent(size, false) + self.fonts.descent(size, false)) * 1.2,
+                LineHeight::Factor(k) => {
+                    explicit = true;
+                    k * size
+                }
+                LineHeight::Px(px) => {
+                    explicit = true;
+                    px
+                }
+            });
+        }
+        let top_gap = if explicit { (line_box - (ascent + descent)) / 2.0 } else { 0.0 };
         // Images sit on the baseline: a tall one pushes the baseline down.
         let image_height = line.iter().filter_map(|(_, item)| item.img.as_ref().map(|i| i.h)).fold(0.0f32, f32::max);
-        let lift = (image_height - ascent).max(0.0);
-        let line_height = (ascent + descent) * 1.2 + lift;
+        let lift = (image_height - ascent - top_gap.max(0.0)).max(0.0);
+        let line_height = line_box + lift;
 
         let total_width: f32 = line.iter().map(|(text, item)| self.item_width(text, item)).sum();
 
@@ -699,12 +806,12 @@ impl<'a> Layout<'a> {
             line.last().map(|(_, item)| item.style.align).unwrap_or(Align::Left)
         };
         let mut pen_x = match align {
-            Align::Left => x,
+            Align::Left => x + indent,
             Align::Center => x + (width - total_width) / 2.0,
             Align::Right => x + width - total_width,
         };
 
-        let baseline = *cursor_y + ascent + lift;
+        let baseline = *cursor_y + top_gap + ascent + lift;
         // Backgrounds for the whole line first, so no run can paint over a
         // neighbour that was already drawn.
         if baseline > 0.0 {
@@ -741,10 +848,10 @@ impl<'a> Layout<'a> {
                 continue;
             }
             if text.trim().is_empty() {
-                pen_x += self.fonts.advance(text, item.style.font_size, item.style.bold, item.style.italic);
+                pen_x += self.text_width(text, &item.style);
                 continue;
             }
-            let advance = self.fonts.advance(text, item.style.font_size, item.style.bold, item.style.italic);
+            let advance = self.text_width(text, &item.style);
             self.page.draws.push(Draw::Text {
                 x: pen_x,
                 baseline,
@@ -754,6 +861,7 @@ impl<'a> Layout<'a> {
                 bold: item.style.bold,
                 italic: item.style.italic,
                 underline: item.style.underline,
+                letter_spacing: item.style.letter_spacing,
             });
             if let Some(href) = &item.href {
                 self.page.links.push(LinkHit {
@@ -826,6 +934,9 @@ impl<'a> Layout<'a> {
             viewport_width: self.viewport_width,
             images: self.images,
             measuring,
+            pending_indent: 0.0,
+            last_margin_bottom: 0.0,
+            trailing_margin: 0.0,
             page: Page::default(),
         }
     }
@@ -835,14 +946,16 @@ impl<'a> Layout<'a> {
         let mut sub = self.sub_layout(measuring);
         let mut ancestors = cell.ancestors.clone();
         ancestors.push(cell.node);
-        let height = sub.layout_children(cell.node, &ancestors, &cell.style, 0.0, 0.0, width.max(1.0));
+        let height = sub.layout_children(cell.node, &ancestors, &cell.style, 0.0, 0.0, width.max(1.0), 0.0);
         (sub.page, height)
     }
 
     /// How wide the content actually is: the right edge of its text and images.
     fn extent(&self, page: &Page) -> f32 {
         page.draws.iter().fold(0.0f32, |acc, draw| match draw {
-            Draw::Text { x, text, size, bold, italic, .. } => acc.max(x + self.fonts.advance(text, *size, *bold, *italic)),
+            Draw::Text { x, text, size, bold, italic, letter_spacing, .. } => {
+                acc.max(x + self.fonts.advance(text, *size, *bold, *italic) + letter_spacing * text.chars().count() as f32)
+            }
             Draw::Image { rect, .. } => acc.max(rect.x + rect.w),
             _ => acc,
         })
@@ -1745,6 +1858,80 @@ mod tests {
         });
         assert!(right <= 400.0 + 8.0 + 0.5, "overflowed to {right}");
         assert!(page.height > 60.0, "text wrapped inside the shrunk items");
+    }
+
+    #[test]
+    fn vertical_margins_collapse() {
+        let fonts = fonts();
+        let line = (fonts.ascent(16.0, false) + fonts.descent(16.0, false)) * 1.2;
+        // two paragraphs: 16px between them, not 16 + 16
+        let page = flex_page("<p>one</p><p>two</p>", 600.0);
+        let (_, y1) = text_x(&page, "one");
+        let (_, y2) = text_x(&page, "two");
+        assert!((y2 - y1 - (line + 16.0)).abs() < 0.5, "gap {}", y2 - y1 - line);
+        // the larger margin wins
+        let page = flex_page("<p>one</p><div style='margin-top:40px'>two</div>", 600.0);
+        let (_, y1) = text_x(&page, "one");
+        let (_, y2) = text_x(&page, "two");
+        assert!((y2 - y1 - (line + 40.0)).abs() < 0.5, "gap {}", y2 - y1 - line);
+        // a parent with no border/padding collapses with its first child
+        let a = flex_page("<div style='margin-top:30px'><p>x</p></div>", 600.0);
+        let b = flex_page("<div style='margin-top:30px;padding-top:1px'><p>x</p></div>", 600.0);
+        let (_, ya) = text_x(&a, "x");
+        let (_, yb) = text_x(&b, "x");
+        assert!((yb - ya - 17.0).abs() < 0.5, "collapsed {ya}, separated {yb}");
+    }
+
+    #[test]
+    fn line_height_letter_spacing_and_indent() {
+        let fonts = fonts();
+        let page = flex_page("<p style='line-height:2'>a<br>b</p>", 600.0);
+        let (_, ya) = text_x(&page, "a");
+        let (_, yb) = text_x(&page, "b");
+        assert!((yb - ya - 32.0).abs() < 0.5, "line-height:2 at 16px: {}", yb - ya);
+        let page = flex_page("<p style='line-height:24px'>a<br>b</p>", 600.0);
+        let (_, ya) = text_x(&page, "a");
+        let (_, yb) = text_x(&page, "b");
+        assert!((yb - ya - 24.0).abs() < 0.5);
+
+        let plain = flex_page("<p>abcd <b>x</b></p>", 600.0);
+        let spaced = flex_page("<p style='letter-spacing:3px'>abcd <b>x</b></p>", 600.0);
+        let (px, _) = text_x(&plain, "x");
+        let (sx, _) = text_x(&spaced, "x");
+        // "abcd" before the run that starts with " x": 4 characters x 3px
+        assert!((sx - px - 12.0).abs() < 0.5, "4 characters x 3px: {}", sx - px);
+
+        let words = "word ".repeat(40);
+        let page = flex_page(&format!("<p style='text-indent:30px'>{words}</p>"), 400.0);
+        let firsts: Vec<f32> = page
+            .draws
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Text { x, text, .. } if !text.starts_with(' ') => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert!((firsts[0] - 38.0).abs() < 0.5, "first line indented: {}", firsts[0]);
+        assert!(firsts[1..].iter().any(|x| (*x - 8.0).abs() < 0.5), "later lines are not");
+        let _ = fonts;
+    }
+
+    #[test]
+    fn max_width_with_auto_margins_centres() {
+        let page = flex_page(
+            "<div style='max-width:300px;margin:0 auto;background:#eeeeee'>column</div>",
+            816.0,
+        );
+        let rect = page
+            .draws
+            .iter()
+            .find_map(|d| match d {
+                Draw::Rect { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("background");
+        assert!((rect.w - 300.0).abs() < 0.5, "width {}", rect.w);
+        assert!((rect.x - (8.0 + (800.0 - 300.0) / 2.0)).abs() < 0.5, "x {}", rect.x);
     }
 
     #[test]
