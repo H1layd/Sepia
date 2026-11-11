@@ -43,7 +43,9 @@ fn usage() -> &'static str {
        --doh URL   DoH endpoint for direct connections (default cloudflare)\n\
        --no-doh    use the system resolver (leaks names to the ISP)\n\
        --audit     print what this browser does and does not expose\n\
-       --verbose   log DoH resolutions to stderr\n"
+       --verbose   log DoH resolutions to stderr\n\
+       --via tor|i2p  use the local Tor SOCKS or I2P HTTP proxy\n\
+       --insecure  accept self-signed certificates (Gemini capsules)\n"
 }
 
 fn build_chain(socks: Option<&str>, via: Option<&str>) -> Result<Chain, String> {

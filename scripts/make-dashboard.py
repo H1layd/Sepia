@@ -18,7 +18,7 @@ OUT = ROOT / "docs" / "anon-dashboard.png"
 
 def audit_facts() -> dict:
     result = subprocess.run([str(BROWSER), "--audit"], capture_output=True, text=True, timeout=60)
-    facts = {"ip": "?", "loc": "?", "chain": "direct"}
+    facts = {"ip": "?", "loc": "?", "chain": "direct", "redacted": False}
     for line in result.stdout.splitlines():
         line = line.strip()
         if line.startswith("ip="):
@@ -27,6 +27,11 @@ def audit_facts() -> dict:
             facts["loc"] = line.split("=", 1)[1]
         elif line.startswith("transport") and "chain" in line:
             facts["chain"] = line.split("transport", 1)[1].strip()
+    # The screenshot goes into a public repository: never publish a real exit IP.
+    if "--redact" in sys.argv:
+        facts["ip"] = "203.0.113.7"
+        facts["loc"] = "NL"
+        facts["note"] = "address redacted for publication"
     return facts
 
 
@@ -62,7 +67,7 @@ JavaScript.</p>
 <div class="row">Pages that need JavaScript render their static shell only. A site behind a
 JS challenge will look empty. That is the price of not running an interpreter:
 every tracker that needs script execution gets nothing.</div>
-<p class="foot">Sepia 1.0 · anonymous by construction, small on purpose</p>
+<p class="foot">Sepia 1.0 · anonymous by construction, small on purpose · {note}</p>
 </body></html>
 """
 
@@ -72,6 +77,7 @@ def main() -> int:
         print(f"build the browser first: {BROWSER}", file=sys.stderr)
         return 1
     facts = audit_facts()
+    facts.setdefault("note", "live numbers from the machine that built it")
     tmp = Path(tempfile.mkdtemp(prefix="sepia-dash-"))
     try:
         page = tmp / "dash.html"
@@ -97,7 +103,7 @@ def main() -> int:
                 )
             finally:
                 server.shutdown()
-        print(f"wrote {OUT}  (exit {facts['ip']}, {facts['loc']})")
+        print(f"wrote {OUT}  (exit {facts['ip']}, {facts['loc']}, redacted={facts['redacted']})")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -1,8 +1,23 @@
+# build output
+browser/target/
+core/target/
+*.rs.bk
+build/
+*.egg-info/
+
+# compiled native binaries (build them with scripts/build.sh)
+native/sepiaprobe
+
+# python
 __pycache__/
 *.pyc
 .venv/
-*.egg-info/
-core/target/
-native/sepiaprobe
-browser/target/
+venv/
+
+# runtime state and logs
+*.log
+.sepia/
+.veil/
+
+# os noise
 .DS_Store
