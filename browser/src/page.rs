@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::css::Stylesheet;
 use crate::dom;
 use crate::images::{self, ImageMap};
+use crate::js::Session;
 use crate::layout::{Fonts, Layout, Page};
 use crate::net::{fetch_with, Chain, Response};
 use crate::protocols;
@@ -41,16 +42,30 @@ pub fn load(
     timeout: Duration,
     insecure_tls: bool,
 ) -> Result<Loaded, String> {
+    open(url, chain, resolver, width, fonts, timeout, insecure_tls).map(|(loaded, _)| loaded)
+}
+
+/// `load`, keeping the page's script session alive for events (clicks,
+/// typing). A session is tied to the calling thread.
+pub fn open(
+    url: &Url,
+    chain: &Chain,
+    resolver: Option<&Resolver>,
+    width: f32,
+    fonts: &Fonts,
+    timeout: Duration,
+    insecure_tls: bool,
+) -> Result<(Loaded, Option<Session>), String> {
     require_overlay(url, chain)?;
     match url.scheme.as_str() {
         "gemini" => {
             let text_page =
                 protocols::fetch_gemini(url, chain, resolver, timeout, insecure_tls)?;
-            Ok(finish(url, text_page.html, 20, text_page.title, text_page.note, width, fonts, 0, None))
+            Ok((finish(url, text_page.html, 20, text_page.title, text_page.note, width, fonts, 0, None).0, None))
         }
         "gopher" => {
             let text_page = protocols::fetch_gopher(url, chain, resolver, timeout)?;
-            Ok(finish(url, text_page.html, 200, text_page.title, text_page.note, width, fonts, 0, None))
+            Ok((finish(url, text_page.html, 200, text_page.title, text_page.note, width, fonts, 0, None).0, None))
         }
         _ => {
             let response: Response = fetch_with(url, chain, resolver, timeout)?;
@@ -169,7 +184,7 @@ fn finish(
     fonts: &Fonts,
     extra_rules: usize,
     fetch: Option<ImageFetch>,
-) -> Loaded {
+) -> (Loaded, Option<Session>) {
     let document = dom::parse_document(&html);
     let title = {
         let from_doc = Layout::title(&document);
@@ -179,35 +194,127 @@ fn finish(
             from_doc
         }
     };
-    // stylesheets and images come in parallel; layout needs both
-    let (mut sheet, images) = match &fetch {
+    // stylesheets, scripts and images come in parallel; layout needs all three
+    let (mut sheet, images, scripts) = match &fetch {
         Some(how) => {
-            let (sheet, external, (images, found, loaded)) = std::thread::scope(|scope| {
+            let (sheet, external, scripts, (images, found, loaded)) = std::thread::scope(|scope| {
                 let images = scope.spawn(|| fetch_images(&document, url, how));
+                let scripts = scope.spawn(|| load_scripts(&document, url, how));
                 let (sheet, external) = load_styles(&document, url, Some(how));
-                (sheet, external, images.join().unwrap_or_else(|_| (ImageMap::new(), 0, 0)))
+                (
+                    sheet,
+                    external,
+                    scripts.join().unwrap_or_default(),
+                    images.join().unwrap_or_else(|_| (ImageMap::new(), 0, 0)),
+                )
             });
             if external > 0 {
                 note = format!("{note} · css {external}");
             }
+            if !scripts.is_empty() {
+                note = format!("{note} · js {}", scripts.len());
+            }
             if found > 0 {
                 note = format!("{note} · images {loaded}/{found}");
             }
-            (sheet, images)
+            (sheet, images, scripts)
         }
-        None => (load_styles(&document, url, None).0, ImageMap::new()),
+        None => (load_styles(&document, url, None).0, ImageMap::new(), Vec::new()),
     };
     sheet.viewport_width = width;
     let rules = sheet.rules.len() + extra_rules;
-    let page = Layout::new(fonts, &sheet, width).with_images(&images).build(&document);
-    Loaded {
-        url: url.clone(),
-        title,
-        page,
-        status,
-        rules,
-        note,
+    if scripts.is_empty() {
+        let page = Layout::new(fonts, &sheet, width).with_images(&images).build(&document);
+        return (Loaded { url: url.clone(), title, page, status, rules, note }, None);
     }
+    // run the page's scripts; the session stays for events
+    let net = fetch.as_ref().map(|how| crate::js::NetAccess { chain: how.chain, resolver: how.resolver, timeout: how.timeout });
+    let session = Session::start(&document, url, &scripts, net, sheet, images, width);
+    let errors = session.log().len();
+    if errors > 0 {
+        note = format!("{note} · js log {errors}");
+        if std::env::var_os("SEPIA_VERBOSE").is_some() {
+            for line in session.log() {
+                eprintln!("js: {line}");
+            }
+        }
+    }
+    let page = session.layout(fonts);
+    let title = session.title().unwrap_or(title);
+    (Loaded { url: url.clone(), title, page, status, rules, note }, Some(session))
+}
+
+const MAX_SCRIPTS: usize = 48;
+const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The document's classic scripts in order: inline ones as written, `src`
+/// ones fetched through the page's path (any origin, like a stylesheet;
+/// six at a time within the CSS budget). Modules, JSON, templates and other
+/// non-script types are skipped.
+fn load_scripts(document: &dom::Node, base: &Url, how: &ImageFetch) -> crate::js::Scripts {
+    enum Source {
+        Inline(String),
+        Remote(Url),
+    }
+    fn walk(node: &dom::Node, base: &Url, out: &mut Vec<Source>) {
+        if node.tag == "script" {
+            let kind = node.attr("type").unwrap_or("").trim().to_ascii_lowercase();
+            let classic = kind.is_empty() || kind.contains("javascript") || kind == "text/ecmascript" || kind == "application/ecmascript";
+            if classic && node.attr("nomodule").is_none() {
+                match node.attr("src") {
+                    Some(src) => {
+                        if let Some(url) = base.resolve(src).filter(|u| matches!(u.scheme.as_str(), "http" | "https")) {
+                            out.push(Source::Remote(url));
+                        }
+                    }
+                    None => out.push(Source::Inline(node.text_content())),
+                }
+            }
+            return;
+        }
+        for child in &node.children {
+            walk(child, base, out);
+        }
+    }
+    let mut sources = Vec::new();
+    walk(document, base, &mut sources);
+    sources.truncate(MAX_SCRIPTS);
+    let remote: Vec<&Url> = sources.iter().filter_map(|s| match s {
+        Source::Remote(u) => Some(u),
+        _ => None,
+    }).collect();
+    let started = Instant::now();
+    let mut fetched: Vec<(Url, String)> = Vec::new();
+    for batch in remote.chunks(IMAGE_PARALLEL) {
+        let left = CSS_BUDGET.saturating_sub(started.elapsed());
+        if left < Duration::from_millis(300) {
+            break;
+        }
+        let timeout = how.timeout.min(left);
+        let got: Vec<(Url, Option<String>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|url| {
+                    scope.spawn(move || {
+                        let body = fetch_with(url, how.chain, how.resolver, timeout)
+                            .ok()
+                            .filter(|r| r.status < 400 && r.body.len() <= MAX_SCRIPT_BYTES)
+                            .map(|r| String::from_utf8_lossy(&r.body).into_owned());
+                        ((*url).clone(), body)
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        fetched.extend(got.into_iter().filter_map(|(u, b)| b.map(|b| (u, b))));
+    }
+    sources
+        .into_iter()
+        .filter_map(|s| match s {
+            Source::Inline(code) => (!code.trim().is_empty()).then(|| (code, "inline script".to_string())),
+            Source::Remote(url) => fetched.iter().find(|(u, _)| *u == url).map(|(_, code)| (code.clone(), url.to_string())),
+        })
+        .collect()
 }
 
 const MAX_STYLESHEETS: usize = 24;
@@ -216,6 +323,7 @@ const MAX_CSS_BYTES: usize = 2 * 1024 * 1024;
 const CSS_BUDGET: Duration = Duration::from_secs(8);
 
 /// Inline `<style>` only (no network): what tests and text pages use.
+#[allow(dead_code)]
 pub fn collect_styles(document: &dom::Node, sheet: &mut Stylesheet) {
     if let Some(base) = Url::parse("http://localhost/") {
         sheet.append(load_styles(document, &base, None).0);

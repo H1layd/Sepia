@@ -308,7 +308,7 @@ fn split_selector(text: &str) -> Option<Vec<String>> {
     (depth == 0).then_some(out)
 }
 
-fn split_top_level(text: &str, sep: char) -> Vec<String> {
+pub fn split_top_level(text: &str, sep: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut depth = 0i32;
@@ -843,7 +843,7 @@ pub fn parse_declarations(body: &str) -> Vec<Declaration> {
 // Matching
 // ---------------------------------------------------------------------------
 
-fn matches_selector(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
+pub fn matches_selector(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
     let last = selector.chain.len() - 1;
     match_from(selector, last, node, ancestors)
 }

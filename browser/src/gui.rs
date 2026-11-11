@@ -21,7 +21,9 @@
 //! the finished pixels. Pages load on a worker thread through `page::load`
 //! (the one network entry point); nothing here opens a socket or touches disk.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowBuilder};
 
 use crate::css::Color;
+use crate::js::{Outcome, PageEvent};
 use crate::layout::{Fonts, Page, Rect};
 use crate::net::{Chain, HopKind};
 use crate::page::{self, Loaded};
@@ -272,6 +275,8 @@ struct Tab {
     loaded: Option<Loaded>,
     /// Bumped whenever `loaded` changes, so a cached page bitmap knows it is stale.
     generation: u64,
+    /// The navigation that produced `loaded`: its script session answers to it.
+    live_nav: u64,
     thumb: Option<Image>,
     loading: Option<Pending>,
     failure: Option<Failure>,
@@ -287,6 +292,7 @@ impl Tab {
             index: 0,
             loaded: None,
             generation: 0,
+            live_nav: 0,
             thumb: None,
             loading: None,
             failure: None,
@@ -685,6 +691,7 @@ impl Ui {
                 tab.loaded = Some(loaded);
                 tab.thumb = Some(thumb);
                 tab.failure = None;
+                tab.live_nav = nav;
             }
             Err(reason) => {
                 tab.loaded = None;
@@ -875,6 +882,32 @@ impl Ui {
             return None;
         }
         tab.loaded.as_ref().map(|l| (tab.id, tab.generation, tab.scroll, &l.page))
+    }
+
+    /// The active tab's shown page and the navigation it came from.
+    pub fn active_live(&self) -> Option<(u64, u64)> {
+        let tab = self.tab();
+        (tab.loaded.is_some() && tab.failure.is_none()).then_some((tab.id, tab.live_nav))
+    }
+
+    pub fn has_tab(&self, id: u64) -> bool {
+        self.tabs.iter().any(|t| t.id == id)
+    }
+
+    /// A script changed the page: show its new layout (scroll stays).
+    pub fn update_page(&mut self, tab_id: u64, nav: u64, page: Option<Page>, title: Option<String>) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id && t.live_nav == nav) else { return false };
+        let Some(loaded) = tab.loaded.as_mut() else { return false };
+        if let Some(title) = title {
+            loaded.title = title;
+        }
+        if let Some(page) = page {
+            loaded.page = page;
+            tab.generation += 1;
+            let max = (loaded.page.height + theme::DOCK_HEIGHT + theme::DOCK_MARGIN * 2.0).max(0.0);
+            tab.scroll = tab.scroll.min(max);
+        }
+        true
     }
 
     pub fn active_loaded(&self) -> Option<&Loaded> {
@@ -1892,6 +1925,21 @@ struct Done {
     result: Result<(Loaded, Image), String>,
 }
 
+/// Messages from page threads to the window.
+enum PageMsg {
+    Done(Done),
+    /// A page's scripts answered an event.
+    Update { tab_id: u64, nav: u64, outcome: Outcome },
+}
+
+/// A text field the user is typing into: its tab, navigation, element, text.
+struct Field {
+    tab_id: u64,
+    nav: u64,
+    node: usize,
+    value: String,
+}
+
 /// The active page painted as a band three viewports tall around the
 /// scroll position: scrolling inside it is a copy, not a repaint.
 struct PageCache {
@@ -1909,8 +1957,11 @@ struct App {
     fonts: Arc<Fonts>,
     chain: Chain,
     resolver: Option<Resolver>,
-    proxy: EventLoopProxy<Done>,
+    proxy: EventLoopProxy<PageMsg>,
     ui: Ui,
+    /// Each tab's live page: the channel to the thread holding its scripts.
+    sessions: HashMap<u64, (u64, mpsc::Sender<PageEvent>)>,
+    field: Option<Field>,
     frame: Canvas,
     page_cache: Option<PageCache>,
     scale: f32,
@@ -1924,21 +1975,118 @@ struct App {
 }
 
 impl App {
-    fn spawn(&self, load: Load) {
+    /// Load a page on a thread of its own. When the page has scripts the
+    /// thread stays: it holds the script session (Boa contexts cannot move
+    /// between threads) and answers page events until the tab moves on.
+    fn spawn(&mut self, load: Load) {
         let fonts = self.fonts.clone();
         let chain = self.chain.clone();
         let resolver = self.resolver.clone();
         let proxy = self.proxy.clone();
         let width = self.ui.viewport().w;
+        let (events, inbox) = mpsc::channel::<PageEvent>();
+        // replacing the sender ends the previous page's thread
+        self.sessions.insert(load.tab_id, (load.nav, events));
+        self.field = None;
         std::thread::spawn(move || {
-            let result = page::load(&load.url, &chain, resolver.as_ref(), width, &fonts, Duration::from_secs(20), false)
-                .map(|loaded| {
+            let opened = page::open(&load.url, &chain, resolver.as_ref(), width, &fonts, Duration::from_secs(20), false);
+            let (result, session) = match opened {
+                Ok((loaded, session)) => {
                     let thumb = thumbnail(&fonts, &loaded.page, width);
-                    (loaded, thumb)
-                });
-            let _ = proxy.send_event(Done { tab_id: load.tab_id, nav: load.nav, result });
+                    (Ok((loaded, thumb)), session)
+                }
+                Err(e) => (Err(e), None),
+            };
+            let _ = proxy.send_event(PageMsg::Done(Done { tab_id: load.tab_id, nav: load.nav, result }));
+            if let Some(mut session) = session {
+                while let Ok(event) = inbox.recv() {
+                    let outcome = session.handle(event, &fonts);
+                    if proxy.send_event(PageMsg::Update { tab_id: load.tab_id, nav: load.nav, outcome }).is_err() {
+                        break;
+                    }
+                }
+            }
         });
         self.window.request_redraw();
+    }
+
+    /// Send an event to the active page's scripts; false when it has none.
+    fn to_page(&self, event: PageEvent) -> bool {
+        let Some((tab_id, nav)) = self.ui.active_live() else { return false };
+        match self.sessions.get(&tab_id) {
+            Some((live, tx)) if *live == nav => tx.send(event).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// The element under a point of the page: a link's `<a>`, else the
+    /// smallest element box around it. (node, raw href)
+    fn element_at(&self, x: f32, y: f32) -> Option<(usize, Option<String>)> {
+        let loaded = self.ui.active_loaded()?;
+        let v = self.ui.viewport();
+        let (px, py) = (x - v.x, y - v.y + self.ui.active_scroll());
+        let link = loaded.page.links.iter().find(|l| l.rect.contains(px, py));
+        let boxed = loaded
+            .page
+            .boxes
+            .iter()
+            .filter(|(r, _)| r.contains(px, py))
+            .min_by(|a, b| (a.0.w * a.0.h).partial_cmp(&(b.0.w * b.0.h)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, id)| *id);
+        let node = link.and_then(|l| l.node).or(boxed)?;
+        Some((node, link.map(|l| l.href.clone())))
+    }
+
+    /// What the page's scripts answered.
+    fn page_update(&mut self, tab_id: u64, nav: u64, outcome: Outcome) {
+        if !self.ui.update_page(tab_id, nav, outcome.page, outcome.title) {
+            return;
+        }
+        if let Some((node, value)) = outcome.focus {
+            self.field = Some(Field { tab_id, nav, node, value });
+        }
+        if let Some(target) = outcome.navigate {
+            let base = self.ui.active_loaded().map(|l| l.url.clone());
+            if let Some(url) = base.and_then(|b| b.resolve(&target)).or_else(|| Url::parse(&target)) {
+                let load = self.ui.navigate(url);
+                self.spawn(load);
+            }
+        }
+        self.update_title();
+    }
+
+    /// Typing into a focused page field; true when the key was used.
+    fn type_into_field(&mut self, key: &Key, typed: Option<&str>) -> bool {
+        let Some(field) = self.field.as_mut() else { return false };
+        if self.ui.active_live() != Some((field.tab_id, field.nav)) {
+            self.field = None;
+            return false;
+        }
+        let node = field.node;
+        let event = match key {
+            Key::Named(NamedKey::Escape) => {
+                self.field = None;
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => PageEvent::Key { node, key: "Enter".into() },
+            Key::Named(NamedKey::Backspace) => {
+                field.value.pop();
+                PageEvent::Input { node, value: field.value.clone() }
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.field = None;
+                return true;
+            }
+            _ => match typed.filter(|t| !t.chars().any(|c| c.is_control())) {
+                Some(text) => {
+                    field.value.push_str(text);
+                    PageEvent::Input { node, value: field.value.clone() }
+                }
+                None => return true,
+            },
+        };
+        self.to_page(event);
+        true
     }
 
     fn run(&mut self, load: Option<Load>) {
@@ -2048,8 +2196,17 @@ impl App {
             Hit::Burn => {
                 self.ui.burn();
                 self.page_cache = None;
+                self.sessions.clear();
+                self.field = None;
             }
             Hit::Page => {
+                // pages with scripts get the click; they decide what happens
+                if let Some((node, href)) = self.element_at(x, y) {
+                    self.field = None;
+                    if self.to_page(PageEvent::Click { node, href }) {
+                        return;
+                    }
+                }
                 if let Some(href) = self.link_at(x, y) {
                     if let Some(url) = Url::parse(&href) {
                         let load = self.ui.navigate(url);
@@ -2069,7 +2226,11 @@ impl App {
                 Key::Character(c) => match c.as_str() {
                     "l" | "д" => self.ui.begin_editing(true),
                     "t" | "е" => self.ui.new_tab(),
-                    "w" | "ц" => self.ui.close_active(),
+                    "w" | "ц" => {
+                        self.ui.close_active();
+                        let ui = &self.ui;
+                        self.sessions.retain(|id, _| ui.has_tab(*id));
+                    }
                     "r" | "к" => {
                         let load = self.ui.reload();
                         self.run(load);
@@ -2094,6 +2255,9 @@ impl App {
                 _ => {}
             }
             self.update_title();
+            return true;
+        }
+        if !self.ui.editing && self.type_into_field(key, typed) {
             return true;
         }
         if self.ui.editing {
@@ -2175,7 +2339,7 @@ fn refresh_interval(window: &Window) -> Duration {
 }
 
 pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) -> Result<(), String> {
-    let event_loop = EventLoopBuilder::<Done>::with_user_event().build().map_err(|e| e.to_string())?;
+    let event_loop = EventLoopBuilder::<PageMsg>::with_user_event().build().map_err(|e| e.to_string())?;
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("Sepia")
@@ -2204,6 +2368,8 @@ pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) ->
         last_frame: Instant::now(),
         gesture_cooldown: Instant::now(),
         frame_interval: refresh_interval(&window),
+        sessions: HashMap::new(),
+        field: None,
     };
     let size = window.inner_size();
     app.resize(size.width, size.height);
@@ -2219,10 +2385,14 @@ pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) ->
 
     event_loop
         .run(move |event, target| match event {
-            Event::UserEvent(done) => {
+            Event::UserEvent(PageMsg::Done(done)) => {
                 app.ui.finish(done.tab_id, done.nav, done.result);
                 app.page_cache = None;
                 app.update_title();
+                app.window.request_redraw();
+            }
+            Event::UserEvent(PageMsg::Update { tab_id, nav, outcome }) => {
+                app.page_update(tab_id, nav, outcome);
                 app.window.request_redraw();
             }
             Event::AboutToWait => {
@@ -2594,7 +2764,7 @@ mod tests {
         }
         let mut kinds: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
         for draw in &loaded.page.draws {
-            let one = Page { draws: vec![draw.clone()], links: vec![], text: vec![], height: loaded.page.height, background: None, content_right: 0.0 };
+            let one = Page { draws: vec![draw.clone()], height: loaded.page.height, ..Page::default() };
             let t = Instant::now();
             view.paint_scaled(&fonts, &one, 0.0, s);
             let name = match draw {

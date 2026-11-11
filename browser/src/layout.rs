@@ -55,6 +55,23 @@ pub enum Draw {
 pub struct LinkHit {
     pub rect: Rect,
     pub href: String,
+    /// the `<a>` element (its `data-sepia-id`), when scripts run
+    pub node: Option<usize>,
+}
+
+/// Inside layout a link's href carries its element id after a NUL; split it.
+fn link(rect: Rect, href: &str) -> LinkHit {
+    match href.split_once('\0') {
+        Some((h, id)) => LinkHit { rect, href: h.to_string(), node: id.parse().ok() },
+        None => LinkHit { rect, href: href.to_string(), node: None },
+    }
+}
+
+fn link_target(node: &Node, href: &str) -> String {
+    match node.attr("data-sepia-id") {
+        Some(id) => format!("{href}\0{id}"),
+        None => href.to_string(),
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -68,6 +85,9 @@ pub struct Page {
     /// Right edge of the widest line box (inline content, atoms included):
     /// what measuring min/max-content reads.
     pub content_right: f32,
+    /// Element boxes with their `data-sepia-id` (only when scripts run):
+    /// what a click lands on.
+    pub boxes: Vec<(Rect, usize)>,
 }
 
 pub struct Fonts {
@@ -488,6 +508,9 @@ impl<'a> Layout<'a> {
         if paints && (b.top > 0.0 || b.right > 0.0 || b.bottom > 0.0 || b.left > 0.0) {
             self.page.draws.push(Draw::Edges { rect, widths: b, colors: style.border_colors, radius: style.radius });
         }
+        if let Some(id) = node.attr("data-sepia-id").and_then(|v| v.parse::<usize>().ok()) {
+            self.page.boxes.push((rect, id));
+        }
         self.last_margin_bottom = margin_bottom;
         total + margin.top + margin_bottom
     }
@@ -597,7 +620,7 @@ impl<'a> Layout<'a> {
                 items.push(InlineItem {
                     text: String::new(),
                     style,
-                    href: href.clone().or_else(|| if node.tag == "a" { node.attr("href").map(String::from) } else { None }),
+                    href: href.clone().or_else(|| if node.tag == "a" { node.attr("href").map(|h| link_target(node, h)) } else { None }),
                     br: false,
                     image: false,
                     own_background: None,
@@ -715,7 +738,7 @@ impl<'a> Layout<'a> {
         let mut child_href = href;
         if node.tag == "a" {
             if let Some(target) = node.attr("href") {
-                child_href = Some(target.to_string());
+                child_href = Some(link_target(node, target));
             }
         }
         let own_background = style.background;
@@ -981,8 +1004,11 @@ impl<'a> Layout<'a> {
                         link.rect.y += dy;
                         self.page.links.push(link);
                     }
+                    for (rect, id) in &page.boxes {
+                        self.page.boxes.push((Rect { x: rect.x + dx, y: rect.y + dy, ..*rect }, *id));
+                    }
                     if let Some(href) = &item.href {
-                        self.page.links.push(LinkHit { rect: Rect { x: dx, y: dy, w: img.w, h: img.h }, href: href.clone() });
+                        self.page.links.push(link(Rect { x: dx, y: dy, w: img.w, h: img.h }, href));
                     }
                     self.page.text.extend(page.text.iter().cloned());
                     pen_x += img.w;
@@ -992,7 +1018,7 @@ impl<'a> Layout<'a> {
                 let rect = Rect { x: pen_x, y: baseline - img.h, w: img.w, h: img.h };
                 self.page.draws.push(Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() });
                 if let Some(href) = &item.href {
-                    self.page.links.push(LinkHit { rect, href: href.clone() });
+                    self.page.links.push(link(rect, href));
                 }
                 if !img.alt.is_empty() {
                     self.page.text.push(img.alt.clone());
@@ -1022,15 +1048,7 @@ impl<'a> Layout<'a> {
                 letter_spacing: item.style.letter_spacing,
             });
             if let Some(href) = &item.href {
-                self.page.links.push(LinkHit {
-                    rect: Rect {
-                        x: pen_x,
-                        y: baseline - ascent,
-                        w: advance.max(2.0),
-                        h: ascent + descent,
-                    },
-                    href: href.clone(),
-                });
+                self.page.links.push(link(Rect { x: pen_x, y: baseline - ascent, w: advance.max(2.0), h: ascent + descent }, href));
             }
             self.page.text.push(text.clone());
             pen_x += advance;
@@ -1394,6 +1412,9 @@ impl<'a> Layout<'a> {
                 link.rect.y += dy;
                 self.page.links.push(link);
             }
+            for (rect, id) in page.boxes {
+                self.page.boxes.push((Rect { x: rect.x + dx, y: rect.y + dy, ..rect }, id));
+            }
             self.page.text.extend(page.text);
             if cell.border > 0.0 {
                 let color = if cell.style.border_width > 0.0 { cell.style.border_color } else { Color::GRAY };
@@ -1467,6 +1488,9 @@ impl<'a> Layout<'a> {
             link.rect.x += dx;
             link.rect.y += dy;
             self.page.links.push(link);
+        }
+        for (rect, id) in page.boxes {
+            self.page.boxes.push((Rect { x: rect.x + dx, y: rect.y + dy, ..rect }, id));
         }
         self.page.text.extend(page.text);
     }
@@ -1569,7 +1593,10 @@ impl<'a> Layout<'a> {
             }
             let used: f32 = items[line.clone()].iter().map(|i| i.size).sum::<f32>() + gaps;
             let leftover = (width - used).max(0.0);
-            let (mut pen, spacing) = match f.justify {
+            // when measuring, everything packs to the start: centring a
+            // line in a 100000px measuring box would read as a huge width
+            let justify = if self.measuring { Justify::Start } else { f.justify };
+            let (mut pen, spacing) = match justify {
                 Justify::Start => (0.0, 0.0),
                 Justify::End => (leftover, 0.0),
                 Justify::Center => (leftover / 2.0, 0.0),
@@ -1625,7 +1652,8 @@ impl<'a> Layout<'a> {
         let content: f32 = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
         let leftover = style.height.map(|h| (h - content).max(0.0)).unwrap_or(0.0);
         let count = laid.len();
-        let (mut pen, spacing) = match f.justify {
+        let justify = if self.measuring { Justify::Start } else { f.justify };
+        let (mut pen, spacing) = match justify {
             Justify::Start => (0.0, 0.0),
             Justify::End => (leftover, 0.0),
             Justify::Center => (leftover / 2.0, 0.0),
@@ -1635,6 +1663,7 @@ impl<'a> Layout<'a> {
             Justify::SpaceEvenly => (leftover / (count + 1) as f32, leftover / (count + 1) as f32),
         };
         for ((page, h, w), align) in laid.into_iter().zip(aligns) {
+            let align = if self.measuring { AlignItems::Start } else { align };
             let dx = match align {
                 AlignItems::Center => (width - w) / 2.0,
                 AlignItems::End => width - w,
@@ -1810,13 +1839,14 @@ impl<'a> Layout<'a> {
             col: usize,
             span: usize,
             margin: (f32, f32),
+            align: AlignItems,
         }
         let mut items: Vec<GridItem> = Vec::new();
         let (mut row, mut col) = (0usize, 0usize);
         for child in &node.children {
-            let (span, margin) = match &child.text {
+            let (span, margin, align) = match &child.text {
                 Some(t) if t.trim().is_empty() => continue,
-                Some(_) => (1, (0.0, 0.0)),
+                Some(_) => (1, (0.0, 0.0), style.flex.align),
                 None => {
                     let s = compute(child, Some(style), self.sheet, ancestors, width);
                     if s.display == Display::None {
@@ -1827,14 +1857,14 @@ impl<'a> Layout<'a> {
                         GridSpan::Span(n) => n.min(columns),
                         GridSpan::Full => columns,
                     };
-                    (span, (s.margin.top, s.margin.bottom))
+                    (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align))
                 }
             };
             if col + span > columns && col > 0 {
                 row += 1;
                 col = 0;
             }
-            items.push(GridItem { node: child, row, col, span, margin });
+            items.push(GridItem { node: child, row, col, span, margin, align });
             col += span;
             if col >= columns {
                 row += 1;
@@ -1918,7 +1948,7 @@ impl<'a> Layout<'a> {
         }
         for (item, (mut page, h)) in items.iter().zip(laid) {
             let slack = row_h[item.row] - h;
-            let dy = match style.flex.align {
+            let dy = match item.align {
                 AlignItems::Center => slack / 2.0,
                 AlignItems::End => slack,
                 AlignItems::Stretch => {
