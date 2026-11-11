@@ -1,0 +1,22 @@
+<html><head><title>flex</title><style>
+body { font-family: sans-serif; }
+.nav { display: flex; justify-content: space-between; align-items: center; background: #1d2330; color: #ffffff; padding: 10px 16px; }
+.nav .links { display: flex; gap: 18px; }
+.nav a { color: #9fd3ff; }
+.cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.card { width: 200px; border: 1px solid #cccccc; padding: 10px; background: #f6f7f9; }
+.split { display: flex; gap: 16px; }
+.side { width: 160px; background: #eef3ff; padding: 8px; }
+.main { flex: 1; background: #fff8e8; padding: 8px; }
+.center { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px; background: #eaf7ee; }
+</style></head><body>
+<div class="nav"><b>Sepia</b><div class="links"><a href="/a">Docs</a><a href="/b">Blog</a><a href="/c">About</a></div></div>
+<div class="cards">
+  <div class="card"><b>Card one</b><p>Short text.</p></div>
+  <div class="card"><b>Card two</b><p>A little more text in this card so it wraps.</p></div>
+  <div class="card"><b>Card three</b><p>Third.</p></div>
+  <div class="card"><b>Card four</b><p>Fourth wraps to the next line.</p></div>
+</div>
+<div class="split"><div class="side">Sidebar with a fixed 160px width.</div><div class="main">Main column takes the rest of the row with flex: 1, and its text wraps inside it when it gets long enough to need more than one line.</div></div>
+<div class="center"><b>Centered column</b><span>align-items: center</span><span>gap: 6px</span></div>
+</body></html>

@@ -14,6 +14,63 @@ pub enum Display {
     RowGroup,
     Row,
     Cell,
+    Flex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Justify {
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignItems {
+    Stretch,
+    Start,
+    End,
+    Center,
+}
+
+/// The flexbox subset: container and item properties together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Flex {
+    pub direction: FlexDirection,
+    pub wrap: bool,
+    pub justify: Justify,
+    pub align: AlignItems,
+    pub row_gap: f32,
+    pub column_gap: f32,
+    pub grow: f32,
+    pub shrink: f32,
+    pub basis: Option<f32>,
+}
+
+impl Default for Flex {
+    fn default() -> Flex {
+        Flex {
+            direction: FlexDirection::Row,
+            wrap: false,
+            justify: Justify::Start,
+            align: AlignItems::Stretch,
+            row_gap: 0.0,
+            column_gap: 0.0,
+            grow: 0.0,
+            shrink: 1.0,
+            basis: None,
+        }
+    }
 }
 
 /// `vertical-align` / `valign`, as far as table cells use it.
@@ -73,6 +130,7 @@ pub struct Style {
     /// None = not specified (a cell then takes its row's, else middle).
     pub valign: Option<VAlign>,
     pub border_collapse: bool,
+    pub flex: Flex,
 }
 
 impl Default for Style {
@@ -97,6 +155,7 @@ impl Default for Style {
             marker: None,
             valign: None,
             border_collapse: false,
+            flex: Flex::default(),
         }
     }
 }
@@ -252,7 +311,8 @@ fn parse_four(value: &str, font_size: f32, percent_base: f32) -> Option<Edges> {
     }
 }
 
-fn inherited(parent: &Style) -> Style {
+/// The properties a child inherits from `parent`, everything else default.
+pub fn inherited(parent: &Style) -> Style {
     let mut style = Style::default();
     style.color = parent.color;
     style.font_size = parent.font_size;
@@ -309,6 +369,11 @@ fn presentational_hints(node: &Node, style: &mut Style, containing_width: f32) {
     if tag == "th" {
         style.align = Align::Center; // not inherited from the row
     }
+    if tag == "table" {
+        // HTML's UA sheet (quirks): a table does not inherit text-align, so
+        // <center><table> centres the table, not the text in its cells.
+        style.align = Align::Left;
+    }
     if let Some(color) = node.attr("bgcolor").and_then(parse_color) {
         style.background = Some(color);
     }
@@ -352,7 +417,8 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "display" => {
             style.display = match value {
                 "none" => Display::None,
-                "block" | "flex" | "grid" => Display::Block,
+                "flex" | "inline-flex" => Display::Flex,
+                "block" | "grid" | "inline-grid" => Display::Block,
                 "table" | "inline-table" => Display::Table,
                 "table-row-group" | "table-header-group" | "table-footer-group" => Display::RowGroup,
                 "table-row" => Display::Row,
@@ -386,6 +452,80 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "font-style" => style.italic = value == "italic" || value == "oblique",
         "text-decoration" | "text-decoration-line" => {
             style.underline = value.contains("underline")
+        }
+        "flex-direction" => {
+            style.flex.direction = match value {
+                "row-reverse" => FlexDirection::RowReverse,
+                "column" => FlexDirection::Column,
+                "column-reverse" => FlexDirection::ColumnReverse,
+                _ => FlexDirection::Row,
+            }
+        }
+        "flex-wrap" => style.flex.wrap = value.starts_with("wrap"),
+        "flex-flow" => {
+            for part in value.split_whitespace() {
+                apply(style, if part.contains("wrap") { "flex-wrap" } else { "flex-direction" }, part, containing_width);
+            }
+        }
+        "justify-content" => {
+            style.flex.justify = match value.trim_start_matches("safe ").trim_start_matches("unsafe ") {
+                "flex-end" | "end" | "right" => Justify::End,
+                "center" => Justify::Center,
+                "space-between" => Justify::SpaceBetween,
+                "space-around" => Justify::SpaceAround,
+                "space-evenly" => Justify::SpaceEvenly,
+                _ => Justify::Start,
+            }
+        }
+        "align-items" => {
+            style.flex.align = match value {
+                "flex-start" | "start" | "self-start" | "baseline" | "first baseline" => AlignItems::Start,
+                "flex-end" | "end" | "self-end" => AlignItems::End,
+                "center" => AlignItems::Center,
+                _ => AlignItems::Stretch,
+            }
+        }
+        "gap" | "grid-gap" => {
+            let mut parts = value.split_whitespace().filter_map(|v| parse_length(v, font_size, containing_width));
+            if let Some(row) = parts.next() {
+                style.flex.row_gap = row;
+                style.flex.column_gap = parts.next().unwrap_or(row);
+            }
+        }
+        "row-gap" => style.flex.row_gap = parse_length(value, font_size, containing_width).unwrap_or(0.0),
+        "column-gap" => style.flex.column_gap = parse_length(value, font_size, containing_width).unwrap_or(0.0),
+        "flex-grow" => style.flex.grow = value.parse::<f32>().unwrap_or(0.0).max(0.0),
+        "flex-shrink" => style.flex.shrink = value.parse::<f32>().unwrap_or(1.0).max(0.0),
+        "flex-basis" => style.flex.basis = parse_length(value, font_size, containing_width),
+        "flex" => {
+            // flex: none | auto | <grow> [<shrink>] [<basis>]
+            let (grow, shrink, basis) = match value {
+                "none" => (0.0, 0.0, None),
+                "auto" => (1.0, 1.0, None),
+                "initial" => (0.0, 1.0, None),
+                _ => {
+                    let mut numbers = Vec::new();
+                    let mut basis = None;
+                    let mut basis_given = false;
+                    for part in value.split_whitespace() {
+                        match part.parse::<f32>() {
+                            Ok(n) if numbers.len() < 2 => numbers.push(n),
+                            _ => {
+                                basis_given = true;
+                                basis = if part == "auto" { None } else { parse_length(part, font_size, containing_width) };
+                            }
+                        }
+                    }
+                    let grow = numbers.first().copied().unwrap_or(1.0);
+                    let shrink = numbers.get(1).copied().unwrap_or(1.0);
+                    // `flex: 1` means a basis of 0; `flex: 1 0 auto` keeps auto
+                    let basis = if basis_given { basis } else { Some(0.0) };
+                    (grow, shrink, basis)
+                }
+            };
+            style.flex.grow = grow.max(0.0);
+            style.flex.shrink = shrink.max(0.0);
+            style.flex.basis = basis;
         }
         "vertical-align" => {
             style.valign = parse_valign(value).or(style.valign);

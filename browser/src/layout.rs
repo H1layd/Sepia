@@ -224,7 +224,7 @@ impl<'a> Layout<'a> {
         let content_x = margin;
         let content_width = self.viewport_width - margin * 2.0;
         for child in &root.children {
-            cursor += self.layout_block(child, &ancestors, content_x, cursor, content_width);
+            cursor += self.layout_block(child, &ancestors, None, content_x, cursor, content_width);
         }
         self.page.height = cursor.max(1.0);
         self.page
@@ -237,10 +237,14 @@ impl<'a> Layout<'a> {
             .unwrap_or_default()
     }
 
+    /// `parent` is the computed style of the element this block sits in, so
+    /// inherited properties (colour, font, alignment) come from what the
+    /// cascade actually produced there; without it, the parent tag's defaults.
     fn layout_block(
         &mut self,
         node: &Node,
         ancestors: &[&Node],
+        parent: Option<&Style>,
         x: f32,
         y: f32,
         containing_width: f32,
@@ -251,7 +255,7 @@ impl<'a> Layout<'a> {
                 return 0.0;
             }
             // Stray text at block level: lay it out as an inline line.
-            let style = Style::default();
+            let style = parent.map(crate::style::inherited).unwrap_or_default();
             let items = vec![InlineItem {
                 text: collapse_ws(&text),
                 style,
@@ -264,14 +268,15 @@ impl<'a> Layout<'a> {
             return self.layout_inline(&items, x, y, containing_width);
         }
 
-        let parent_style = ancestors.last().map(|n| default_for(n));
+        let parent_style = parent.cloned().or_else(|| ancestors.last().map(|n| default_for(n)));
         let style = compute(node, parent_style.as_ref(), self.sheet, ancestors, containing_width);
         if style.display == Display::None {
             return 0.0;
         }
 
         if style.display == Display::Table {
-            return self.layout_table(node, ancestors, &style, x, y, containing_width);
+            let outer_align = parent_style.as_ref().map(|p| p.align).unwrap_or(Align::Left);
+            return self.layout_table(node, ancestors, &style, outer_align, x, y, containing_width);
         }
 
         let mut ancestors2: Vec<&Node> = ancestors.to_vec();
@@ -333,7 +338,11 @@ impl<'a> Layout<'a> {
             }
         }
 
-        cursor += self.layout_children(node, &ancestors2, &style, inner_x, cursor, content_width);
+        cursor += if style.display == Display::Flex {
+            self.layout_flex(node, &ancestors2, &style, inner_x, cursor, content_width)
+        } else {
+            self.layout_children(node, &ancestors2, &style, inner_x, cursor, content_width)
+        };
 
         let mut content_height = cursor - inner_y;
         if let Some(height) = style.height {
@@ -383,7 +392,7 @@ impl<'a> Layout<'a> {
                     cursor += self.layout_inline(&items, x, cursor, width);
                     items.clear();
                 }
-                cursor += self.layout_block(child, ancestors, x, cursor, width);
+                cursor += self.layout_block(child, ancestors, Some(style), x, cursor, width);
             } else {
                 self.collect_inline(child, ancestors, style, current_href.clone(), &mut items);
             }
@@ -844,7 +853,10 @@ impl<'a> Layout<'a> {
     /// fitted to the space, rows as tall as their tallest cell, cells
     /// aligned vertically inside their row. `border`, `cellspacing`,
     /// `cellpadding` and `border-collapse` are honoured.
-    fn layout_table(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, containing_width: f32) -> f32 {
+    /// `outer_align` is the text alignment around the table (a `<center>`),
+    /// which positions the table box itself.
+    #[allow(clippy::too_many_arguments)]
+    fn layout_table(&mut self, node: &Node, ancestors: &[&Node], style: &Style, outer_align: Align, x: f32, y: f32, containing_width: f32) -> f32 {
         let margin = style.margin;
         let avail = (containing_width - margin.horizontal()).max(1.0);
         let frame = match node.attr("border") {
@@ -1060,7 +1072,7 @@ impl<'a> Layout<'a> {
             Some("center") => free / 2.0,
             Some("right") => free,
             Some(_) => 0.0,
-            None if style.align == Align::Center => free / 2.0,
+            None if outer_align == Align::Center => free / 2.0,
             None => 0.0,
         };
         let (tx, ty) = (x + margin.left + offset, y + margin.top);
@@ -1110,6 +1122,232 @@ impl<'a> Layout<'a> {
             self.page.draws.push(Draw::Border { rect: Rect { x: tx, y: ty, w: table_w, h: table_h }, width: frame, color });
         }
         table_h + margin.vertical()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flexbox (subset)
+// ---------------------------------------------------------------------------
+
+/// One flex item: an element child, or a run of text (an anonymous item).
+struct FlexItem<'n> {
+    node: &'n Node,
+    flex: crate::style::Flex,
+    /// main size the item asks for before growing/shrinking (outer, margins included)
+    basis: f32,
+    /// smallest main size it can shrink to (min-content, outer)
+    min: f32,
+    /// main size after grow/shrink
+    size: f32,
+    /// the item's own vertical margins, to find its box when stretching
+    margin_top: f32,
+    margin_bottom: f32,
+}
+
+/// `align-items: stretch`: grow the item's own box (its background and
+/// border, which span exactly from its top to its bottom margin) by `extra`.
+fn stretch_box(page: &mut Page, height: f32, extra: f32, margin_top: f32, margin_bottom: f32) {
+    let bottom = height - margin_bottom;
+    for draw in &mut page.draws {
+        if let Draw::Rect { rect, .. } | Draw::Border { rect, .. } = draw {
+            if (rect.y - margin_top).abs() < 0.5 && (rect.y + rect.h - bottom).abs() < 0.5 {
+                rect.h += extra;
+            }
+        }
+    }
+}
+
+impl<'a> Layout<'a> {
+    /// Lay `node` out as a block at the origin of a scratch page with
+    /// `width` available: (page, height). Used to measure and place items.
+    fn item_page(&self, node: &Node, ancestors: &[&Node], parent: &Style, width: f32, measuring: bool) -> (Page, f32) {
+        let mut sub = self.sub_layout(measuring);
+        let height = sub.layout_block(node, ancestors, Some(parent), 0.0, 0.0, width.max(1.0));
+        (sub.page, height)
+    }
+
+    fn paste(&mut self, page: Page, dx: f32, dy: f32) {
+        for mut draw in page.draws {
+            translate(&mut draw, dx, dy);
+            self.page.draws.push(draw);
+        }
+        for mut link in page.links {
+            link.rect.x += dx;
+            link.rect.y += dy;
+            self.page.links.push(link);
+        }
+        self.page.text.extend(page.text);
+    }
+
+    /// The flexbox subset: `flex-direction`, `flex-wrap`, `justify-content`,
+    /// `align-items`, `gap`, `flex-grow` / `flex-shrink` / `flex-basis`.
+    /// Items are measured (max- and min-content), sized along the main axis,
+    /// broken into lines when wrapping, then placed and aligned; returns the
+    /// height used. `ancestors` ends with `node`.
+    fn layout_flex(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
+        use crate::style::{AlignItems, FlexDirection, Justify};
+        let f = style.flex;
+        let row = matches!(f.direction, FlexDirection::Row | FlexDirection::RowReverse);
+        let reverse = matches!(f.direction, FlexDirection::RowReverse | FlexDirection::ColumnReverse);
+
+        let mut items: Vec<FlexItem> = Vec::new();
+        for child in &node.children {
+            let (item_flex, margin_top, margin_bottom) = match &child.text {
+                Some(text) if text.trim().is_empty() => continue,
+                Some(_) => (crate::style::Flex::default(), 0.0, 0.0),
+                None => {
+                    let s = compute(child, Some(style), self.sheet, ancestors, width);
+                    if s.display == Display::None {
+                        continue;
+                    }
+                    (s.flex, s.margin.top, s.margin.bottom)
+                }
+            };
+            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom });
+        }
+        if reverse {
+            items.reverse();
+        }
+        if items.is_empty() {
+            return 0.0;
+        }
+
+        if !row {
+            return self.layout_flex_column(items, ancestors, style, x, y, width);
+        }
+
+        // ----- measure along the main (horizontal) axis ----------------------
+        for item in &mut items {
+            let (wide, _) = self.item_page(item.node, ancestors, style, 100_000.0, true);
+            let (narrow, _) = self.item_page(item.node, ancestors, style, 1.0, true);
+            let own = match item.node.text {
+                Some(_) => None,
+                // a declared width is the content box; the item's outer size adds its margins
+                None => {
+                    let s = compute(item.node, Some(style), self.sheet, ancestors, width);
+                    s.width.map(|w| w + s.margin.horizontal())
+                }
+            };
+            let max_content = self.extent(&wide);
+            item.min = self.extent(&narrow).min(max_content);
+            item.basis = item.flex.basis.or(own).unwrap_or(max_content);
+            if own.is_some() && item.flex.basis.is_none() {
+                item.min = item.min.min(item.basis);
+            }
+        }
+
+        // ----- lines -----------------------------------------------------------
+        let gap = f.column_gap;
+        let mut lines: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut start = 0;
+        let mut used = 0.0f32;
+        for i in 0..items.len() {
+            let add = items[i].basis + if i > start { gap } else { 0.0 };
+            if f.wrap && i > start && used + add > width {
+                lines.push(start..i);
+                start = i;
+                used = items[i].basis;
+            } else {
+                used += add;
+            }
+        }
+        lines.push(start..items.len());
+
+        // ----- grow / shrink, place, align --------------------------------------
+        let mut cursor = y;
+        for (n, line) in lines.iter().enumerate() {
+            let count = line.len();
+            let gaps = gap * (count.saturating_sub(1)) as f32;
+            let total: f32 = items[line.clone()].iter().map(|i| i.basis).sum();
+            let free = width - total - gaps;
+            if free > 0.0 {
+                let grow: f32 = items[line.clone()].iter().map(|i| i.flex.grow).sum();
+                for item in &mut items[line.clone()] {
+                    item.size = item.basis + if grow > 0.0 { free * item.flex.grow / grow } else { 0.0 };
+                }
+            } else {
+                // shrink in proportion to shrink × basis, never below min-content
+                let weight: f32 = items[line.clone()].iter().map(|i| i.flex.shrink * i.basis).sum();
+                for item in &mut items[line.clone()] {
+                    let cut = if weight > 0.0 { -free * item.flex.shrink * item.basis / weight } else { 0.0 };
+                    item.size = (item.basis - cut).max(item.min);
+                }
+            }
+            let used: f32 = items[line.clone()].iter().map(|i| i.size).sum::<f32>() + gaps;
+            let leftover = (width - used).max(0.0);
+            let (mut pen, spacing) = match f.justify {
+                Justify::Start => (0.0, 0.0),
+                Justify::End => (leftover, 0.0),
+                Justify::Center => (leftover / 2.0, 0.0),
+                Justify::SpaceBetween if count > 1 => (0.0, leftover / (count - 1) as f32),
+                Justify::SpaceBetween => (0.0, 0.0),
+                Justify::SpaceAround => (leftover / count as f32 / 2.0, leftover / count as f32),
+                Justify::SpaceEvenly => (leftover / (count + 1) as f32, leftover / (count + 1) as f32),
+            };
+            let laid: Vec<(Page, f32)> = items[line.clone()]
+                .iter()
+                .map(|item| self.item_page(item.node, ancestors, style, item.size, false))
+                .collect();
+            let line_h = laid.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
+            for (item, (mut page, h)) in items[line.clone()].iter().zip(laid) {
+                if f.align == AlignItems::Stretch && h < line_h && item.node.text.is_none() {
+                    stretch_box(&mut page, h, line_h - h, item.margin_top, item.margin_bottom);
+                }
+                let dy = match f.align {
+                    AlignItems::Center => (line_h - h) / 2.0,
+                    AlignItems::End => line_h - h,
+                    AlignItems::Start | AlignItems::Stretch => 0.0,
+                };
+                self.paste(page, x + pen, cursor + dy);
+                pen += item.size + gap + spacing;
+            }
+            cursor += line_h;
+            if n + 1 < lines.len() {
+                cursor += f.row_gap;
+            }
+        }
+        cursor - y
+    }
+
+    /// Column direction: items stack; `align-items` places them across,
+    /// `justify-content` along the container's declared height, if any.
+    fn layout_flex_column(&mut self, items: Vec<FlexItem>, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
+        use crate::style::{AlignItems, Justify};
+        let f = style.flex;
+        let mut laid: Vec<(Page, f32, f32)> = Vec::new(); // page, height, width
+        for item in &items {
+            let item_w = if f.align == AlignItems::Stretch {
+                width
+            } else {
+                let (wide, _) = self.item_page(item.node, ancestors, style, width, true);
+                self.extent(&wide).min(width).max(1.0)
+            };
+            let (page, h) = self.item_page(item.node, ancestors, style, item_w, false);
+            laid.push((page, h, item_w));
+        }
+        let gaps = f.row_gap * (laid.len().saturating_sub(1)) as f32;
+        let content: f32 = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
+        let leftover = style.height.map(|h| (h - content).max(0.0)).unwrap_or(0.0);
+        let count = laid.len();
+        let (mut pen, spacing) = match f.justify {
+            Justify::Start => (0.0, 0.0),
+            Justify::End => (leftover, 0.0),
+            Justify::Center => (leftover / 2.0, 0.0),
+            Justify::SpaceBetween if count > 1 => (0.0, leftover / (count - 1) as f32),
+            Justify::SpaceBetween => (0.0, 0.0),
+            Justify::SpaceAround => (leftover / count as f32 / 2.0, leftover / count as f32),
+            Justify::SpaceEvenly => (leftover / (count + 1) as f32, leftover / (count + 1) as f32),
+        };
+        for (page, h, w) in laid {
+            let dx = match f.align {
+                AlignItems::Center => (width - w) / 2.0,
+                AlignItems::End => width - w,
+                _ => 0.0,
+            };
+            self.paste(page, x + dx, y + pen);
+            pen += h + f.row_gap + spacing;
+        }
+        (pen - f.row_gap - spacing).max(0.0)
     }
 }
 
@@ -1435,6 +1673,78 @@ mod tests {
         });
         assert!(right <= 600.0 - 8.0 + 0.5, "table overflowed: {right}");
         assert!(page.height > 100.0, "text wrapped inside the cells");
+    }
+
+    fn flex_page(html: &str, width: f32) -> Page {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let doc = parse_document(html);
+        Layout::new(&fonts, &sheet, width).build(&doc)
+    }
+
+    #[test]
+    fn flex_row_places_items_side_by_side() {
+        let page = flex_page("<div style='display:flex;gap:10px'><div>one</div><div>two</div><div>three</div></div>", 600.0);
+        let (x1, y1) = text_x(&page, "one");
+        let (x2, y2) = text_x(&page, "two");
+        let (x3, y3) = text_x(&page, "three");
+        assert!(y1 == y2 && y2 == y3, "one line");
+        let fonts = fonts();
+        let w1 = fonts.advance("one", 16.0, false, false);
+        assert!((x2 - (x1 + w1 + 10.0)).abs() < 0.5, "gap between items: {x1} {x2}");
+        assert!(x3 > x2);
+    }
+
+    #[test]
+    fn flex_grow_and_justify() {
+        // grow: the middle item takes the free space, so "end" sits at the right edge
+        let page = flex_page(
+            "<div style='display:flex'><div>start</div><div style='flex:1'>mid</div><div>end</div></div>",
+            508.0,
+        );
+        let fonts = fonts();
+        let (ex, _) = text_x(&page, "end");
+        let end_w = fonts.advance("end", 16.0, false, false);
+        assert!((ex + end_w - 500.0).abs() < 0.5, "end at right edge: {}", ex + end_w);
+
+        let page = flex_page("<div style='display:flex;justify-content:space-between'><span>L</span><span>R</span></div>", 508.0);
+        let (rx, _) = text_x(&page, "R");
+        assert!((rx + fonts.advance("R", 16.0, false, false) - 500.0).abs() < 0.5);
+
+        let page = flex_page("<div style='display:flex;justify-content:center'><span>mid</span></div>", 508.0);
+        let (mx, _) = text_x(&page, "mid");
+        let w = fonts.advance("mid", 16.0, false, false);
+        assert!((mx - (8.0 + (492.0 - w) / 2.0)).abs() < 0.5, "mid at {mx}, want {}", 8.0 + (492.0 - w) / 2.0);
+    }
+
+    #[test]
+    fn flex_wrap_and_column() {
+        let items: String = (0..6).map(|i| format!("<div style='width:150px'>item{i}</div>")).collect();
+        let page = flex_page(&format!("<div style='display:flex;flex-wrap:wrap;row-gap:4px'>{items}</div>"), 508.0);
+        let (_, y0) = text_x(&page, "item0");
+        let (_, y2) = text_x(&page, "item2");
+        let (_, y3) = text_x(&page, "item3");
+        assert_eq!(y0, y2, "three 150px items fit in 500px");
+        assert!(y3 > y0, "the fourth wraps");
+
+        let page = flex_page("<div style='display:flex;flex-direction:column;align-items:center'><div>top</div><div>bottom</div></div>", 508.0);
+        let (tx, ty) = text_x(&page, "top");
+        let (_, by) = text_x(&page, "bottom");
+        assert!(by > ty, "column stacks");
+        assert!(tx > 150.0, "align-items:center centres across: {tx}");
+    }
+
+    #[test]
+    fn flex_shrinks_to_fit_but_not_below_min_content() {
+        let long = "word ".repeat(60);
+        let page = flex_page(&format!("<div style='display:flex'><div>{long}</div><div>{long}</div></div>"), 408.0);
+        let fonts = fonts();
+        let right = page.draws.iter().fold(0.0f32, |acc, d| match d {
+            Draw::Text { x, text, .. } => acc.max(x + fonts.advance(text, 16.0, false, false)),
+            _ => acc,
+        });
+        assert!(right <= 400.0 + 8.0 + 0.5, "overflowed to {right}");
+        assert!(page.height > 60.0, "text wrapped inside the shrunk items");
     }
 
     #[test]
