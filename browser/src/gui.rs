@@ -493,16 +493,17 @@ impl Ui {
 
     fn geom(&self) -> Geom {
         let (w, h) = (self.w, self.h);
+        // the page runs to the top; the capsule floats over it
         let viewport = Rect {
             x: theme::INSET,
-            y: theme::TOP,
+            y: theme::INSET,
             w: w - theme::INSET * 2.0,
-            h: h - theme::TOP - theme::INSET,
+            h: h - theme::INSET * 2.0,
         };
         let open_w = theme::CAPSULE_OPEN_MAX.min(w - 32.0);
         let t = smooth(self.addr_open);
         let cap_w = theme::CAPSULE + (open_w - theme::CAPSULE) * t;
-        let capsule = Rect { x: (w - cap_w) / 2.0, y: (theme::TOP - theme::CAPSULE) / 2.0, w: cap_w, h: theme::CAPSULE };
+        let capsule = Rect { x: (w - cap_w) / 2.0, y: theme::INSET + 10.0, w: cap_w, h: theme::CAPSULE };
 
         let fixed = |arrows: bool| {
             12.0 + theme::BUTTON + 8.0 + 1.0 + 8.0
@@ -1082,6 +1083,41 @@ impl RoundShape {
     }
 }
 
+/// One horizontal and one vertical box-blur pass of `radius`, edges clamped.
+fn box_blur(buf: &mut [[f32; 3]], w: usize, h: usize, radius: usize) {
+    let mut line = vec![[0.0f32; 3]; w.max(h)];
+    let span = (2 * radius + 1) as f32;
+    let mut run = |get: &dyn Fn(usize) -> [f32; 3], n: usize, out: &mut [[f32; 3]]| {
+        let at = |i: isize| get(i.clamp(0, n as isize - 1) as usize);
+        let mut sum = [0.0f32; 3];
+        for k in -(radius as isize)..=(radius as isize) {
+            let v = at(k);
+            for c in 0..3 {
+                sum[c] += v[c];
+            }
+        }
+        for i in 0..n {
+            out[i] = [sum[0] / span, sum[1] / span, sum[2] / span];
+            let (add, sub) = (at(i as isize + radius as isize + 1), at(i as isize - radius as isize));
+            for c in 0..3 {
+                sum[c] += add[c] - sub[c];
+            }
+        }
+    };
+    for y in 0..h {
+        let row: Vec<[f32; 3]> = buf[y * w..(y + 1) * w].to_vec();
+        run(&|i| row[i], w, &mut line[..w]);
+        buf[y * w..(y + 1) * w].copy_from_slice(&line[..w]);
+    }
+    for x in 0..w {
+        let col: Vec<[f32; 3]> = (0..h).map(|y| buf[y * w + x]).collect();
+        run(&|i| col[i], h, &mut line[..h]);
+        for y in 0..h {
+            buf[y * w + x] = line[y];
+        }
+    }
+}
+
 fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (pax, pay, bax, bay) = (px - ax, py - ay, bx - ax, by - ay);
     let len = bax * bax + bay * bay;
@@ -1189,6 +1225,51 @@ impl<'a> Painter<'a> {
                 let t = 1.0 - smooth((d + b * 0.25) / b);
                 if t > 0.0 {
                     self.put(x, y, black, t * strength);
+                }
+            }
+        }
+    }
+
+    /// Blur what is already drawn under the rounded rect `r` and lay a tint
+    /// over it: a frosted-glass panel. Three box-blur passes ≈ a Gaussian.
+    fn frosted(&mut self, r: Rect, radius: f32, tint: Color, blur: f32) {
+        let s = self.s;
+        let reach = (blur * s).ceil() as i32;
+        let (cw, ch) = (self.c.width as i32, self.c.height as i32);
+        let x0 = ((r.x * s).floor() as i32 - reach).max(0);
+        let x1 = (((r.x + r.w) * s).ceil() as i32 + reach).min(cw);
+        let y0 = ((r.y * s).floor() as i32 - reach).max(0);
+        let y1 = (((r.y + r.h) * s).ceil() as i32 + reach).min(ch);
+        let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut buf = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y0 as usize + y) * self.c.width + x0 as usize + x) * 4;
+                buf[y * w + x] = [self.c.pixels[i] as f32, self.c.pixels[i + 1] as f32, self.c.pixels[i + 2] as f32];
+            }
+        }
+        let pass = ((blur * s) / 3.0).round().max(1.0) as usize;
+        for _ in 0..3 {
+            box_blur(&mut buf, w, h, pass);
+        }
+        let shape = RoundShape::new(r, radius, s);
+        let ta = tint.a as f32 / 255.0;
+        let tc = [tint.r as f32, tint.g as f32, tint.b as f32];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let cov = (0.5 - shape.sd(x, y)).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let b = buf[(y - y0) as usize * w + (x - x0) as usize];
+                let i = (y as usize * self.c.width + x as usize) * 4;
+                for c in 0..3 {
+                    let glass = b[c] * (1.0 - ta) + tc[c] * ta;
+                    let under = self.c.pixels[i + c] as f32;
+                    self.c.pixels[i + c] = (glass * cov + under * (1.0 - cov)).round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -1790,9 +1871,10 @@ impl Ui {
     fn draw_capsule(&self, p: &mut Painter, fonts: &Fonts, g: &Geom) {
         let c = g.capsule;
         let tab = self.tab();
-        p.shadow(c, c.h / 2.0, 16.0, 6.0, 0.45);
-        p.round_rect(c, c.h / 2.0, theme::PANEL);
-        p.round_stroke(c, c.h / 2.0, 1.0, theme::STROKE);
+        // frosted glass: the page behind, blurred and tinted
+        p.shadow(c, c.h / 2.0, 14.0, 4.0, 0.22);
+        p.frosted(c, c.h / 2.0, alpha(theme::PANEL, 0.62), 14.0);
+        p.round_stroke(c, c.h / 2.0, 1.0, Color { r: 255, g: 255, b: 255, a: 34 });
 
         let transport = Transport::of_tab(self.transport, tab);
         // monogram, always visible, at the left end
@@ -2339,12 +2421,21 @@ fn refresh_interval(window: &Window) -> Duration {
 }
 
 pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) -> Result<(), String> {
-    let event_loop = EventLoopBuilder::<PageMsg>::with_user_event().build().map_err(|e| e.to_string())?;
+    let mut builder = EventLoopBuilder::<PageMsg>::with_user_event();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        // a regular app in the Dock and the app switcher, which does not
+        // force itself in front of the app you are using when it starts
+        builder.with_activation_policy(ActivationPolicy::Regular).with_activate_ignoring_other_apps(false);
+    }
+    let event_loop = builder.build().map_err(|e| e.to_string())?;
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("Sepia")
             .with_inner_size(LogicalSize::new(1200.0, 860.0))
             .with_min_inner_size(LogicalSize::new(480.0, 360.0))
+            .with_window_level(winit::window::WindowLevel::Normal)
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
@@ -2803,6 +2894,7 @@ mod tests {
         dump(&c, "page");
         // page area is white inside the viewport, window colour outside
         assert_eq!(pixel(&c, 600.0, 300.0, 2.0), [255, 255, 255]);
-        assert_eq!(pixel(&c, 100.0, 20.0, 2.0)[0], theme::WINDOW.r);
+        assert_eq!(pixel(&c, 2.0, 300.0, 2.0)[0], theme::WINDOW.r, "window colour only in the inset margin");
+        assert_eq!(pixel(&c, 100.0, 20.0, 2.0), [255, 255, 255], "the page runs to the top");
     }
 }
