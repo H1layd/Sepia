@@ -48,13 +48,37 @@ impl Canvas {
         if color.a == 0 {
             return;
         }
-        let x0 = rect.x.floor() as i32;
-        let y0 = (rect.y - scroll).floor() as i32;
-        let w = rect.w.ceil() as i32;
-        let h = rect.h.ceil() as i32;
-        for y in y0..y0 + h {
-            for x in x0..x0 + w {
-                self.blend(x, y, color, 1.0);
+        let x0 = (rect.x.floor() as i32).max(0);
+        let y0 = ((rect.y - scroll).floor() as i32).max(0);
+        let x1 = ((rect.x.floor() + rect.w.ceil()) as i32).min(self.width as i32);
+        let y1 = (((rect.y - scroll).floor() + rect.h.ceil()) as i32).min(self.height as i32);
+        for y in y0..y1 {
+            self.span(y, x0, x1, color);
+        }
+    }
+
+    /// Fill pixels x0..x1 of row y at full coverage: a straight copy when
+    /// the colour is opaque, a blend otherwise. Coordinates must be clipped.
+    fn span(&mut self, y: i32, x0: i32, x1: i32, color: Color) {
+        if x1 <= x0 || y < 0 || y as usize >= self.height {
+            return;
+        }
+        let (x0, x1) = (x0.max(0) as usize, (x1 as usize).min(self.width));
+        let row = y as usize * self.width;
+        if color.a == 255 {
+            let px = [color.r, color.g, color.b, 255];
+            for chunk in self.pixels[(row + x0) * 4..(row + x1) * 4].chunks_exact_mut(4) {
+                chunk.copy_from_slice(&px);
+            }
+        } else {
+            let a = color.a as u32;
+            let keep = 255 - a;
+            let src = [color.r as u32 * a, color.g as u32 * a, color.b as u32 * a];
+            for chunk in self.pixels[(row + x0) * 4..(row + x1) * 4].chunks_exact_mut(4) {
+                for c in 0..3 {
+                    chunk[c] = ((src[c] + chunk[c] as u32 * keep + 127) / 255) as u8;
+                }
+                chunk[3] = 255;
             }
         }
     }
@@ -131,21 +155,58 @@ impl Canvas {
             return;
         }
         let radius = radius.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-        let ramp = gradient.map(|g| Ramp::new(g, r.w, r.h, scale));
+        // the gradient as a 1024-step colour table: one lookup per pixel
+        let lut = gradient.map(|g| Ramp::new(g, r.w, r.h, scale).table());
         let (x0, x1, y0, y1) = self.clip(&r, 0.0);
         for y in y0..y1 {
             let py = y as f32 + 0.5;
-            for x in x0..x1 {
+            // pixels of this row wholly inside the box take the fast path
+            let (ia, ib) = inner_span(&r, radius, y).map(|(a, b)| (a.max(x0), b.min(x1))).unwrap_or((x1, x1));
+            let coverage = |x: i32| {
                 let px = x as f32 + 0.5;
-                let cov = if radius > 0.0 { (0.5 - sd_round(px, py, &r, radius)).clamp(0.0, 1.0) } else { edge_coverage(px, py, &r) };
-                if cov <= 0.0 {
+                if radius > 0.0 { (0.5 - sd_round(px, py, &r, radius)).clamp(0.0, 1.0) } else { edge_coverage(px, py, &r) }
+            };
+            if let Some(c) = color {
+                for x in (x0..ia.min(x1)).chain(ib.max(x0)..x1) {
+                    let cov = coverage(x);
+                    if cov > 0.0 {
+                        self.blend(x, y, c, cov);
+                    }
+                }
+                if ia < ib {
+                    self.span(y, ia, ib, c);
+                }
+            }
+            if let Some((table, t0, dtx, dty)) = &lut {
+                let row_t = t0 + dty * (py - r.y);
+                if dtx.abs() < 1e-7 {
+                    // a vertical gradient: one colour for the whole row
+                    let c = table[((row_t * 1023.0).round().clamp(0.0, 1023.0)) as usize];
+                    for x in (x0..ia.min(x1)).chain(ib.max(x0)..x1) {
+                        let cov = coverage(x);
+                        if cov > 0.0 {
+                            self.blend(x, y, c, cov);
+                        }
+                    }
+                    if ia < ib {
+                        self.span(y, ia, ib, c);
+                    }
                     continue;
                 }
-                if let Some(c) = color {
-                    self.blend(x, y, c, cov);
-                }
-                if let Some(ramp) = &ramp {
-                    self.blend(x, y, ramp.at(px - r.x, py - r.y), cov);
+                for x in x0..x1 {
+                    let inside = x >= ia && x < ib;
+                    let cov = if inside { 1.0 } else { coverage(x) };
+                    if cov <= 0.0 {
+                        continue;
+                    }
+                    let t = row_t + dtx * (x as f32 + 0.5 - r.x);
+                    let c = table[((t * 1023.0).round().clamp(0.0, 1023.0)) as usize];
+                    if inside && c.a == 255 {
+                        let i = (y as usize * self.width + x as usize) * 4;
+                        self.pixels[i..i + 4].copy_from_slice(&[c.r, c.g, c.b, 255]);
+                    } else {
+                        self.blend(x, y, c, cov);
+                    }
                 }
             }
         }
@@ -174,7 +235,13 @@ impl Canvas {
         let (x0, x1, y0, y1) = self.clip(&r, 1.0);
         for y in y0..y1 {
             let py = y as f32 + 0.5;
-            for x in x0..x1 {
+            // the hole's fully covered middle needs no work
+            let (ha, hb) = if inner.w > 2.0 && inner.h > 2.0 {
+                inner_span(&Rect { x: inner.x + 1.0, y: inner.y + 1.0, w: inner.w - 2.0, h: inner.h - 2.0 }, inner_radius, y).unwrap_or((x1, x1))
+            } else {
+                (x1, x1)
+            };
+            for x in (x0..ha.min(x1)).chain(hb.max(x0)..x1) {
                 let px = x as f32 + 0.5;
                 let outer = (0.5 - sd_round(px, py, &r, radius)).clamp(0.0, 1.0);
                 if outer <= 0.0 {
@@ -387,6 +454,27 @@ impl Canvas {
     }
 }
 
+/// Pixels [a, b) of row `y` lying wholly inside the rounded rect.
+fn inner_span(r: &Rect, radius: f32, y: i32) -> Option<(i32, i32)> {
+    let (ya, yb) = (y as f32, y as f32 + 1.0);
+    if ya < r.y || yb > r.y + r.h {
+        return None;
+    }
+    let pull = |yy: f32| {
+        let dy = if yy < r.y + radius {
+            r.y + radius - yy
+        } else if yy > r.y + r.h - radius {
+            yy - (r.y + r.h - radius)
+        } else {
+            return 0.0;
+        };
+        radius - (radius * radius - dy.min(radius).powi(2)).max(0.0).sqrt()
+    };
+    let dx = pull(ya).max(pull(yb));
+    let (a, b) = ((r.x + dx).ceil() as i32, (r.x + r.w - dx).floor() as i32);
+    (a < b).then_some((a, b))
+}
+
 /// Signed distance from (px, py) to a rounded rectangle (negative inside).
 fn sd_round(px: f32, py: f32, r: &Rect, radius: f32) -> f32 {
     let (hw, hh) = (r.w / 2.0, r.h / 2.0);
@@ -465,6 +553,21 @@ impl Ramp {
             })
             .collect();
         Ramp { dir, length, center: (w / 2.0, h / 2.0), stops }
+    }
+
+    /// A 1024-entry colour table over the gradient line, with the line's
+    /// parameter at the box origin and its step per px in x and y.
+    fn table(&self) -> (Vec<Color>, f32, f32, f32) {
+        let table = (0..1024)
+            .map(|i| {
+                let t = i as f32 / 1023.0;
+                // a point on the gradient line at parameter t
+                let d = (t - 0.5) * self.length;
+                self.at(self.center.0 + self.dir.0 * d, self.center.1 + self.dir.1 * d)
+            })
+            .collect();
+        let t0 = (-self.center.0 * self.dir.0 - self.center.1 * self.dir.1) / self.length + 0.5;
+        (table, t0, self.dir.0 / self.length, self.dir.1 / self.length)
     }
 
     fn at(&self, x: f32, y: f32) -> Color {

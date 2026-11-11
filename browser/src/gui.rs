@@ -1266,6 +1266,28 @@ impl<'a> Painter<'a> {
         self.text(fonts, s, cx - w / 2.0, baseline, size, color, bold);
     }
 
+    /// Copy `rows` rows of `src`, starting at `src_row`, to (x, y).
+    fn blit_rows(&mut self, src: &Canvas, x: f32, y: f32, src_row: usize, rows: usize) {
+        let (ox, oy) = ((x * self.s).round() as isize, (y * self.s).round() as isize);
+        for r in 0..rows {
+            let sy = src_row + r;
+            let dy = oy + r as isize;
+            if sy >= src.height || dy < 0 || dy as usize >= self.c.height {
+                continue;
+            }
+            let x_start = ox.max(0) as usize;
+            let x_end = ((ox + src.width as isize).max(0) as usize).min(self.c.width);
+            if x_start >= x_end {
+                continue;
+            }
+            let src_from = (sy * src.width + (x_start as isize - ox) as usize) * 4;
+            let dst_from = (dy as usize * self.c.width + x_start) * 4;
+            let n = (x_end - x_start) * 4;
+            self.c.pixels[dst_from..dst_from + n].copy_from_slice(&src.pixels[src_from..src_from + n]);
+        }
+    }
+
+    #[allow(dead_code)]
     fn blit(&mut self, src: &Canvas, x: f32, y: f32) {
         let (ox, oy) = ((x * self.s).round() as isize, (y * self.s).round() as isize);
         for sy in 0..src.height {
@@ -1469,9 +1491,10 @@ fn wrap(fonts: &Fonts, s: &str, size: f32, max_w: f32, max_lines: usize) -> Vec<
 
 impl Ui {
     /// Draw the whole window into `canvas` (device px; `scale` = device px per
-    /// logical px). `page_view` is the active page already painted at the
+    /// logical px). `page_view` is the active page already painted (a band of
+    /// it, and the device row in that band where the viewport starts) at the
     /// viewport's device size.
-    pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts, page_view: Option<&Canvas>, scale: f32) {
+    pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts, page_view: Option<(&Canvas, usize)>, scale: f32) {
         let g = self.geom();
         let mut p = Painter { c: canvas, s: scale };
         p.fill(theme::WINDOW);
@@ -1483,12 +1506,13 @@ impl Ui {
         self.draw_toast(&mut p, fonts, &g);
     }
 
-    fn draw_viewport(&self, p: &mut Painter, fonts: &Fonts, g: &Geom, page_view: Option<&Canvas>) {
+    fn draw_viewport(&self, p: &mut Painter, fonts: &Fonts, g: &Geom, page_view: Option<(&Canvas, usize)>) {
         let v = g.viewport;
         let tab = self.tab();
         match (page_view, &tab.failure) {
-            (Some(view), None) => {
-                p.blit(view, v.x, v.y);
+            (Some((view, offset)), None) => {
+                let rows = (v.h * p.s).round() as usize;
+                p.blit_rows(view, v.x, v.y, offset, rows);
                 p.mask_corners(v, theme::VIEW_RADIUS, theme::WINDOW);
             }
             (_, Some(failure)) => {
@@ -1868,10 +1892,16 @@ struct Done {
     result: Result<(Loaded, Image), String>,
 }
 
+/// The active page painted as a band three viewports tall around the
+/// scroll position: scrolling inside it is a copy, not a repaint.
 struct PageCache {
-    key: (u64, u64, i64, u32, u32, u32),
+    key: (u64, u64, u32, u32, u32),
+    /// page y (logical px) of the band's first row
+    top: f32,
     canvas: Canvas,
 }
+
+const BAND: f32 = 3.0;
 
 struct App {
     window: Arc<Window>,
@@ -1937,22 +1967,28 @@ impl App {
         let (vw, vh) = ((v.w * s).round().max(1.0) as u32, (v.h * s).round().max(1.0) as u32);
         let page_view = match self.ui.active_page() {
             Some((tab_id, generation, scroll, page)) => {
-                let key = (tab_id, generation, (scroll * 4.0) as i64, vw, vh, s.to_bits());
-                if self.page_cache.as_ref().map(|c| c.key) != Some(key) {
-                    // Scrolling repaints every frame: reuse the bitmap instead of reallocating it.
-                    let same_size = self.page_cache.as_ref().is_some_and(|c| c.key.3 == vw && c.key.4 == vh);
+                let key = (tab_id, generation, vw, vh, s.to_bits());
+                let band_h = v.h * BAND;
+                let fresh = self.page_cache.as_ref().is_some_and(|c| {
+                    c.key == key && scroll >= c.top && scroll + v.h <= c.top + band_h
+                });
+                if !fresh {
+                    // repaint the band with the viewport in its middle third,
+                    // reusing the bitmap when the size has not changed
+                    let top = (scroll - v.h).max(0.0);
+                    let band_rows = (band_h * s).round() as usize;
                     let mut canvas = match self.page_cache.take() {
-                        Some(old) if same_size => {
+                        Some(old) if old.canvas.width == vw as usize && old.canvas.height == band_rows => {
                             let mut c = old.canvas;
                             Painter { c: &mut c, s }.fill(theme::PAGE);
                             c
                         }
-                        _ => Canvas::new(vw as usize, vh as usize, theme::PAGE),
+                        _ => Canvas::new(vw as usize, band_rows, theme::PAGE),
                     };
-                    canvas.paint_scaled(&self.fonts, page, scroll, s);
-                    self.page_cache = Some(PageCache { key, canvas });
+                    canvas.paint_scaled(&self.fonts, page, top, s);
+                    self.page_cache = Some(PageCache { key, top, canvas });
                 }
-                self.page_cache.as_ref().map(|c| &c.canvas)
+                self.page_cache.as_ref().map(|c| (&c.canvas, ((scroll - c.top) * s).round().max(0.0) as usize))
             }
             None => None,
         };
@@ -2301,7 +2337,7 @@ mod tests {
             c.paint_scaled(&fonts, page, scroll, scale);
             c
         });
-        ui.draw(&mut canvas, &fonts, view.as_ref(), scale);
+        ui.draw(&mut canvas, &fonts, view.as_ref().map(|c| (c, 0)), scale);
         canvas
     }
 
@@ -2509,9 +2545,9 @@ mod tests {
             }
             println!("{name:>12}: {:6.2} ms", start.elapsed().as_secs_f64() * 100.0);
         };
-        time("whole frame", &mut || ui.draw(&mut canvas, &fonts, Some(&view), s));
+        time("whole frame", &mut || ui.draw(&mut canvas, &fonts, Some((&view, 0)), s));
         time("fill", &mut || Painter { c: &mut canvas, s }.fill(theme::WINDOW));
-        time("viewport", &mut || ui.draw_viewport(&mut Painter { c: &mut canvas, s }, &fonts, &g, Some(&view)));
+        time("viewport", &mut || ui.draw_viewport(&mut Painter { c: &mut canvas, s }, &fonts, &g, Some((&view, 0))));
         time("dock", &mut || ui.draw_dock(&mut Painter { c: &mut canvas, s }, &fonts, &g));
         time("cards", &mut || ui.draw_cards(&mut Painter { c: &mut canvas, s }, &fonts, &g));
         time("capsule", &mut || ui.draw_capsule(&mut Painter { c: &mut canvas, s }, &fonts, &g));
@@ -2537,6 +2573,56 @@ mod tests {
             scroll_y += 37.0;
             view.paint_scaled(&fonts, &big, scroll_y, s)
         });
+    }
+
+    /// `SEPIA_BENCH_URL=https://… cargo test --release live_page_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_page_cost() {
+        let Ok(address) = std::env::var("SEPIA_BENCH_URL") else { return };
+        let fonts = Fonts::load();
+        let url = Url::parse(&address).unwrap();
+        let t = Instant::now();
+        let loaded = page::load(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false).unwrap();
+        println!("load+layout: {:7.1} ms, {} draws, height {:.0}", t.elapsed().as_secs_f64() * 1000.0, loaded.page.draws.len(), loaded.page.height);
+        let s = 2.0;
+        let mut view = Canvas::new((1184.0 * s) as usize, (780.0 * s) as usize, theme::PAGE);
+        for scroll in [0.0f32, 37.0, 300.0] {
+            let t = Instant::now();
+            view.paint_scaled(&fonts, &loaded.page, scroll, s);
+            println!("paint at scroll {scroll:5}: {:7.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mut kinds: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
+        for draw in &loaded.page.draws {
+            let one = Page { draws: vec![draw.clone()], links: vec![], text: vec![], height: loaded.page.height, background: None, content_right: 0.0 };
+            let t = Instant::now();
+            view.paint_scaled(&fonts, &one, 0.0, s);
+            let name = match draw {
+                crate::layout::Draw::Rect { .. } => "rect",
+                crate::layout::Draw::Border { .. } => "border",
+                crate::layout::Draw::Text { .. } => "text",
+                crate::layout::Draw::Image { .. } => "image",
+                crate::layout::Draw::Fill { gradient: Some(_), .. } => "fill+gradient",
+                crate::layout::Draw::Fill { .. } => "fill",
+                crate::layout::Draw::Edges { .. } => "edges",
+                crate::layout::Draw::Shadow { .. } => "shadow",
+            };
+            let e = kinds.entry(name).or_default();
+            e.0 += 1;
+            e.1 += t.elapsed().as_secs_f64() * 1000.0;
+        }
+        for (k, (n, ms)) in kinds {
+            println!("  {k:14} x{n:4}: {ms:7.1} ms");
+        }
+        // the whole window as the user sees it
+        let mut ui = Ui::new(Transport::Direct, true);
+        ui.set_size(1200.0, 860.0);
+        let load = ui.navigate(url.clone());
+        let thumb = thumbnail(&fonts, &loaded.page, 1184.0);
+        ui.finish(load.tab_id, load.nav, Ok((loaded, thumb)));
+        settle(&mut ui);
+        let c = frame(&ui, 2.0);
+        dump(&c, "live");
     }
 
     #[test]
