@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sepia-anon"
+version = "1.0.0"
+description = "Layered traffic anonymisation: proxy chain, killswitch, DoH, leak verification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "h1layd" }]
+keywords = ["anonymity", "proxy", "killswitch", "dns", "privacy", "opsec"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.scripts]
+sepia = "sepia.cli:main"
+
+[tool.setuptools]
+packages = ["sepia", "sepia.platforms"]

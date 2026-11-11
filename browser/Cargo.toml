@@ -1,0 +1,23 @@
+[package]
+name = "sepia-browser"
+version = "0.1.0"
+edition = "2021"
+description = "A browser written from scratch: own parser, cascade, layout and rasteriser"
+license = "MIT"
+
+[dependencies]
+fontdue = "0.9"
+png = "0.17"
+rustls = "0.23"
+webpki-roots = "0.26"
+winit = "0.29"
+softbuffer = "0.4"
+zune-jpeg = "0.5.15"
+zune-core = "0.5"
+gif = { version = "0.14", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+strip = true

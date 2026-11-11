@@ -1,0 +1,1450 @@
+//! Layout: block flow with inline text lines, measured with real font metrics.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use fontdue::{Font, FontSettings};
+
+use crate::css::{Color, Stylesheet};
+use crate::dom::Node;
+use crate::images::{Bitmap, ImageMap};
+use crate::style::{compute, Align, Display, Edges, Style, VAlign};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Draw {
+    Rect { rect: Rect, color: Color },
+    Border { rect: Rect, width: f32, color: Color },
+    Text {
+        x: f32,
+        baseline: f32,
+        text: String,
+        size: f32,
+        color: Color,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+    },
+    /// An `<img>`; `image` is None when it could not be fetched or decoded
+    /// and paint shows a placeholder with the `alt` text.
+    Image { rect: Rect, image: Option<Arc<Bitmap>>, alt: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkHit {
+    pub rect: Rect,
+    pub href: String,
+}
+
+#[derive(Debug, Default)]
+pub struct Page {
+    pub draws: Vec<Draw>,
+    pub links: Vec<LinkHit>,
+    pub text: Vec<String>,
+    pub height: f32,
+}
+
+pub struct Fonts {
+    pub regular: Font,
+    pub bold: Font,
+    pub italic: Font,
+    /// Faces for codepoints the styled face lacks (CJK, symbols...), loaded on first miss.
+    pub fallback: crate::fonts::Fallbacks,
+    /// Colour emoji (Apple sbix / Noto CBDT), loaded on first emoji.
+    pub emoji: crate::fonts::LazyEmoji,
+}
+
+impl Fonts {
+    pub fn load() -> Fonts {
+        let candidates: Vec<PathBuf> = std::env::var("SEPIA_FONT")
+            .or_else(|_| std::env::var("VEIL_FONT"))
+            .ok()
+            .map(|value| value.split(':').map(PathBuf::from).collect())
+            .unwrap_or_default();
+        let mut paths = candidates;
+        paths.extend([
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial.ttf"),
+            PathBuf::from("/System/Library/Fonts/Supplemental/Helvetica.ttf"),
+            PathBuf::from("/System/Library/Fonts/SFNS.ttf"),
+            PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            PathBuf::from("/usr/share/fonts/TTF/DejaVuSans.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\arial.ttf"),
+        ]);
+        let mut bold_paths = vec![
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+            PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\arialbd.ttf"),
+        ];
+        let mut italic_paths = vec![
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial Italic.ttf"),
+            PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\ariali.ttf"),
+        ];
+
+        let load_first = |paths: &mut Vec<PathBuf>| -> Option<Font> {
+            for path in paths.iter() {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                        return Some(font);
+                    }
+                }
+            }
+            None
+        };
+
+        let regular = load_first(&mut paths).expect(
+            "sepia-browser needs a TTF font: tried Arial, Helvetica, SFNS, DejaVu; \
+             set SEPIA_FONT to pin one",
+        );
+        let bold = load_first(&mut bold_paths).unwrap_or_else(|| {
+            Font::from_bytes(std::fs::read("/System/Library/Fonts/Supplemental/Arial.ttf")
+                .unwrap_or_default(), FontSettings::default()).unwrap_or_else(|_| {
+                Font::from_bytes(Vec::new(), FontSettings::default()).ok().unwrap()
+            })
+        });
+        let italic = load_first(&mut italic_paths);
+        let italic = match italic {
+            Some(font) => font,
+            None => Font::from_bytes(Vec::new(), FontSettings::default())
+                .unwrap_or_else(|_| unreachable!()),
+        };
+        Fonts {
+            regular,
+            bold,
+            italic,
+            fallback: crate::fonts::Fallbacks::system(),
+            emoji: crate::fonts::LazyEmoji::system(),
+        }
+    }
+
+    pub fn pick(&self, bold: bool, italic: bool) -> &Font {
+        if bold && self.bold.units_per_em() > 0.0 {
+            &self.bold
+        } else if italic && self.italic.units_per_em() > 0.0 {
+            &self.italic
+        } else {
+            &self.regular
+        }
+    }
+
+    pub fn advance(&self, text: &str, size: f32, bold: bool, italic: bool) -> f32 {
+        // Measure with exactly the faces paint will draw with, glyph by glyph,
+        // so wrapping, underlines and link boxes match the pixels.
+        let mut width = 0.0;
+        self.for_each_glyph(text, bold, italic, |glyph| width += glyph.advance(size));
+        width
+    }
+
+    pub fn ascent(&self, size: f32, bold: bool) -> f32 {
+        let font = if bold { &self.bold } else { &self.regular };
+        font.horizontal_line_metrics(size)
+            .map(|m| m.ascent)
+            .unwrap_or(size * 0.8)
+    }
+
+    pub fn descent(&self, size: f32, bold: bool) -> f32 {
+        let font = if bold { &self.bold } else { &self.regular };
+        font.horizontal_line_metrics(size)
+            .map(|m| m.descent.abs())
+            .unwrap_or(size * 0.2)
+    }
+}
+
+struct InlineItem {
+    text: String,
+    style: Style,
+    href: Option<String>,
+    br: bool,
+    image: bool,
+    /// Set only when this element itself declared a background: a block's own
+    /// background must never become a per-word patch painted over the line.
+    own_background: Option<Color>,
+    /// `<img>`: a replaced box on the line instead of text.
+    img: Option<ImgBox>,
+}
+
+#[derive(Clone)]
+struct ImgBox {
+    w: f32,
+    h: f32,
+    bitmap: Option<Arc<Bitmap>>,
+    alt: String,
+}
+
+pub struct Layout<'a> {
+    pub fonts: &'a Fonts,
+    pub sheet: &'a Stylesheet,
+    pub viewport_width: f32,
+    images: Option<&'a ImageMap>,
+    /// Measuring min/max-content for table columns: lines start at the left
+    /// edge whatever their alignment, so the extent of the draws is the width.
+    measuring: bool,
+    page: Page,
+}
+
+impl<'a> Layout<'a> {
+    pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, page: Page::default() }
+    }
+
+    /// Decoded images of the document, keyed by `src` as written.
+    pub fn with_images(mut self, images: &'a ImageMap) -> Layout<'a> {
+        self.images = Some(images);
+        self
+    }
+
+    /// Width a line entry occupies: the image box, or the text advance.
+    fn item_width(&self, text: &str, item: &InlineItem) -> f32 {
+        match &item.img {
+            Some(img) => img.w,
+            None => self.fonts.advance(text, item.style.font_size, item.style.bold, item.style.italic),
+        }
+    }
+
+    pub fn build(mut self, root: &Node) -> Page {
+        let ancestors: Vec<&Node> = Vec::new();
+        let style = compute(root, None, self.sheet, &ancestors, self.viewport_width);
+        let _ = style;
+        // The document root lays its children out as blocks at the origin.
+        let mut cursor = 0.0f32;
+        let margin = 8.0f32;
+        let content_x = margin;
+        let content_width = self.viewport_width - margin * 2.0;
+        for child in &root.children {
+            cursor += self.layout_block(child, &ancestors, content_x, cursor, content_width);
+        }
+        self.page.height = cursor.max(1.0);
+        self.page
+    }
+
+    pub fn title(document: &Node) -> String {
+        document
+            .find_first("title")
+            .map(|node| collapse_ws(&node.text_content()).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn layout_block(
+        &mut self,
+        node: &Node,
+        ancestors: &[&Node],
+        x: f32,
+        y: f32,
+        containing_width: f32,
+    ) -> f32 {
+        if node.is_text() {
+            let text = node.text.clone().unwrap_or_default();
+            if text.trim().is_empty() {
+                return 0.0;
+            }
+            // Stray text at block level: lay it out as an inline line.
+            let style = Style::default();
+            let items = vec![InlineItem {
+                text: collapse_ws(&text),
+                style,
+                href: None,
+                br: false,
+                image: false,
+                own_background: None,
+                img: None,
+            }];
+            return self.layout_inline(&items, x, y, containing_width);
+        }
+
+        let parent_style = ancestors.last().map(|n| default_for(n));
+        let style = compute(node, parent_style.as_ref(), self.sheet, ancestors, containing_width);
+        if style.display == Display::None {
+            return 0.0;
+        }
+
+        if style.display == Display::Table {
+            return self.layout_table(node, ancestors, &style, x, y, containing_width);
+        }
+
+        let mut ancestors2: Vec<&Node> = ancestors.to_vec();
+        ancestors2.push(node);
+
+        if style.display == Display::Inline {
+            // Inline elements at block level are laid out as their own line.
+            let mut items: Vec<InlineItem> = Vec::new();
+            self.collect_inline(node, &ancestors2, &style, None, &mut items);
+            return self.layout_inline(&items, x, y, containing_width);
+        }
+
+        let border = style.border_width;
+        let pad = style.padding;
+        let margin = style.margin;
+        let box_x = x + margin.left;
+        let box_y = y + margin.top;
+        let inner_x = box_x + border + pad.left;
+        let inner_y = box_y + border + pad.top;
+        let content_width = style
+            .width
+            .map(|w| w - pad.horizontal() - border * 2.0)
+            .unwrap_or(containing_width - margin.horizontal() - pad.horizontal() - border * 2.0)
+            .max(10.0);
+
+        // Background first, so children paint over it.
+        if let Some(background) = style.background {
+            let rect = Rect { x: box_x, y: box_y, w: content_width + pad.horizontal() + border * 2.0, h: 0.0 };
+            self.page.draws.push(Draw::Rect { rect, color: background });
+            self.page.draws.pop();
+            let _ = rect;
+        }
+
+        let background_rect_index = if style.background.is_some() {
+            let rect = Rect { x: box_x, y: box_y, w: 0.0, h: 0.0 };
+            self.page.draws.push(Draw::Rect { rect, color: style.background.unwrap() });
+            Some(self.page.draws.len() - 1)
+        } else {
+            None
+        };
+
+        let mut cursor = inner_y;
+        // list marker
+        if style.display == Display::ListItem {
+            if let Some(marker) = style.marker {
+                if !marker.is_empty() {
+                    let baseline = cursor + self.fonts.ascent(style.font_size, style.bold);
+                    self.page.draws.push(Draw::Text {
+                        x: inner_x - 18.0,
+                        baseline,
+                        text: marker.to_string(),
+                        size: style.font_size,
+                        color: style.color,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                    });
+                }
+            }
+        }
+
+        cursor += self.layout_children(node, &ancestors2, &style, inner_x, cursor, content_width);
+
+        let mut content_height = cursor - inner_y;
+        if let Some(height) = style.height {
+            content_height = content_height.max(height - pad.vertical() - border * 2.0);
+        }
+        let total = content_height + pad.vertical() + border * 2.0;
+
+        if let Some(index) = background_rect_index {
+            if let Draw::Rect { rect, .. } = &mut self.page.draws[index] {
+                rect.w = content_width + pad.horizontal() + border * 2.0;
+                rect.h = total;
+            }
+        }
+        if border > 0.0 {
+            self.page.draws.push(Draw::Border {
+                rect: Rect {
+                    x: box_x,
+                    y: box_y,
+                    w: content_width + pad.horizontal() + border * 2.0,
+                    h: total,
+                },
+                width: border,
+                color: style.border_color,
+            });
+        }
+        total + margin.top + margin.bottom
+    }
+
+    /// Lay out the children of `node` (whose own box is already placed) in a
+    /// column of `width` starting at (x, y); returns the height used.
+    /// `ancestors` ends with `node` itself.
+    fn layout_children(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
+        let mut cursor = y;
+        let mut items: Vec<InlineItem> = Vec::new();
+        let current_href: Option<String> =
+            if node.tag == "a" { node.attr("href").map(|h| h.to_string()) } else { None };
+        for child in &node.children {
+            let child_is_block = match child.text {
+                Some(_) => false,
+                None => {
+                    let child_style = compute(child, Some(style), self.sheet, ancestors, width);
+                    !matches!(child_style.display, Display::Inline | Display::None)
+                }
+            };
+            if child_is_block {
+                if !items.is_empty() {
+                    cursor += self.layout_inline(&items, x, cursor, width);
+                    items.clear();
+                }
+                cursor += self.layout_block(child, ancestors, x, cursor, width);
+            } else {
+                self.collect_inline(child, ancestors, style, current_href.clone(), &mut items);
+            }
+        }
+        if !items.is_empty() {
+            cursor += self.layout_inline(&items, x, cursor, width);
+        }
+        cursor - y
+    }
+
+    fn collect_inline(
+        &mut self,
+        node: &Node,
+        ancestors: &[&Node],
+        parent_style: &Style,
+        href: Option<String>,
+        items: &mut Vec<InlineItem>,
+    ) {
+        if let Some(text) = &node.text {
+            let collapsed = if parent_style.pre { text.clone() } else { collapse_ws(text) };
+            if !collapsed.is_empty() {
+                items.push(InlineItem {
+                    text: collapsed,
+                    style: parent_style.clone(),
+                    href: href.clone(),
+                    br: false,
+                    image: false,
+                    own_background: None,
+                    img: None,
+                });
+            }
+            return;
+        }
+        let style = compute(node, Some(parent_style), self.sheet, ancestors, self.viewport_width);
+        if style.display == Display::None {
+            return;
+        }
+        match node.tag.as_str() {
+            "br" => {
+                items.push(InlineItem {
+                    text: String::new(),
+                    style,
+                    href: None,
+                    br: true,
+                    image: false,
+                    own_background: None,
+                    img: None,
+                });
+                return;
+            }
+            "img" => {
+                let alt = node.attr("alt").unwrap_or("").trim().to_string();
+                let bitmap = node
+                    .attr("src")
+                    .and_then(|src| self.images.and_then(|map| map.get(src)))
+                    .cloned();
+                match image_size(node, &style, bitmap.as_deref()) {
+                    Some((w, h)) => items.push(InlineItem {
+                        text: String::new(),
+                        style,
+                        href: href.clone(),
+                        br: false,
+                        image: false,
+                        own_background: None,
+                        img: Some(ImgBox { w, h, bitmap, alt }),
+                    }),
+                    // Nothing to size the box by: the alt text stands in, as plain text.
+                    None if !alt.is_empty() => items.push(InlineItem {
+                        text: alt,
+                        style,
+                        href: href.clone(),
+                        br: false,
+                        image: false,
+                        own_background: None,
+                        img: None,
+                    }),
+                    None => {}
+                }
+                return;
+            }
+            "input" => {
+                let placeholder = node
+                    .attr("aria-label")
+                    .or_else(|| node.attr("placeholder"))
+                    .or_else(|| node.attr("value"))
+                    .unwrap_or("");
+                let width = node.attr("size").and_then(|s| s.parse::<f32>().ok()).unwrap_or(16.0) * 8.0;
+                items.push(InlineItem {
+                    text: format!("[{}]", if placeholder.is_empty() { "input".into() } else { placeholder.to_string() }),
+                    style,
+                    href: None,
+                    br: false,
+                    image: true,
+                    own_background: None,
+                    img: None,
+                });
+                let _ = width;
+                return;
+            }
+            "button" => {
+                let label = node.text_content();
+                items.push(InlineItem {
+                    text: format!("[{}]", label.trim()),
+                    style,
+                    href: href.clone(),
+                    br: false,
+                    image: true,
+                    own_background: None,
+                    img: None,
+                });
+                return;
+            }
+            _ => {}
+        }
+        let mut child_href = href;
+        if node.tag == "a" {
+            if let Some(target) = node.attr("href") {
+                child_href = Some(target.to_string());
+            }
+        }
+        let own_background = style.background;
+        let mut child_ancestors: Vec<&Node> = ancestors.to_vec();
+        child_ancestors.push(node);
+        for child in &node.children {
+            self.collect_inline_styled(
+                child,
+                &child_ancestors,
+                &style,
+                child_href.clone(),
+                items,
+                own_background,
+            );
+        }
+    }
+
+    fn collect_inline_styled(
+        &mut self,
+        node: &Node,
+        ancestors: &[&Node],
+        parent_style: &Style,
+        href: Option<String>,
+        items: &mut Vec<InlineItem>,
+        own_background: Option<Color>,
+    ) {
+        let before = items.len();
+        self.collect_inline(node, ancestors, parent_style, href, items);
+        if let Some(background) = own_background {
+            for item in items.iter_mut().skip(before) {
+                if item.own_background.is_none() {
+                    item.own_background = Some(background);
+                }
+            }
+        }
+    }
+
+    fn layout_inline(
+        &mut self,
+        items: &[InlineItem],
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> f32 {
+        if items.is_empty() {
+            return 0.0;
+        }
+        let mut cursor_y = y;
+        let mut line: Vec<(String, InlineItem)> = Vec::new();
+        let mut line_width = 0.0f32;
+        let mut max_size = 0.0f32;
+        let mut line_done = false;
+        // Whitespace is a property of the boundary between two runs, so it has
+        // to survive element transitions: `</b>, <i>` keeps one space.
+        let mut need_space = false;
+
+        for item in items {
+            if item.br {
+                line_done = true;
+            } else if item.img.is_some() {
+                // Replaced box: shrink to the container width, keeping the aspect ratio.
+                let mut boxed = item.clone_shallow();
+                let w = match boxed.img.as_mut() {
+                    Some(img) => {
+                        if img.w > width && width > 0.0 {
+                            img.h *= width / img.w;
+                            img.w = width;
+                        }
+                        img.w
+                    }
+                    None => 0.0,
+                };
+                let space = if need_space && line_width > 0.0 {
+                    self.fonts.advance(" ", item.style.font_size, item.style.bold, item.style.italic)
+                } else {
+                    0.0
+                };
+                if line_width + space + w > width && line_width > 0.0 {
+                    self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                    line.clear();
+                    line_width = 0.0;
+                    max_size = 0.0;
+                } else if space > 0.0 {
+                    // the whitespace before the image, as a text run of its own
+                    let mut gap = item.clone_shallow();
+                    gap.img = None;
+                    line.push((" ".to_string(), gap));
+                    line_width += space;
+                }
+                max_size = max_size.max(item.style.font_size);
+                line_width += w;
+                line.push((String::new(), boxed));
+                need_space = false;
+            } else if item.image {
+                let advance = self.fonts.advance(&item.text, item.style.font_size, item.style.bold, item.style.italic);
+                if line_width + advance > width && line_width > 0.0 {
+                    self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                    line.clear();
+                    line_width = 0.0;
+                    max_size = 0.0;
+                }
+                max_size = max_size.max(item.style.font_size);
+                line_width += advance;
+                line.push((item.text.clone(), item.clone_shallow()));
+            } else {
+                let words = split_words(&item.text, item.style.pre);
+                for (word, trailing_space) in words {
+                    if word.is_empty() {
+                        // A text node that opens with whitespace: mark the
+                        // boundary so the next word gets its leading space.
+                        need_space = need_space || trailing_space;
+                        continue;
+                    }
+                    if word == "\n" {
+                        self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                        line.clear();
+                        line_width = 0.0;
+                        max_size = 0.0;
+                        need_space = false;
+                        continue;
+                    }
+                    let mut piece = word;
+                    let mut piece_width = self.fonts.advance(&piece, item.style.font_size, item.style.bold, item.style.italic);
+                    if need_space && line_width > 0.0 {
+                        piece = format!(" {piece}");
+                        piece_width += self.fonts.advance(" ", item.style.font_size, item.style.bold, item.style.italic);
+                    }
+                    if line_width + piece_width > width && line_width > 0.0 {
+                        self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                        line.clear();
+                        line_width = 0.0;
+                        max_size = 0.0;
+                        need_space = false;
+                        piece = piece.trim_start().to_string();
+                        if piece.is_empty() {
+                            continue;
+                        }
+                        piece_width = self.fonts.advance(&piece, item.style.font_size, item.style.bold, item.style.italic);
+                    }
+                    max_size = max_size.max(item.style.font_size);
+                    line_width += piece_width;
+                    line.push((piece, item.clone_shallow()));
+                    need_space = trailing_space;
+                }
+            }
+            if line_done {
+                self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                line.clear();
+                line_width = 0.0;
+                max_size = 0.0;
+                line_done = false;
+                need_space = false;
+            }
+        }
+        if !line.is_empty() {
+            self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+        }
+        cursor_y - y
+    }
+
+    fn flush_line(
+        &mut self,
+        line: &mut Vec<(String, InlineItem)>,
+        x: f32,
+        cursor_y: &mut f32,
+        width: f32,
+        max_size: f32,
+    ) {
+        if line.is_empty() {
+            *cursor_y += max_size.max(16.0) * 1.35;
+            return;
+        }
+        let size = if max_size > 0.0 { max_size } else { 16.0 };
+        let ascent = self.fonts.ascent(size, false);
+        let descent = self.fonts.descent(size, false);
+        // Images sit on the baseline: a tall one pushes the baseline down.
+        let image_height = line.iter().filter_map(|(_, item)| item.img.as_ref().map(|i| i.h)).fold(0.0f32, f32::max);
+        let lift = (image_height - ascent).max(0.0);
+        let line_height = (ascent + descent) * 1.2 + lift;
+
+        let total_width: f32 = line.iter().map(|(text, item)| self.item_width(text, item)).sum();
+
+        let align = if self.measuring {
+            Align::Left
+        } else {
+            line.last().map(|(_, item)| item.style.align).unwrap_or(Align::Left)
+        };
+        let mut pen_x = match align {
+            Align::Left => x,
+            Align::Center => x + (width - total_width) / 2.0,
+            Align::Right => x + width - total_width,
+        };
+
+        let baseline = *cursor_y + ascent + lift;
+        // Backgrounds for the whole line first, so no run can paint over a
+        // neighbour that was already drawn.
+        if baseline > 0.0 {
+            let mut pen = pen_x;
+            for (text, item) in line.iter() {
+                let advance = self.item_width(text, item);
+                if let Some(background) = item.own_background {
+                    if background.a > 0 && !text.trim().is_empty() {
+                        self.page.draws.push(Draw::Rect {
+                            rect: Rect {
+                                x: pen - item.style.padding.left,
+                                y: baseline - ascent - item.style.padding.top,
+                                w: advance + item.style.padding.horizontal(),
+                                h: ascent + descent + item.style.padding.vertical(),
+                            },
+                            color: background,
+                        });
+                    }
+                }
+                pen += advance;
+            }
+        }
+        for (text, item) in line.iter() {
+            if let Some(img) = &item.img {
+                let rect = Rect { x: pen_x, y: baseline - img.h, w: img.w, h: img.h };
+                self.page.draws.push(Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() });
+                if let Some(href) = &item.href {
+                    self.page.links.push(LinkHit { rect, href: href.clone() });
+                }
+                if !img.alt.is_empty() {
+                    self.page.text.push(img.alt.clone());
+                }
+                pen_x += img.w;
+                continue;
+            }
+            if text.trim().is_empty() {
+                pen_x += self.fonts.advance(text, item.style.font_size, item.style.bold, item.style.italic);
+                continue;
+            }
+            let advance = self.fonts.advance(text, item.style.font_size, item.style.bold, item.style.italic);
+            self.page.draws.push(Draw::Text {
+                x: pen_x,
+                baseline,
+                text: text.clone(),
+                size: item.style.font_size,
+                color: item.style.color,
+                bold: item.style.bold,
+                italic: item.style.italic,
+                underline: item.style.underline,
+            });
+            if let Some(href) = &item.href {
+                self.page.links.push(LinkHit {
+                    rect: Rect {
+                        x: pen_x,
+                        y: baseline - ascent,
+                        w: advance.max(2.0),
+                        h: ascent + descent,
+                    },
+                    href: href.clone(),
+                });
+            }
+            self.page.text.push(text.clone());
+            pen_x += advance;
+        }
+        *cursor_y += line_height;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+/// One cell placed in the table grid.
+struct Cell<'n> {
+    node: &'n Node,
+    ancestors: Vec<&'n Node>,
+    style: Style,
+    row: usize,
+    col: usize,
+    colspan: usize,
+    rowspan: usize,
+    pad: Edges,
+    border: f32,
+    min: f32,
+    max: f32,
+}
+
+/// A table row's computed style (its background and height).
+struct TableRow {
+    style: Style,
+}
+
+fn span_attr(node: &Node, name: &str) -> usize {
+    node.attr(name).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 1000)
+}
+
+fn px_attr(node: &Node, name: &str) -> Option<f32> {
+    node.attr(name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn translate(draw: &mut Draw, dx: f32, dy: f32) {
+    match draw {
+        Draw::Rect { rect, .. } | Draw::Border { rect, .. } | Draw::Image { rect, .. } => {
+            rect.x += dx;
+            rect.y += dy;
+        }
+        Draw::Text { x, baseline, .. } => {
+            *x += dx;
+            *baseline += dy;
+        }
+    }
+}
+
+impl<'a> Layout<'a> {
+    fn sub_layout(&self, measuring: bool) -> Layout<'a> {
+        Layout {
+            fonts: self.fonts,
+            sheet: self.sheet,
+            viewport_width: self.viewport_width,
+            images: self.images,
+            measuring,
+            page: Page::default(),
+        }
+    }
+
+    /// Lay out a cell's contents alone at `width`: (page at the origin, height).
+    fn cell_page(&self, cell: &Cell, width: f32, measuring: bool) -> (Page, f32) {
+        let mut sub = self.sub_layout(measuring);
+        let mut ancestors = cell.ancestors.clone();
+        ancestors.push(cell.node);
+        let height = sub.layout_children(cell.node, &ancestors, &cell.style, 0.0, 0.0, width.max(1.0));
+        (sub.page, height)
+    }
+
+    /// How wide the content actually is: the right edge of its text and images.
+    fn extent(&self, page: &Page) -> f32 {
+        page.draws.iter().fold(0.0f32, |acc, draw| match draw {
+            Draw::Text { x, text, size, bold, italic, .. } => acc.max(x + self.fonts.advance(text, *size, *bold, *italic)),
+            Draw::Image { rect, .. } => acc.max(rect.x + rect.w),
+            _ => acc,
+        })
+    }
+
+    /// The CSS 2 table model, automatic layout: cells on a grid (colspan,
+    /// rowspan), column widths from each column's min- and max-content width
+    /// fitted to the space, rows as tall as their tallest cell, cells
+    /// aligned vertically inside their row. `border`, `cellspacing`,
+    /// `cellpadding` and `border-collapse` are honoured.
+    fn layout_table(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, containing_width: f32) -> f32 {
+        let margin = style.margin;
+        let avail = (containing_width - margin.horizontal()).max(1.0);
+        let frame = match node.attr("border") {
+            Some(v) if v.trim().is_empty() => 1.0,
+            Some(_) => px_attr(node, "border").unwrap_or(1.0),
+            None => style.border_width,
+        };
+        let spacing = if style.border_collapse { 0.0 } else { px_attr(node, "cellspacing").unwrap_or(2.0) };
+        let cellpadding = px_attr(node, "cellpadding").unwrap_or(1.0);
+        let cell_border = if frame > 0.0 { 1.0 } else { 0.0 };
+
+        // ----- rows and cells on the grid ---------------------------------
+        let mut table_ancestors: Vec<&Node> = ancestors.to_vec();
+        table_ancestors.push(node);
+        let mut rows: Vec<(&Node, Vec<&Node>, Style)> = Vec::new();
+        for child in node.children.iter().filter(|c| c.text.is_none()) {
+            let child_style = compute(child, Some(style), self.sheet, &table_ancestors, avail);
+            match child_style.display {
+                Display::Row => rows.push((child, table_ancestors.clone(), child_style)),
+                Display::RowGroup => {
+                    let mut group_ancestors = table_ancestors.clone();
+                    group_ancestors.push(child);
+                    for row in child.children.iter().filter(|c| c.text.is_none()) {
+                        let row_style = compute(row, Some(&child_style), self.sheet, &group_ancestors, avail);
+                        if row_style.display == Display::Row {
+                            rows.push((row, group_ancestors.clone(), row_style));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if rows.is_empty() {
+            return margin.vertical();
+        }
+
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut table_rows: Vec<TableRow> = Vec::new();
+        // columns still taken by a rowspan from above: remaining rows per column
+        let mut taken: Vec<usize> = Vec::new();
+        for (r, (row, row_ancestors, row_style)) in rows.iter().enumerate() {
+            let mut cell_ancestors = row_ancestors.clone();
+            cell_ancestors.push(row);
+            let mut col = 0usize;
+            for cell in row.children.iter().filter(|c| c.text.is_none()) {
+                let mut cell_style = compute(cell, Some(row_style), self.sheet, &cell_ancestors, avail);
+                if cell_style.display != Display::Cell {
+                    continue;
+                }
+                if cell_style.valign.is_none() {
+                    cell_style.valign = row_style.valign;
+                }
+                while taken.get(col).copied().unwrap_or(0) > 0 {
+                    col += 1;
+                }
+                let colspan = span_attr(cell, "colspan").min(64);
+                let rowspan = span_attr(cell, "rowspan").min(rows.len() - r);
+                if taken.len() < col + colspan {
+                    taken.resize(col + colspan, 0);
+                }
+                for t in &mut taken[col..col + colspan] {
+                    *t = rowspan;
+                }
+                let pad = if cell_style.padding == Edges::default() { Edges::all(cellpadding) } else { cell_style.padding };
+                let border = if cell_style.border_width > 0.0 { cell_style.border_width } else { cell_border };
+                cells.push(Cell {
+                    node: cell,
+                    ancestors: cell_ancestors.clone(),
+                    style: cell_style,
+                    row: r,
+                    col,
+                    colspan,
+                    rowspan,
+                    pad,
+                    border,
+                    min: 0.0,
+                    max: 0.0,
+                });
+                col += colspan;
+            }
+            for t in taken.iter_mut() {
+                *t = t.saturating_sub(1);
+            }
+            table_rows.push(TableRow { style: row_style.clone() });
+        }
+        let columns = cells.iter().map(|c| c.col + c.colspan).max().unwrap_or(0);
+        if columns == 0 {
+            return margin.vertical();
+        }
+
+        // ----- column widths ------------------------------------------------
+        for i in 0..cells.len() {
+            let chrome = cells[i].pad.horizontal() + cells[i].border * 2.0;
+            let (narrow, _) = self.cell_page(&cells[i], 1.0, true);
+            let (wide, _) = self.cell_page(&cells[i], 100_000.0, true);
+            let mut min = self.extent(&narrow) + chrome;
+            let mut max = self.extent(&wide).max(min - chrome) + chrome;
+            if let Some(fixed) = cells[i].style.width {
+                min = min.max(fixed);
+                max = fixed.max(min);
+            }
+            cells[i].min = min;
+            cells[i].max = max;
+        }
+        let mut col_min = vec![0.0f32; columns];
+        let mut col_max = vec![0.0f32; columns];
+        let mut col_fixed = vec![false; columns];
+        for cell in cells.iter().filter(|c| c.colspan == 1) {
+            col_min[cell.col] = col_min[cell.col].max(cell.min);
+            col_max[cell.col] = col_max[cell.col].max(cell.max);
+            if cell.style.width.is_some() {
+                col_fixed[cell.col] = true;
+            }
+        }
+        // spanning cells widen the columns they cover, evenly, if they need to
+        for cell in cells.iter().filter(|c| c.colspan > 1) {
+            let range = cell.col..cell.col + cell.colspan;
+            let inner = spacing * (cell.colspan - 1) as f32;
+            let have_min: f32 = col_min[range.clone()].iter().sum::<f32>() + inner;
+            if cell.min > have_min {
+                let add = (cell.min - have_min) / cell.colspan as f32;
+                col_min[range.clone()].iter_mut().for_each(|w| *w += add);
+            }
+            let have_max: f32 = col_max[range.clone()].iter().sum::<f32>() + inner;
+            if cell.max > have_max {
+                let add = (cell.max - have_max) / cell.colspan as f32;
+                col_max[range].iter_mut().for_each(|w| *w += add);
+            }
+        }
+        for c in 0..columns {
+            col_max[c] = col_max[c].max(col_min[c]);
+        }
+        let chrome = spacing * (columns + 1) as f32 + frame * 2.0;
+        let target = style.width.map(|w| w.min(avail.max(w))).unwrap_or(avail);
+        let room = (target - chrome).max(0.0);
+        let (sum_min, sum_max): (f32, f32) = (col_min.iter().sum(), col_max.iter().sum());
+        let widths: Vec<f32> = if sum_max <= room {
+            if style.width.is_some() && room > sum_max {
+                // a declared table width: give the slack to the flexible columns
+                let flexible: Vec<usize> = (0..columns).filter(|c| !col_fixed[*c]).collect();
+                let pool: Vec<usize> = if flexible.is_empty() { (0..columns).collect() } else { flexible };
+                let weight: f32 = pool.iter().map(|c| col_max[*c]).sum();
+                let extra = room - sum_max;
+                (0..columns)
+                    .map(|c| {
+                        if !pool.contains(&c) {
+                            col_max[c]
+                        } else if weight > 0.0 {
+                            col_max[c] + extra * col_max[c] / weight
+                        } else {
+                            col_max[c] + extra / pool.len() as f32
+                        }
+                    })
+                    .collect()
+            } else {
+                col_max.clone()
+            }
+        } else if sum_min >= room {
+            col_min.clone()
+        } else {
+            let k = (room - sum_min) / (sum_max - sum_min).max(0.001);
+            (0..columns).map(|c| col_min[c] + (col_max[c] - col_min[c]) * k).collect()
+        };
+        let table_w: f32 = widths.iter().sum::<f32>() + chrome;
+        let mut col_x = vec![0.0f32; columns + 1];
+        col_x[0] = frame + spacing;
+        for c in 0..columns {
+            col_x[c + 1] = col_x[c] + widths[c] + spacing;
+        }
+
+        // ----- lay cells out at their widths; row heights -------------------
+        let mut laid: Vec<(Page, f32)> = Vec::with_capacity(cells.len());
+        let mut row_h = vec![0.0f32; rows.len()];
+        for (r, row) in table_rows.iter().enumerate() {
+            if let Some(h) = row.style.height {
+                row_h[r] = h;
+            }
+        }
+        for cell in &cells {
+            let cell_w = col_x[cell.col + cell.colspan] - col_x[cell.col] - spacing;
+            let content_w = (cell_w - cell.pad.horizontal() - cell.border * 2.0).max(1.0);
+            let (page, height) = self.cell_page(cell, content_w, false);
+            // the content's own box, for vertical alignment ...
+            let content_box = height + cell.pad.vertical() + cell.border * 2.0;
+            // ... and the box the row must make room for
+            let box_h = content_box.max(cell.style.height.unwrap_or(0.0));
+            if cell.rowspan == 1 {
+                row_h[cell.row] = row_h[cell.row].max(box_h);
+            }
+            laid.push((page, content_box));
+        }
+        // a rowspan cell taller than its rows stretches the last of them
+        for (cell, (_, content_box)) in cells.iter().zip(&laid) {
+            let box_h = content_box.max(cell.style.height.unwrap_or(0.0));
+            if cell.rowspan > 1 {
+                let rows_end = cell.row + cell.rowspan;
+                let have: f32 = row_h[cell.row..rows_end].iter().sum::<f32>() + spacing * (cell.rowspan - 1) as f32;
+                if box_h > have {
+                    row_h[rows_end - 1] += box_h - have;
+                }
+            }
+        }
+        let mut row_y = vec![0.0f32; rows.len() + 1];
+        row_y[0] = frame + spacing;
+        for r in 0..rows.len() {
+            row_y[r + 1] = row_y[r] + row_h[r] + spacing;
+        }
+        let table_h = row_y[rows.len()] + frame;
+
+        // ----- place the table ----------------------------------------------
+        let free = (avail - table_w).max(0.0);
+        let offset = match node.attr("align").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("center") => free / 2.0,
+            Some("right") => free,
+            Some(_) => 0.0,
+            None if style.align == Align::Center => free / 2.0,
+            None => 0.0,
+        };
+        let (tx, ty) = (x + margin.left + offset, y + margin.top);
+        if let Some(background) = style.background {
+            self.page.draws.push(Draw::Rect { rect: Rect { x: tx, y: ty, w: table_w, h: table_h }, color: background });
+        }
+        for (r, row) in table_rows.iter().enumerate() {
+            if let Some(background) = row.style.background {
+                let rect = Rect { x: tx + col_x[0], y: ty + row_y[r], w: col_x[columns] - col_x[0] - spacing, h: row_h[r] };
+                self.page.draws.push(Draw::Rect { rect, color: background });
+            }
+        }
+        for (cell, (page, content_box_h)) in cells.iter().zip(laid) {
+            let cx = tx + col_x[cell.col];
+            let cy = ty + row_y[cell.row];
+            let cw = col_x[cell.col + cell.colspan] - col_x[cell.col] - spacing;
+            let ch = row_y[cell.row + cell.rowspan] - row_y[cell.row] - spacing;
+            let rect = Rect { x: cx, y: cy, w: cw, h: ch };
+            if let Some(background) = cell.style.background {
+                self.page.draws.push(Draw::Rect { rect, color: background });
+            }
+            let slack = (ch - content_box_h).max(0.0);
+            let shift = match cell.style.valign.unwrap_or(VAlign::Middle) {
+                VAlign::Top => 0.0,
+                VAlign::Middle => slack / 2.0,
+                VAlign::Bottom => slack,
+            };
+            let dx = cx + cell.border + cell.pad.left;
+            let dy = cy + cell.border + cell.pad.top + shift;
+            for mut draw in page.draws {
+                translate(&mut draw, dx, dy);
+                self.page.draws.push(draw);
+            }
+            for mut link in page.links {
+                link.rect.x += dx;
+                link.rect.y += dy;
+                self.page.links.push(link);
+            }
+            self.page.text.extend(page.text);
+            if cell.border > 0.0 {
+                let color = if cell.style.border_width > 0.0 { cell.style.border_color } else { Color::GRAY };
+                self.page.draws.push(Draw::Border { rect, width: cell.border, color });
+            }
+        }
+        if frame > 0.0 {
+            let color = if style.border_width > 0.0 { style.border_color } else { Color::GRAY };
+            self.page.draws.push(Draw::Border { rect: Rect { x: tx, y: ty, w: table_w, h: table_h }, width: frame, color });
+        }
+        table_h + margin.vertical()
+    }
+}
+
+impl InlineItem {
+    fn clone_shallow(&self) -> InlineItem {
+        InlineItem {
+            text: self.text.clone(),
+            style: self.style.clone(),
+            href: self.href.clone(),
+            br: self.br,
+            image: self.image,
+            own_background: self.own_background,
+            img: self.img.clone(),
+        }
+    }
+}
+
+/// The box of an `<img>`: `width`/`height` attributes, then CSS, then the
+/// decoded size; one given side scales the other by the aspect ratio.
+/// None when nothing gives a size (no attributes and no decodable image).
+fn image_size(node: &Node, style: &Style, bitmap: Option<&Bitmap>) -> Option<(f32, f32)> {
+    let attr = |name: &str| {
+        node.attr(name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
+    let w = attr("width").or(style.width.filter(|v| *v > 0.0));
+    let h = attr("height").or(style.height.filter(|v| *v > 0.0));
+    let natural = bitmap.map(|b| (b.width as f32, b.height as f32));
+    let size = match (w, h, natural) {
+        (Some(w), Some(h), _) => (w, h),
+        (Some(w), None, Some((nw, nh))) => (w, w * nh / nw),
+        (None, Some(h), Some((nw, nh))) => (h * nw / nh, h),
+        (None, None, Some(n)) => n,
+        (Some(w), None, None) => (w, w),
+        (None, Some(h), None) => (h, h),
+        (None, None, None) => return None,
+    };
+    Some((size.0.min(8192.0), size.1.min(8192.0)))
+}
+
+fn default_for(node: &Node) -> Style {
+    crate::style::default_style(&node.tag)
+}
+
+pub fn collapse_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+    out
+}
+
+/// Split into words, each carrying whether the source had whitespace *after* it.
+fn split_words(text: &str, pre: bool) -> Vec<(String, bool)> {
+    if pre {
+        return text
+            .split_inclusive('\n')
+            .map(|s| (s.to_string(), false))
+            .collect();
+    }
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut current = String::new();
+    let mut leading_space = false;
+    for ch in text.chars() {
+        if ch == '\n' {
+            if !current.is_empty() {
+                out.push((current.clone(), false));
+                current.clear();
+            }
+            out.push(("\n".into(), false));
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                out.push((current.clone(), true));
+                current.clear();
+            } else if let Some(last) = out.last_mut() {
+                last.1 = true;
+            } else {
+                leading_space = true;
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        out.push((current, false));
+    }
+    if leading_space {
+        out.insert(0, (String::new(), true));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dom::parse_document;
+
+    fn fonts() -> Fonts {
+        Fonts::load()
+    }
+
+    #[test]
+    fn collapses_whitespace() {
+        assert_eq!(collapse_ws("a   b\n\tc"), "a b c");
+        assert_eq!(collapse_ws("  "), " ");
+    }
+
+    #[test]
+    fn splits_words() {
+        assert_eq!(
+            split_words("one two", false),
+            vec![("one".to_string(), true), ("two".to_string(), false)]
+        );
+        assert_eq!(
+            split_words(" x", false),
+            vec![(String::new(), true), ("x".to_string(), false)]
+        );
+        assert_eq!(
+            split_words("a\nb", false),
+            vec![("a".to_string(), false), ("\n".to_string(), false), ("b".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn keeps_spaces_across_inline_boundaries() {
+        let doc = parse_document("<p>alpha <b>beta</b> gamma</p>");
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let line = page.text.join("");
+        assert!(line.contains("alpha"), "line: {line:?}");
+        assert!(
+            page.text.iter().any(|t| t.trim() == "gamma" && t.starts_with(' ')),
+            "space before gamma lost: {:?}",
+            page.text
+        );
+    }
+
+    #[test]
+    fn renders_paragraphs_and_headings() {
+        let doc = parse_document("<h1>Title</h1><p>Hello <b>bold</b> world</p>");
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        assert!(page.height > 20.0);
+        let texts: Vec<String> = page
+            .draws
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("Title")));
+        assert!(texts.iter().any(|t| t.contains("Hello")));
+    }
+
+    #[test]
+    fn wraps_long_lines() {
+        let long = "word ".repeat(200);
+        let doc = parse_document(&format!("<p>{long}</p>"));
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let narrow = Layout::new(&fonts, &sheet, 200.0).build(&doc);
+        let wide = Layout::new(&fonts, &sheet, 2000.0).build(&doc);
+        assert!(narrow.height > wide.height * 2.0, "narrow page must be taller");
+    }
+
+    #[test]
+    fn links_are_collected() {
+        let doc = parse_document(r#"<p><a href="/x">click</a></p>"#);
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0].href, "/x");
+    }
+
+    fn image_map(src: &str, w: u32, h: u32) -> ImageMap {
+        let png = crate::images::tests::png_bytes(w, h, [10, 20, 30, 255]);
+        let mut map = ImageMap::new();
+        map.insert(src.to_string(), Arc::new(crate::images::decode(&png).unwrap()));
+        map
+    }
+
+    fn image_rects(page: &Page) -> Vec<(Rect, bool)> {
+        page.draws
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Image { rect, image, .. } => Some((*rect, image.is_some())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn images_take_their_natural_or_declared_size() {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let map = image_map("a.png", 120, 60);
+        let doc = parse_document(r#"<p><img src="a.png"> <img src="a.png" width="60"> <img src="a.png" style="height:15px"></p>"#);
+        let page = Layout::new(&fonts, &sheet, 800.0).with_images(&map).build(&doc);
+        let rects = image_rects(&page);
+        assert_eq!(rects.len(), 3);
+        assert_eq!((rects[0].0.w, rects[0].0.h), (120.0, 60.0));
+        assert_eq!((rects[1].0.w, rects[1].0.h), (60.0, 30.0), "width keeps aspect");
+        assert_eq!((rects[2].0.w, rects[2].0.h), (30.0, 15.0), "css height keeps aspect");
+        assert!(rects.iter().all(|(_, loaded)| *loaded));
+        // all on one line, bottoms on the same baseline
+        let bottom = rects[0].0.y + rects[0].0.h;
+        assert!(rects.iter().all(|(r, _)| (r.y + r.h - bottom).abs() < 0.01));
+        assert!(page.height >= 60.0, "the line grew to fit the image");
+    }
+
+    #[test]
+    fn wide_images_shrink_to_the_container() {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let map = image_map("big.png", 2000, 1000);
+        let doc = parse_document(r#"<div><img src="big.png"></div>"#);
+        let page = Layout::new(&fonts, &sheet, 516.0).with_images(&map).build(&doc);
+        let (rect, _) = image_rects(&page)[0];
+        assert!((rect.w - 500.0).abs() < 0.01, "width {}", rect.w);
+        assert!((rect.h - 250.0).abs() < 0.01, "height {}", rect.h);
+    }
+
+    #[test]
+    fn linked_image_is_clickable_and_missing_one_keeps_alt() {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let map = image_map("logo.png", 40, 20);
+        let doc = parse_document(
+            r#"<p><a href="/home"><img src="logo.png"></a> <img src="gone.png" width="80" height="30" alt="Chart"> <img src="gone.png" alt="Plain alt"> <img src="gone.png"></p>"#,
+        );
+        let page = Layout::new(&fonts, &sheet, 800.0).with_images(&map).build(&doc);
+        let rects = image_rects(&page);
+        assert_eq!(rects.len(), 2, "sized boxes only: {rects:?}");
+        assert!(rects[0].1 && !rects[1].1, "second is a placeholder");
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0].rect, rects[0].0);
+        assert_eq!(page.links[0].href, "/home");
+        assert!(page.text.join("").contains("Plain alt"), "unsized missing image falls back to its alt text");
+        assert!(page.text.iter().any(|t| t == "Chart"));
+    }
+
+    fn text_x(page: &Page, needle: &str) -> (f32, f32) {
+        page.draws
+            .iter()
+            .find_map(|d| match d {
+                Draw::Text { x, baseline, text, .. } if text.trim() == needle => Some((*x, *baseline)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not drawn"))
+    }
+
+    #[test]
+    fn table_cells_form_columns() {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let doc = parse_document(
+            "<table><tr><td>a</td><td>first</td></tr><tr><td>much longer cell</td><td>b</td></tr></table>",
+        );
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let (ax, ay) = text_x(&page, "a");
+        let (lx, ly) = text_x(&page, "much");
+        let (fx, _) = text_x(&page, "first");
+        let (bx, by) = text_x(&page, "b");
+        assert_eq!(ax, lx, "column 1 is left-aligned in both rows");
+        assert_eq!(fx, bx, "column 2 starts at the same x in both rows");
+        assert!(fx > lx + fonts.advance("much longer cell", 16.0, false, false), "column 1 is as wide as its widest cell");
+        assert!(ly > ay && by == ly, "rows stack, cells of a row share a line");
+    }
+
+    #[test]
+    fn colspan_valign_and_bgcolor() {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let doc = parse_document(
+            r##"<table cellspacing="0" cellpadding="0" bgcolor="#ff6600" width="400">
+                <tr><td colspan="2">header across both</td></tr>
+                <tr><td height="100">left</td><td valign="top">right</td></tr>
+                <tr><td>x</td><td align="right">end</td></tr>
+            </table>"##,
+        );
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let orange = page.draws.iter().find_map(|d| match d {
+            Draw::Rect { rect, color } if color.r == 255 && color.g == 102 => Some(*rect),
+            _ => None,
+        });
+        let table = orange.expect("bgcolor paints the table");
+        assert!((table.w - 400.0).abs() < 0.5, "width=400 honoured: {}", table.w);
+        let (lx, ly) = text_x(&page, "left");
+        let (rx, ry) = text_x(&page, "right");
+        let (hx, _) = text_x(&page, "header");
+        assert_eq!(hx, lx, "colspan cell starts at column 1");
+        assert!(ry + 30.0 < ly, "valign=top sits above the middle-aligned neighbour ({ry} vs {ly})");
+        assert!(rx > lx);
+        let (ex, _) = text_x(&page, "end");
+        let end_w = fonts.advance("end", 16.0, false, false);
+        assert!((ex + end_w - (table.x + table.w)).abs() < 1.0, "align=right reaches the right edge");
+    }
+
+    #[test]
+    fn wide_tables_fit_the_container() {
+        let fonts = fonts();
+        let sheet = Stylesheet::default();
+        let long = "word ".repeat(80);
+        let doc = parse_document(&format!("<table border=1><tr><td>{long}</td><td>{long}</td></tr></table>"));
+        let page = Layout::new(&fonts, &sheet, 600.0).build(&doc);
+        let right = page.draws.iter().fold(0.0f32, |acc, d| match d {
+            Draw::Border { rect, .. } => acc.max(rect.x + rect.w),
+            _ => acc,
+        });
+        assert!(right <= 600.0 - 8.0 + 0.5, "table overflowed: {right}");
+        assert!(page.height > 100.0, "text wrapped inside the cells");
+    }
+
+    #[test]
+    fn display_none_is_skipped() {
+        let doc = parse_document("<div style='display:none'>hidden</div><p>shown</p>");
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let text = page.text.join(" ");
+        assert!(!text.contains("hidden"));
+        assert!(text.contains("shown"));
+    }
+}
