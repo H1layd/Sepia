@@ -39,6 +39,8 @@ pub enum Draw {
         underline: bool,
         /// extra px after each character (CSS letter-spacing)
         letter_spacing: f32,
+        /// the CSS font-family list the text is set in
+        family: Option<Arc<str>>,
     },
     /// An `<img>`; `image` is None when it could not be fetched or decoded
     /// and paint shows a placeholder with the `alt` text.
@@ -98,6 +100,11 @@ pub struct Fonts {
     pub fallback: crate::fonts::Fallbacks,
     /// Colour emoji (Apple sbix / Noto CBDT), loaded on first emoji.
     pub emoji: crate::fonts::LazyEmoji,
+    /// Families pages brought with @font-face.
+    pub web: crate::fonts::WebFonts,
+    /// Local faces for `monospace` and `serif`.
+    pub mono: crate::fonts::LocalFamily,
+    pub serif: crate::fonts::LocalFamily,
 }
 
 impl Fonts {
@@ -160,6 +167,9 @@ impl Fonts {
             italic,
             fallback: crate::fonts::Fallbacks::system(),
             emoji: crate::fonts::LazyEmoji::system(),
+            web: crate::fonts::WebFonts::default(),
+            mono: crate::fonts::LocalFamily::mono(),
+            serif: crate::fonts::LocalFamily::serif(),
         }
     }
 
@@ -257,7 +267,7 @@ impl<'a> Layout<'a> {
 
     /// Advance of `text` in `style`, letter-spacing included.
     fn text_width(&self, text: &str, style: &Style) -> f32 {
-        let base = self.fonts.advance(text, style.font_size, style.bold, style.italic);
+        let base = self.fonts.advance_in(text, style.font_size, style.bold, style.italic, style.family.as_deref());
         if style.letter_spacing == 0.0 {
             base
         } else {
@@ -373,7 +383,10 @@ impl<'a> Layout<'a> {
         let mut ancestors2: Vec<&Node> = ancestors.to_vec();
         ancestors2.push(node);
 
-        if matches!(style.display, Display::Inline | Display::InlineBlock) {
+        // Replaced elements (images, inline SVG) drawn as blocks are a line
+        // holding their box: they have no children to lay out.
+        let replaced = matches!(node.tag.as_str(), "img" | "svg");
+        if replaced || matches!(style.display, Display::Inline | Display::InlineBlock) {
             // Inline elements at block level are laid out as their own line.
             self.last_margin_bottom = 0.0;
             let mut items: Vec<InlineItem> = Vec::new();
@@ -451,6 +464,7 @@ impl<'a> Layout<'a> {
                         italic: false,
                         underline: false,
                         letter_spacing: 0.0,
+                        family: None,
                     });
                 }
             }
@@ -1046,6 +1060,7 @@ impl<'a> Layout<'a> {
                 italic: item.style.italic,
                 underline: item.style.underline,
                 letter_spacing: item.style.letter_spacing,
+                family: item.style.family.clone(),
             });
             if let Some(href) = &item.href {
                 self.page.links.push(link(Rect { x: pen_x, y: baseline - ascent, w: advance.max(2.0), h: ascent + descent }, href));
@@ -1138,8 +1153,8 @@ impl<'a> Layout<'a> {
     /// How wide the content actually is: the right edge of its text and images.
     fn extent(&self, page: &Page) -> f32 {
         page.draws.iter().fold(page.content_right, |acc, draw| match draw {
-            Draw::Text { x, text, size, bold, italic, letter_spacing, .. } => {
-                acc.max(x + self.fonts.advance(text, *size, *bold, *italic) + letter_spacing * text.chars().count() as f32)
+            Draw::Text { x, text, size, bold, italic, letter_spacing, family, .. } => {
+                acc.max(x + self.fonts.advance_in(text, *size, *bold, *italic, family.as_deref()) + letter_spacing * text.chars().count() as f32)
             }
             Draw::Image { rect, .. } => acc.max(rect.x + rect.w),
             // sized boxes count (an empty 10px square is still 10px wide);
@@ -1448,6 +1463,8 @@ struct FlexItem<'n> {
     margin_bottom: f32,
     /// padding + border + margin on the right: past the content's extent
     right_chrome: f32,
+    /// min-width as an outer size (0 without one)
+    min_outer: f32,
     /// align-self, else the container's align-items
     align: crate::style::AlignItems,
 }
@@ -1508,19 +1525,21 @@ impl<'a> Layout<'a> {
 
         let mut items: Vec<FlexItem> = Vec::new();
         for child in &node.children {
-            let (item_flex, margin_top, margin_bottom, right_chrome) = match &child.text {
+            let (item_flex, margin_top, margin_bottom, right_chrome, min_outer) = match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
-                Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0),
+                Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0, 0.0),
                 None => {
                     let s = compute(child, Some(style), self.sheet, ancestors, width);
                     if s.display == Display::None {
                         continue;
                     }
-                    (s.flex, s.margin.top, s.margin.bottom, s.padding.right + s.border.right + s.margin.right)
+                    let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
+                    let min_outer = s.min_width.map(|m| m + chrome + s.margin.horizontal()).unwrap_or(0.0);
+                    (s.flex, s.margin.top, s.margin.bottom, s.padding.right + s.border.right + s.margin.right, min_outer)
                 }
             };
             let align = item_flex.align_self.unwrap_or(f.align);
-            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, align });
+            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align });
         }
         if reverse {
             items.reverse();
@@ -1552,6 +1571,9 @@ impl<'a> Layout<'a> {
             if own.is_some() && item.flex.basis.is_none() {
                 item.min = item.min.min(item.basis);
             }
+            // min-width is a floor for both
+            item.min = item.min.max(item.min_outer);
+            item.basis = item.basis.max(item.min_outer);
         }
 
         // ----- lines -----------------------------------------------------------

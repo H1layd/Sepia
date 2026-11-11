@@ -2,8 +2,9 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -125,7 +126,7 @@ pub fn request_headers(url: &Url) -> Vec<(String, String)> {
         ),
         ("Accept-Encoding".to_string(), "identity".to_string()),
         ("Accept-Language".to_string(), "en-US,en;q=0.9".to_string()),
-        ("Connection".to_string(), "close".to_string()),
+        ("Connection".to_string(), "keep-alive".to_string()),
     ]
 }
 
@@ -153,8 +154,67 @@ fn fetch_once(
         return fetch_via_http_proxy(url, chain, timeout);
     }
 
-    let mut stream = connect_through(url, chain, resolver, timeout)?;
+    // reuse an open connection to this origin when there is one
+    let key = pool_key(url, chain);
+    if let Some(stream) = take_pooled(&key) {
+        if let Ok((response, keep)) = exchange(stream, url) {
+            if let Some(stream) = keep {
+                put_pooled(key, stream);
+            }
+            return Ok(response);
+        }
+        // a stale connection the server had closed: open a fresh one
+    }
+    let stream = connect_through(url, chain, resolver, timeout)?;
+    let (response, keep) = exchange(stream, url)?;
+    if let Some(stream) = keep {
+        put_pooled(key, stream);
+    }
+    Ok(response)
+}
 
+/// Open connections, by origin and path (scheme, host, port and the chain),
+/// kept for `IDLE` seconds: a page's stylesheets, scripts and images reuse
+/// one TLS connection instead of a handshake each. Origins never share one.
+static POOL: OnceLock<Mutex<HashMap<String, Vec<(Transport, Instant)>>>> = OnceLock::new();
+const IDLE: Duration = Duration::from_secs(30);
+const PER_ORIGIN: usize = 6;
+
+fn pool_key(url: &Url, chain: &Chain) -> String {
+    let path: Vec<String> = chain.hops.iter().map(|h| format!("{}:{}", h.host, h.port)).collect();
+    format!("{}://{}:{}|{}", url.scheme, url.host.to_ascii_lowercase(), url.port, path.join(","))
+}
+
+fn take_pooled(key: &str) -> Option<Transport> {
+    let mut pool = POOL.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let list = pool.get_mut(key)?;
+    while let Some((stream, since)) = list.pop() {
+        if since.elapsed() < IDLE {
+            return Some(stream);
+        }
+    }
+    None
+}
+
+fn put_pooled(key: String, stream: Transport) {
+    let mut pool = POOL.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let list = pool.entry(key).or_default();
+    list.retain(|(_, since)| since.elapsed() < IDLE);
+    if list.len() < PER_ORIGIN {
+        list.push((stream, Instant::now()));
+    }
+}
+
+/// Close every pooled connection (the burn button, leaving a session).
+pub fn forget_connections() {
+    if let Some(pool) = POOL.get() {
+        pool.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+/// One request and its response over `stream`; the stream comes back when
+/// it can carry another request.
+fn exchange(mut stream: Transport, url: &Url) -> Result<(Response, Option<Transport>), String> {
     let request = build_request(url);
     stream
         .write_all(request.as_bytes())
@@ -204,7 +264,13 @@ fn fetch_once(
             .map(|(_, v)| v.clone())
     };
 
-    let body = if let Some(length) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+    let bodiless = (100..200).contains(&status) || status == 204 || status == 304;
+    let content_length = header("content-length").and_then(|v| v.parse::<usize>().ok());
+    let chunked = header("transfer-encoding").map(|v| v.to_lowercase().contains("chunked")).unwrap_or(false);
+    let framed = bodiless || content_length.is_some() || chunked;
+    let body = if bodiless {
+        Vec::new()
+    } else if let Some(length) = content_length {
         while body.len() < length {
             let n = stream.read(&mut chunk).map_err(|e| format!("read failed: {e}"))?;
             if n == 0 {
@@ -217,10 +283,7 @@ fn fetch_once(
         }
         body.truncate(length);
         body
-    } else if header("transfer-encoding")
-        .map(|v| v.to_lowercase().contains("chunked"))
-        .unwrap_or(false)
-    {
+    } else if chunked {
         let mut raw = body;
         loop {
             if dechunk(&raw).is_some() {
@@ -250,12 +313,14 @@ fn fetch_once(
         body
     };
 
-    Ok(Response {
-        status,
-        headers,
-        body,
-        final_url: url.to_string(),
-    })
+    // the connection can carry the next request when the response was
+    // framed and the server did not ask to close it
+    let closing = header("connection").is_some_and(|v| v.to_ascii_lowercase().contains("close"));
+    let reusable = framed && !closing;
+    Ok((
+        Response { status, headers, body, final_url: url.to_string() },
+        reusable.then_some(stream),
+    ))
 }
 
 /// Plain-http request through an HTTP proxy: what I2P's proxy expects.
@@ -654,6 +719,30 @@ fn socks5_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cargo test --release fetch_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fetch_timing() {
+        let resolver = crate::resolver::Resolver::default();
+        let chain = Chain::default();
+        for address in ["https://news.ycombinator.com/", "https://news.ycombinator.com/news.css", "https://a152b.host/", "https://a152b.host/style.css"] {
+            let url = Url::parse(address).unwrap();
+            let t = std::time::Instant::now();
+            let _ = resolver.resolve(&url.host, &chain, Duration::from_secs(10));
+            let dns = t.elapsed();
+            let t = std::time::Instant::now();
+            let tcp = {
+                let ips = resolver.resolve(&url.host, &chain, Duration::from_secs(10)).unwrap();
+                tcp_connect_addr(ips[0], url.port, Duration::from_secs(10)).unwrap()
+            };
+            let connect = t.elapsed();
+            drop(tcp);
+            let t = std::time::Instant::now();
+            let r = fetch_with(&url, &chain, Some(&resolver), Duration::from_secs(15)).unwrap();
+            println!("{address}: dns {:.0} ms, tcp {:.0} ms, whole fetch {:.0} ms, {} bytes", dns.as_secs_f64() * 1e3, connect.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3, r.body.len());
+        }
+    }
 
     fn url(value: &str) -> Url {
         Url::parse(value).expect("url")

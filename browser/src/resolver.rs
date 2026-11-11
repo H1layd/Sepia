@@ -6,8 +6,9 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -32,6 +33,25 @@ impl Default for Resolver {
     }
 }
 
+/// How long a DoH answer is reused (memory only, gone when the browser quits).
+const DNS_TTL: Duration = Duration::from_secs(300);
+
+type Answers = HashMap<String, (Vec<IpAddr>, Instant)>;
+static CACHE: OnceLock<Mutex<Answers>> = OnceLock::new();
+static IN_FLIGHT: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// Drop every remembered answer (the burn button).
+pub fn forget() {
+    if let Some(cache) = CACHE.get() {
+        cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+fn cached(key: &str) -> Option<Vec<IpAddr>> {
+    let cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    cache.get(key).filter(|(_, at)| at.elapsed() < DNS_TTL).map(|(ips, _)| ips.clone())
+}
+
 impl Resolver {
     pub fn new(url: Option<&str>) -> Resolver {
         match url {
@@ -43,28 +63,55 @@ impl Resolver {
         }
     }
 
-    /// Resolve `host` (A and AAAA) without touching the system resolver.
+    /// Resolve `host` without touching the system resolver. Answers are
+    /// kept in memory for a few minutes (never on disk), one lookup per
+    /// name at a time: the page, its stylesheets, scripts and images share it.
     pub fn resolve(&self, host: &str, chain: &Chain, timeout: Duration) -> Result<Vec<IpAddr>, String> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
+        let key = format!("{}|{}", self.url, host.to_ascii_lowercase());
+        if let Some(hit) = cached(&key) {
+            return Ok(hit);
+        }
+        // the same name asked from many threads at once: one DoH lookup
+        let gate = {
+            let mut flights = IN_FLIGHT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+            flights.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        };
+        let _turn = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cached(&key) {
+            return Ok(hit);
+        }
+        let addresses = self.lookup(host, chain, timeout)?;
+        CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (addresses.clone(), Instant::now()));
+        Ok(addresses)
+    }
+
+    fn lookup(&self, host: &str, chain: &Chain, timeout: Duration) -> Result<Vec<IpAddr>, String> {
         let endpoint = Endpoint::parse(&self.url)?;
         let mut addresses: Vec<IpAddr> = Vec::new();
         let mut last_error = String::from("no bootstrap reachable");
 
+        // IPv4 first; AAAA only for names without an A record. An answer
+        // with no records is an answer: it is not retried on another bootstrap.
         for qtype in [TYPE_A, TYPE_AAAA] {
             let query = build_query(host, qtype)?;
             for bootstrap in &self.bootstraps {
                 match self.post(&endpoint, bootstrap, &query, chain, timeout) {
                     Ok(response) => {
-                        let found = parse_answers(&response);
-                        if !found.is_empty() {
-                            addresses.extend(found);
-                            break;
-                        }
+                        addresses.extend(parse_answers(&response));
+                        break;
                     }
                     Err(err) => last_error = err,
                 }
+            }
+            if !addresses.is_empty() {
+                break;
             }
         }
         if addresses.is_empty() {
@@ -284,6 +331,28 @@ fn connect_ip(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_answers_and_expires() {
+        let key = "test|cached.example".to_string();
+        CACHE.get_or_init(Default::default).lock().unwrap().insert(key.clone(), (vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))], Instant::now()));
+        assert_eq!(cached(&key), Some(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]));
+        let old = Instant::now() - DNS_TTL - Duration::from_secs(1);
+        CACHE.get_or_init(Default::default).lock().unwrap().insert(key.clone(), (vec![], old));
+        assert_eq!(cached(&key), None, "expired");
+    }
+
+    /// `cargo test --release resolve_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn resolve_timing() {
+        let r = Resolver::default();
+        for host in ["a152b.host", "a152b.host", "news.ycombinator.com"] {
+            let t = std::time::Instant::now();
+            let got = r.resolve(host, &Chain::default(), Duration::from_secs(10));
+            println!("{host}: {:?} in {:.0} ms", got.map(|v| v.len()), t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
 
     #[test]
     fn builds_query_wire() {

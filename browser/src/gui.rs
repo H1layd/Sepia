@@ -2071,15 +2071,27 @@ impl App {
         self.sessions.insert(load.tab_id, (load.nav, events));
         self.field = None;
         std::thread::spawn(move || {
-            let opened = page::open(&load.url, &chain, resolver.as_ref(), width, &fonts, Duration::from_secs(20), false);
-            let (result, session) = match opened {
-                Ok((loaded, session)) => {
+            // show the page as soon as HTML, CSS and scripts are in; images follow
+            let opened = page::open(&load.url, &chain, resolver.as_ref(), width, &fonts, Duration::from_secs(20), false, true);
+            let (result, session, late) = match opened {
+                Ok((loaded, session, late)) => {
                     let thumb = thumbnail(&fonts, &loaded.page, width);
-                    (Ok((loaded, thumb)), session)
+                    (Ok((loaded, thumb)), session, late)
                 }
-                Err(e) => (Err(e), None),
+                Err(e) => (Err(e), None, None),
             };
             let _ = proxy.send_event(PageMsg::Done(Done { tab_id: load.tab_id, nav: load.nav, result }));
+            let mut session = session;
+            if let (Some(late), Some(session)) = (late, session.as_mut()) {
+                if let Ok(images) = late.join() {
+                    if !images.is_empty() {
+                        session.set_images(images);
+                        let page = session.layout(&fonts);
+                        let outcome = Outcome { page: Some(page), ..Outcome::default() };
+                        let _ = proxy.send_event(PageMsg::Update { tab_id: load.tab_id, nav: load.nav, outcome });
+                    }
+                }
+            }
             if let Some(mut session) = session {
                 while let Ok(event) = inbox.recv() {
                     let outcome = session.handle(event, &fonts);
@@ -2280,6 +2292,9 @@ impl App {
                 self.page_cache = None;
                 self.sessions.clear();
                 self.field = None;
+                // nothing of the past session stays: open connections, DNS answers
+                crate::net::forget_connections();
+                crate::resolver::forget();
             }
             Hit::Page => {
                 // pages with scripts get the click; they decide what happens

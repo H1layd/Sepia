@@ -96,15 +96,15 @@ impl Canvas {
 
     pub fn draw_text(&mut self, fonts: &Fonts, text: &str, x: f32, baseline: f32, size: f32,
                      color: Color, bold: bool, italic: bool, scroll: f32) {
-        self.draw_text_spaced(fonts, text, x, baseline, size, color, bold, italic, scroll, 0.0);
+        self.draw_text_spaced(fonts, text, x, baseline, size, color, bold, italic, scroll, 0.0, None);
     }
 
     /// `draw_text` with `spacing` device px added after every glyph (letter-spacing).
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text_spaced(&mut self, fonts: &Fonts, text: &str, x: f32, baseline: f32, size: f32,
-                            color: Color, bold: bool, italic: bool, scroll: f32, spacing: f32) {
+                            color: Color, bold: bool, italic: bool, scroll: f32, spacing: f32, family: Option<&str>) {
         let mut pen = x;
-        fonts.for_each_glyph(text, bold, italic, |glyph| {
+        fonts.for_each_glyph_in(family, text, bold, italic, |glyph| {
             match &glyph {
                 Glyph::Outline(font, ch) => {
                     let (metrics, coverage) = font.rasterize(*ch, size);
@@ -419,14 +419,15 @@ impl Canvas {
                     italic,
                     underline,
                     letter_spacing,
+                    family,
                 } => {
                     if *baseline + size < visible_top || *baseline - size > visible_bottom {
                         continue;
                     }
                     let y = (*baseline - scroll) * s;
-                    self.draw_text_spaced(fonts, text, *x * s, y, *size * s, *color, *bold, *italic, 0.0, letter_spacing * s);
+                    self.draw_text_spaced(fonts, text, *x * s, y, *size * s, *color, *bold, *italic, 0.0, letter_spacing * s, family.as_deref());
                     if *underline {
-                        let width = fonts.advance(text, *size, *bold, *italic) + letter_spacing * text.chars().count() as f32;
+                        let width = fonts.advance_in(text, *size, *bold, *italic, family.as_deref()) + letter_spacing * text.chars().count() as f32;
                         self.fill_rect(
                             Rect { x: *x * s, y: y + 1.5 * s, w: width * s, h: s.max(1.0) },
                             *color,

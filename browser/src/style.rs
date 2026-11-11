@@ -243,6 +243,8 @@ pub struct Style {
     pub vars: Arc<Vec<(String, String)>>,
     /// font-family asks for a monospace face (inherited)
     pub monospace: bool,
+    /// the font-family list, lower case (inherited); fonts resolve it
+    pub family: Option<Arc<str>>,
 }
 
 impl Default for Style {
@@ -292,6 +294,7 @@ impl Default for Style {
             grid_span: GridSpan::Auto,
             vars: Arc::new(Vec::new()),
             monospace: false,
+            family: None,
         }
     }
 }
@@ -371,11 +374,13 @@ pub fn default_style(tag: &str) -> Style {
         "code" | "kbd" | "samp" | "tt" => {
             style.font_size = 14.0;
             style.monospace = true;
+            style.family = Some(Arc::from("monospace"));
         }
         "pre" => {
             style.display = Display::Block;
             style.pre = true;
             style.monospace = true;
+            style.family = Some(Arc::from("monospace"));
             style.font_size = 14.0;
             style.margin = Edges { top: 13.0, right: 0.0, bottom: 13.0, left: 0.0 };
             style.background = Some(Color::rgb(245, 245, 245));
@@ -640,6 +645,7 @@ pub fn inherited(parent: &Style) -> Style {
     style.hidden = parent.hidden;
     style.vars = parent.vars.clone();
     style.monospace = parent.monospace;
+    style.family = parent.family.clone();
     style.pre = parent.pre;
     style
 }
@@ -676,6 +682,9 @@ pub fn compute(
         style.hidden = inherit.hidden;
         style.vars = inherit.vars.clone();
         style.monospace = style.monospace || inherit.monospace;
+        if style.family.is_none() {
+            style.family = inherit.family.clone();
+        }
         style.pre = style.pre || inherit.pre;
     }
 
@@ -821,11 +830,15 @@ fn inherit_property(style: &mut Style, parent: &Style, name: &str) {
             style.italic = parent.italic;
             style.line_height = parent.line_height;
             style.monospace = parent.monospace;
+            style.family = parent.family.clone();
         }
         "font-size" => style.font_size = parent.font_size,
         "font-weight" => style.bold = parent.bold,
         "font-style" => style.italic = parent.italic,
-        "font-family" => style.monospace = parent.monospace,
+        "font-family" => {
+            style.monospace = parent.monospace;
+            style.family = parent.family.clone();
+        }
         "line-height" => style.line_height = parent.line_height,
         "color" => style.color = parent.color,
         "text-align" => style.align = parent.align,
@@ -1082,7 +1095,10 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 }
             }
         }
-        "font-family" => style.monospace = is_monospace(value),
+        "font-family" => {
+            style.monospace = is_monospace(value);
+            style.family = Some(Arc::from(value.to_ascii_lowercase().as_str()));
+        }
         "font" => {
             // [style] [weight] size[/line-height] family
             if value == "inherit" || value.starts_with("var(") {
@@ -1106,7 +1122,11 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                     if let Some(line) = line {
                         apply(style, "line-height", line, containing_width);
                     }
-                    style.monospace = is_monospace(&tokens[i + 1..].join(" "));
+                    let family = tokens[i + 1..].join(" ");
+                    style.monospace = is_monospace(&family);
+                    if !family.trim().is_empty() {
+                        style.family = Some(Arc::from(family.to_ascii_lowercase().as_str()));
+                    }
                     break;
                 }
                 match token.as_str() {

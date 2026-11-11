@@ -636,9 +636,55 @@ pub struct Rule {
     pub order: usize,
 }
 
+/// An `@font-face`: a family name, its files (best first) and which face it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontFace {
+    /// lower case, unquoted
+    pub family: String,
+    /// `url()` sources in order, relative to the stylesheet until resolved
+    pub sources: Vec<String>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl FontFace {
+    fn parse(body: &str) -> Option<FontFace> {
+        let mut face = FontFace { family: String::new(), sources: Vec::new(), bold: false, italic: false };
+        for d in parse_declarations(body) {
+            match d.name.as_str() {
+                "font-family" => face.family = d.value.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase(),
+                "src" => {
+                    for source in split_top_level(&d.value, ',') {
+                        let source = source.trim();
+                        let lower = source.to_ascii_lowercase();
+                        // WOFF2 needs Brotli and a table rebuild we do not have
+                        if lower.contains("woff2") || !lower.starts_with("url(") {
+                            continue;
+                        }
+                        let inner = &source[4..];
+                        let url = inner.split(')').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'');
+                        if !url.is_empty() && !url.starts_with("data:") {
+                            face.sources.push(url.to_string());
+                        }
+                    }
+                }
+                "font-weight" => {
+                    let first = d.value.split_whitespace().next().unwrap_or("400").to_ascii_lowercase();
+                    face.bold = first == "bold" || first == "bolder" || first.parse::<u32>().is_ok_and(|w| w >= 600);
+                }
+                "font-style" => face.italic = d.value.contains("italic") || d.value.contains("oblique"),
+                _ => {}
+            }
+        }
+        (!face.family.is_empty() && !face.sources.is_empty()).then_some(face)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// `@font-face` rules, for the loader to fetch
+    pub font_faces: Vec<FontFace>,
     /// `@import` URLs, in order, for the loader to fetch
     pub imports: Vec<String>,
     /// width the `@media` queries are evaluated against
@@ -647,7 +693,7 @@ pub struct Stylesheet {
 
 impl Default for Stylesheet {
     fn default() -> Stylesheet {
-        Stylesheet { rules: Vec::new(), imports: Vec::new(), viewport_width: 1024.0 }
+        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), viewport_width: 1024.0 }
     }
 }
 
@@ -667,6 +713,7 @@ impl Stylesheet {
             self.rules.push(rule);
         }
         self.imports.extend(other.imports);
+        self.font_faces.extend(other.font_faces);
     }
 
     fn parse_block(&mut self, css: &str, media: &Media) {
@@ -756,7 +803,12 @@ impl Stylesheet {
                             self.parse_block(&body, media);
                         }
                     }
-                    // @font-face (fonts are local only), @keyframes, @page, @property…
+                    "font-face" => {
+                        if let Some(face) = FontFace::parse(&body) {
+                            self.font_faces.push(face);
+                        }
+                    }
+                    // @keyframes, @page, @property…
                     _ => {}
                 }
                 continue;

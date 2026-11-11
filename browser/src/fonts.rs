@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use fontdue::{Font, FontSettings};
 
@@ -161,13 +161,181 @@ impl<'f> Glyph<'f> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Families: fonts pages bring (@font-face) and local generic faces
+// ---------------------------------------------------------------------------
+
+/// Faces of one family: regular, bold, italic, bold italic.
+type Faces = [Option<&'static Font>; 4];
+
+fn slot(bold: bool, italic: bool) -> usize {
+    (bold as usize) | ((italic as usize) << 1)
+}
+
+/// Fonts loaded from pages, by family name. A face lives for the rest of
+/// the run (they are few and small); the same file is never parsed twice.
+#[derive(Default)]
+pub struct WebFonts {
+    families: RwLock<HashMap<String, Faces>>,
+}
+
+static LOADED: OnceLock<Mutex<HashMap<String, Option<&'static Font>>>> = OnceLock::new();
+
+impl WebFonts {
+    pub fn register(&self, family: &str, bold: bool, italic: bool, font: &'static Font) {
+        let mut map = self.families.write().unwrap_or_else(|e| e.into_inner());
+        map.entry(family.to_ascii_lowercase()).or_default()[slot(bold, italic)] = Some(font);
+    }
+
+    pub fn has(&self, family: &str) -> bool {
+        self.families.read().unwrap_or_else(|e| e.into_inner()).contains_key(family)
+    }
+
+    /// The face closest to bold/italic in `family`.
+    fn face(&self, family: &str, bold: bool, italic: bool) -> Option<&'static Font> {
+        let map = self.families.read().unwrap_or_else(|e| e.into_inner());
+        let faces = map.get(family)?;
+        faces[slot(bold, italic)].or(faces[slot(false, italic)]).or(faces[slot(bold, false)]).or(faces[0]).or_else(|| faces.iter().flatten().next().copied())
+    }
+}
+
+/// Parse a font file (TTF, OTF, TTC or WOFF) once per `key` (its URL).
+pub fn load_web_font(key: &str, bytes: &[u8]) -> Option<&'static Font> {
+    let cache = LOADED.get_or_init(Default::default);
+    if let Some(done) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
+        return *done;
+    }
+    let sfnt = if bytes.starts_with(b"wOFF") { woff_to_sfnt(bytes) } else { Some(bytes.to_vec()) };
+    let font = sfnt
+        .filter(|b| b.starts_with(&[0, 1, 0, 0]) || b.starts_with(b"OTTO") || b.starts_with(b"true") || b.starts_with(b"ttcf"))
+        .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok())
+        .map(|f| &*Box::leak(Box::new(f)));
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), font);
+    font
+}
+
+/// WOFF 1.0 → the sfnt it wraps: each table zlib-inflated back in place.
+fn woff_to_sfnt(w: &[u8]) -> Option<Vec<u8>> {
+    let flavor = be32(w, 4)?;
+    let count = be16(w, 12)? as usize;
+    let mut tables = Vec::with_capacity(count);
+    for i in 0..count {
+        let e = 44 + i * 20;
+        let tag = w.get(e..e + 4)?.to_vec();
+        let (offset, comp, orig, checksum) = (be32(w, e + 4)? as usize, be32(w, e + 8)? as usize, be32(w, e + 12)? as usize, be32(w, e + 16)?);
+        let raw = w.get(offset..offset + comp)?;
+        let data = if comp < orig { miniz_oxide::inflate::decompress_to_vec_zlib(raw).ok()? } else { raw.to_vec() };
+        if data.len() != orig {
+            return None;
+        }
+        tables.push((tag, checksum, data));
+    }
+    let mut out = Vec::new();
+    let power = (count.max(1) as f32).log2().floor() as u32;
+    let range = 16u16 << power;
+    out.extend_from_slice(&flavor.to_be_bytes());
+    out.extend_from_slice(&(count as u16).to_be_bytes());
+    out.extend_from_slice(&range.to_be_bytes());
+    out.extend_from_slice(&(power as u16).to_be_bytes());
+    out.extend_from_slice(&((count as u16) * 16 - range).to_be_bytes());
+    let mut offset = 12 + count * 16;
+    for (tag, checksum, data) in &tables {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&checksum.to_be_bytes());
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        offset += (data.len() + 3) & !3;
+    }
+    for (_, _, data) in &tables {
+        out.extend_from_slice(data);
+        out.resize((out.len() + 3) & !3, 0);
+    }
+    Some(out)
+}
+
+/// Local faces for the generic families pages ask for.
+const MONO_FACES: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/SFNSMono.ttf", 0),
+    ("/System/Library/Fonts/Menlo.ttc", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
+    (r"C:\Windows\Fonts\consola.ttf", 0),
+];
+const SERIF_FACES: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/Supplemental/Georgia.ttf", 0),
+    ("/System/Library/Fonts/Supplemental/Times New Roman.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 0),
+    (r"C:\Windows\Fonts\georgia.ttf", 0),
+];
+
+/// A local face loaded on first use.
+#[derive(Default)]
+pub struct LocalFamily {
+    paths: &'static [(&'static str, u32)],
+    face: OnceLock<Option<Font>>,
+}
+
+impl LocalFamily {
+    pub fn mono() -> LocalFamily {
+        LocalFamily { paths: MONO_FACES, face: OnceLock::new() }
+    }
+
+    pub fn serif() -> LocalFamily {
+        LocalFamily { paths: SERIF_FACES, face: OnceLock::new() }
+    }
+
+    fn get(&self) -> Option<&Font> {
+        self.face
+            .get_or_init(|| {
+                self.paths.iter().find_map(|(path, index)| {
+                    let bytes = std::fs::read(path).ok()?;
+                    Font::from_bytes(bytes, FontSettings { collection_index: *index, ..FontSettings::default() }).ok()
+                })
+            })
+            .as_ref()
+    }
+}
+
 impl Fonts {
+    /// The face for a CSS `font-family` list: the first family the page
+    /// loaded, or a local face for a generic one; else the default faces.
+    pub fn pick_family(&self, family: Option<&str>, bold: bool, italic: bool) -> &Font {
+        if let Some(list) = family {
+            for name in list.split(',') {
+                let name = name.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
+                if let Some(font) = self.web.face(&name, bold, italic) {
+                    return font;
+                }
+                let local = match name.as_str() {
+                    "monospace" | "ui-monospace" | "sfmono-regular" | "sf mono" | "menlo" | "monaco" | "consolas" | "courier" | "courier new" | "liberation mono" | "dejavu sans mono" => Some(&self.mono),
+                    "serif" | "ui-serif" | "georgia" | "times" | "times new roman" | "cambria" => Some(&self.serif),
+                    "sans-serif" | "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" | "arial" | "helvetica" | "helvetica neue" | "segoe ui" | "roboto" => return self.pick(bold, italic),
+                    _ => None,
+                };
+                if let Some(font) = local.and_then(|l| l.get()) {
+                    return font;
+                }
+            }
+        }
+        self.pick(bold, italic)
+    }
+
+    /// Advance of `text` in the face `family` selects.
+    pub fn advance_in(&self, text: &str, size: f32, bold: bool, italic: bool, family: Option<&str>) -> f32 {
+        let mut width = 0.0;
+        self.for_each_glyph_in(family, text, bold, italic, |glyph| width += glyph.advance(size));
+        width
+    }
+
+    pub fn for_each_glyph<'f>(&'f self, text: &str, bold: bool, italic: bool, f: impl FnMut(Glyph<'f>)) {
+        self.for_each_glyph_in(None, text, bold, italic, f)
+    }
+
     /// Walk `text`, choosing a face per codepoint: the styled primary face,
     /// then the fallback chain, then colour emoji. Emoji presentation wins
     /// for default-emoji codepoints and anything followed by U+FE0F.
     /// Joiners and variation selectors are zero-width and produce nothing.
-    pub fn for_each_glyph<'f>(&'f self, text: &str, bold: bool, italic: bool, mut f: impl FnMut(Glyph<'f>)) {
-        let primary = self.pick(bold, italic);
+    pub fn for_each_glyph_in<'f>(&'f self, family: Option<&str>, text: &str, bold: bool, italic: bool, mut f: impl FnMut(Glyph<'f>)) {
+        let primary = self.pick_family(family, bold, italic);
         let mut chars = text.chars().peekable();
         let mut after_emoji = false;
         while let Some(ch) = chars.next() {

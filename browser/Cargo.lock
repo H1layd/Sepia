@@ -1930,6 +1930,7 @@ dependencies = [
  "boa_engine",
  "fontdue",
  "gif",
+ "miniz_oxide 0.8.9",
  "png",
  "rustls",
  "softbuffer",

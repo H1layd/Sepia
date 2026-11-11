@@ -154,7 +154,7 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
         "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         "Accept-Encoding: identity",
         "Accept-Language: en-US,en;q=0.9",
-        "Connection: close",
+        "Connection: keep-alive (reused per site for 30 s, never across sites)",
     ] {
         println!("  {header}");
     }
@@ -164,8 +164,10 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!("  {:<16} {}", "", "headers as the page (no Referer, no cookies); data: URIs decoded locally;");
     println!("  {:<16} {}", "", "1x1 (tracking) images are never requested; 8 s budget per page");
     println!("  {:<16} {}", "stylesheets", "<link rel=stylesheet> and @import, up to 24 (+8 imports), any origin, same");
-    println!("  {:<16} {}", "", "path and headers as the page; 8 s budget; fonts and url() images in CSS");
-    println!("  {:<16} {}", "", "are never requested");
+    println!("  {:<16} {}", "", "path and headers as the page; 8 s budget; url() images in CSS are never");
+    println!("  {:<16} {}", "", "requested");
+    println!("  {:<16} {}", "fonts", "@font-face files (TTF, OTF, WOFF; not WOFF2), up to 16, same path and");
+    println!("  {:<16} {}", "", "headers as the page, 6 s budget; kept in memory only");
     println!("  {:<16} {}", "scripts", "<script src> fetched like stylesheets (any origin) and run in Boa; fetch()");
     println!("  {:<16} {}", "", "reaches only the page's own origin, GET, same path and headers; no XHR,");
     println!("  {:<16} {}", "", "WebSocket, beacons or workers; no cookies; storage in memory only;");

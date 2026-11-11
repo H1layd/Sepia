@@ -16,6 +16,7 @@ zune-jpeg = "0.5.15"
 zune-core = "0.5"
 gif = { version = "0.14", default-features = false, features = ["std"] }
 boa_engine = { version = "0.22.0", default-features = false, features = ["annex-b"] }
+miniz_oxide = "0.8"
 
 [profile.release]
 opt-level = 3

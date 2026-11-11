@@ -42,11 +42,17 @@ pub fn load(
     timeout: Duration,
     insecure_tls: bool,
 ) -> Result<Loaded, String> {
-    open(url, chain, resolver, width, fonts, timeout, insecure_tls).map(|(loaded, _)| loaded)
+    open(url, chain, resolver, width, fonts, timeout, insecure_tls, false).map(|(loaded, _, _)| loaded)
 }
 
+/// Images still on their way: the page is shown without them first.
+pub type LateImages = std::thread::JoinHandle<ImageMap>;
+
 /// `load`, keeping the page's script session alive for events (clicks,
-/// typing). A session is tied to the calling thread.
+/// typing). A session is tied to the calling thread. With `defer_images`
+/// the page is laid out as soon as its HTML, CSS and scripts are in; the
+/// images arrive through the returned handle (give them to the session).
+#[allow(clippy::too_many_arguments)]
 pub fn open(
     url: &Url,
     chain: &Chain,
@@ -55,17 +61,18 @@ pub fn open(
     fonts: &Fonts,
     timeout: Duration,
     insecure_tls: bool,
-) -> Result<(Loaded, Option<Session>), String> {
+    defer_images: bool,
+) -> Result<(Loaded, Option<Session>, Option<LateImages>), String> {
     require_overlay(url, chain)?;
     match url.scheme.as_str() {
         "gemini" => {
             let text_page =
                 protocols::fetch_gemini(url, chain, resolver, timeout, insecure_tls)?;
-            Ok((finish(url, text_page.html, 20, text_page.title, text_page.note, width, fonts, 0, None).0, None))
+            Ok((finish(url, text_page.html, 20, text_page.title, text_page.note, width, fonts, 0, None, false).0, None, None))
         }
         "gopher" => {
             let text_page = protocols::fetch_gopher(url, chain, resolver, timeout)?;
-            Ok((finish(url, text_page.html, 200, text_page.title, text_page.note, width, fonts, 0, None).0, None))
+            Ok((finish(url, text_page.html, 200, text_page.title, text_page.note, width, fonts, 0, None, false).0, None, None))
         }
         _ => {
             let response: Response = fetch_with(url, chain, resolver, timeout)?;
@@ -80,6 +87,7 @@ pub fn open(
                 fonts,
                 0,
                 Some(ImageFetch { chain, resolver, timeout }),
+                defer_images,
             ))
         }
     }
@@ -184,7 +192,8 @@ fn finish(
     fonts: &Fonts,
     extra_rules: usize,
     fetch: Option<ImageFetch>,
-) -> (Loaded, Option<Session>) {
+    defer_images: bool,
+) -> (Loaded, Option<Session>, Option<LateImages>) {
     let document = dom::parse_document(&html);
     let title = {
         let from_doc = Layout::title(&document);
@@ -195,17 +204,25 @@ fn finish(
         }
     };
     // stylesheets, scripts and images come in parallel; layout needs all three
+    // images either come with the page or follow it on their own thread
+    let late: Option<LateImages> = match (&fetch, defer_images) {
+        (Some(how), true) => {
+            let (doc, base, chain, resolver, timeout) = (document.clone(), url.clone(), how.chain.clone(), how.resolver.cloned(), how.timeout);
+            Some(std::thread::spawn(move || fetch_images(&doc, &base, &ImageFetch { chain: &chain, resolver: resolver.as_ref(), timeout }).0))
+        }
+        _ => None,
+    };
     let (mut sheet, images, scripts) = match &fetch {
         Some(how) => {
             let (sheet, external, scripts, (images, found, loaded)) = std::thread::scope(|scope| {
-                let images = scope.spawn(|| fetch_images(&document, url, how));
+                let images = (!defer_images).then(|| scope.spawn(|| fetch_images(&document, url, how)));
                 let scripts = scope.spawn(|| load_scripts(&document, url, how));
                 let (sheet, external) = load_styles(&document, url, Some(how));
                 (
                     sheet,
                     external,
                     scripts.join().unwrap_or_default(),
-                    images.join().unwrap_or_else(|_| (ImageMap::new(), 0, 0)),
+                    images.map(|h| h.join().unwrap_or_else(|_| (ImageMap::new(), 0, 0))).unwrap_or_else(|| (ImageMap::new(), 0, 0)),
                 )
             });
             if external > 0 {
@@ -222,10 +239,16 @@ fn finish(
         None => (load_styles(&document, url, None).0, ImageMap::new(), Vec::new()),
     };
     sheet.viewport_width = width;
+    if let Some(how) = &fetch {
+        let loaded = load_fonts(&sheet, fonts, how);
+        if loaded > 0 {
+            note = format!("{note} · fonts {loaded}");
+        }
+    }
     let rules = sheet.rules.len() + extra_rules;
-    if scripts.is_empty() {
+    if scripts.is_empty() && late.is_none() {
         let page = Layout::new(fonts, &sheet, width).with_images(&images).build(&document);
-        return (Loaded { url: url.clone(), title, page, status, rules, note }, None);
+        return (Loaded { url: url.clone(), title, page, status, rules, note }, None, None);
     }
     // run the page's scripts; the session stays for events
     let net = fetch.as_ref().map(|how| crate::js::NetAccess { chain: how.chain, resolver: how.resolver, timeout: how.timeout });
@@ -241,7 +264,52 @@ fn finish(
     }
     let page = session.layout(fonts);
     let title = session.title().unwrap_or(title);
-    (Loaded { url: url.clone(), title, page, status, rules, note }, Some(session))
+    (Loaded { url: url.clone(), title, page, status, rules, note }, Some(session), late)
+}
+
+const MAX_FONTS: usize = 16;
+const FONT_BUDGET: Duration = Duration::from_secs(6);
+
+/// Fetch the files of the page's `@font-face` rules (TTF, OTF, WOFF; the
+/// first usable source of each) through the page's path and register them
+/// by family. Returns how many faces were registered.
+fn load_fonts(sheet: &Stylesheet, fonts: &Fonts, how: &ImageFetch) -> usize {
+    let faces: Vec<&crate::css::FontFace> = sheet.font_faces.iter().take(MAX_FONTS).collect();
+    if faces.is_empty() {
+        return 0;
+    }
+    let started = Instant::now();
+    let mut registered = 0;
+    for batch in faces.chunks(IMAGE_PARALLEL) {
+        let left = FONT_BUDGET.saturating_sub(started.elapsed());
+        if left < Duration::from_millis(300) {
+            break;
+        }
+        let got: Vec<(&crate::css::FontFace, Option<&'static fontdue::Font>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|face| {
+                    scope.spawn(move || {
+                        let font = face.sources.iter().find_map(|source| {
+                            let url = Url::parse(source)?;
+                            let response = fetch_with(&url, how.chain, how.resolver, how.timeout.min(left)).ok()?;
+                            (response.status < 400).then_some(())?;
+                            crate::fonts::load_web_font(source, &response.body)
+                        });
+                        (*face, font)
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for (face, font) in got {
+            if let Some(font) = font {
+                fonts.web.register(&face.family, face.bold, face.italic, font);
+                registered += 1;
+            }
+        }
+    }
+    registered
 }
 
 const MAX_SCRIPTS: usize = 48;
@@ -432,6 +500,9 @@ fn load_styles(document: &dom::Node, base: &Url, how: Option<&ImageFetch>) -> (S
         }
         let mut parsed = parsed;
         parsed.imports.clear();
+        for face in &mut parsed.font_faces {
+            face.sources = face.sources.iter().filter_map(|s| sheet_url.resolve(s).map(|u| u.to_string())).collect();
+        }
         sheet.append(parsed);
     }
     (sheet, external)

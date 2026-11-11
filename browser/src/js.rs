@@ -620,6 +620,11 @@ impl Session {
         Layout::new(fonts, &self.sheet, self.width).with_images(&self.images).build(&tree)
     }
 
+    /// Images that arrived after the page was first shown.
+    pub fn set_images(&mut self, images: ImageMap) {
+        self.images = images;
+    }
+
     pub fn title(&self) -> Option<String> {
         with(|st| st.title.clone())
     }
@@ -785,7 +790,7 @@ mod tests {
         let Ok(address) = std::env::var("SEPIA_BENCH_URL") else { return };
         let fonts = Fonts::load();
         let url = Url::parse(&address).unwrap();
-        let (loaded, session) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false).unwrap();
+        let (loaded, session, _) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false, false).unwrap();
         let mut session = session.expect("scripts ran");
         println!("note: {}  log: {:?}", loaded.note, session.log());
         let tree = session.tree();
@@ -795,6 +800,51 @@ mod tests {
         println!("relayout: {}, title: {:?}, log: {:?}", out.page.is_some(), out.title, session.log());
         let tree = session.tree();
         println!("archive hidden: {:?}, projects hidden: {:?}", find_id(&tree, "archive").map(|n| n.attr("hidden").is_some()), find_id(&tree, "projects").map(|n| n.attr("hidden").is_some()));
+    }
+
+    /// Click every button of a live page and report what happened.
+    /// `SEPIA_BENCH_URL=https://a152b.host/ cargo test --release live_buttons -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_buttons() {
+        let Ok(address) = std::env::var("SEPIA_BENCH_URL") else { return };
+        let fonts = Fonts::load();
+        let url = Url::parse(&address).unwrap();
+        let (_, session, _) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false, false).unwrap();
+        let mut session = session.expect("session");
+        fn buttons(node: &Node, out: &mut Vec<(usize, String)>) {
+            if node.tag == "button" || (node.tag == "input" && matches!(node.attr("type"), Some("submit") | Some("button"))) {
+                let label = format!("{} [{}]", node.text_content().split_whitespace().collect::<Vec<_>>().join(" "), node.attrs.iter().filter(|(k, _)| k != "data-sepia-id").map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
+                out.push((node.attr("data-sepia-id").unwrap().parse().unwrap(), label));
+            }
+            for c in &node.children {
+                buttons(c, out);
+            }
+        }
+        let mut list = Vec::new();
+        buttons(&session.tree(), &mut list);
+        // hit testing as the window does it: the smallest box around a point
+        let page = session.layout(&fonts);
+        for (id, label) in &list {
+            let Some((rect, _)) = page.boxes.iter().find(|(_, b)| b == id) else {
+                println!("NO BOX for {label}");
+                continue;
+            };
+            let (x, y) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+            let hit = page.boxes.iter().filter(|(r, _)| r.contains(x, y)).min_by(|a, b| (a.0.w * a.0.h).partial_cmp(&(b.0.w * b.0.h)).unwrap()).map(|(_, i)| *i);
+            if hit != Some(*id) {
+                println!("centre of {label} hits {hit:?} (button is {id}), rect {rect:?}");
+            }
+        }
+        let mut seen = session.log().len();
+        for (id, label) in list {
+            let before = session.tree().text_content();
+            let out = session.handle(PageEvent::Click { node: id, href: None }, &fonts);
+            let after = session.tree().text_content();
+            let log = session.log();
+            println!("{label}\n   relayout={} changed_text={} navigate={:?} new_log={:?}", out.page.is_some(), before != after, out.navigate, &log[seen..]);
+            seen = log.len();
+        }
     }
 
     fn find_attr<'n>(node: &'n Node, name: &str, value: &str) -> Option<&'n Node> {
