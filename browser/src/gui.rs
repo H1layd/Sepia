@@ -54,28 +54,36 @@ mod theme {
     use super::rgb;
     use crate::css::Color;
 
-    pub const WINDOW: Color = rgb(13, 15, 18);
-    pub const PANEL: Color = rgb(21, 24, 29);
-    pub const RAISED: Color = rgb(28, 32, 39);
-    pub const RAISED_HOVER: Color = rgb(38, 43, 52);
-    pub const STROKE: Color = rgb(38, 43, 51);
-    pub const TEXT: Color = rgb(232, 234, 237);
-    pub const TEXT_DIM: Color = rgb(154, 163, 174);
-    pub const ACCENT: Color = rgb(124, 240, 192);
-    pub const ON_ACCENT: Color = rgb(13, 15, 18);
-    pub const DANGER: Color = rgb(255, 138, 128);
+    // Colourless glass: every colour of the chrome is a neutral grey; the
+    // panels are frosted glass over the page with a bright rim on top.
+    pub const WINDOW: Color = rgb(10, 10, 11);
+    pub const PANEL: Color = rgb(17, 17, 19);
+    pub const RAISED: Color = rgb(30, 30, 33);
+    pub const STROKE: Color = rgb(40, 40, 44);
+    pub const TEXT: Color = rgb(244, 244, 246);
+    pub const TEXT_DIM: Color = rgb(150, 150, 156);
+    pub const ACCENT: Color = rgb(250, 250, 252);
+    pub const ON_ACCENT: Color = rgb(12, 12, 13);
+    pub const DANGER: Color = rgb(250, 250, 252);
     pub const PAGE: Color = rgb(255, 255, 255);
 
-    pub const TOR: Color = rgb(183, 148, 255);
-    pub const I2P: Color = rgb(242, 193, 78);
-    pub const CHAIN: Color = rgb(143, 180, 255);
-    pub const DIRECT: Color = rgb(255, 150, 110);
+    /// smoked glass: the tint laid over the blurred page
+    pub const GLASS: Color = Color { r: 40, g: 40, b: 44, a: 118 };
+    /// the same glass over a light page: a milky white wash
+    pub const GLASS_LIGHT: Color = Color { r: 255, g: 255, b: 255, a: 120 };
+
+    pub const TOR: Color = TEXT;
+    pub const I2P: Color = TEXT;
+    pub const CHAIN: Color = TEXT;
+    pub const DIRECT: Color = TEXT_DIM;
 
     // geometry, logical px
     pub const TOP: f32 = 56.0;
-    pub const INSET: f32 = 8.0;
-    pub const VIEW_RADIUS: f32 = 14.0;
+    pub const INSET: f32 = 0.0;
+    pub const VIEW_RADIUS: f32 = 0.0;
     pub const CAPSULE: f32 = 36.0;
+    /// height of the (transparent) macOS title bar that lies over the page
+    pub const TITLEBAR: f32 = 28.0;
     pub const CAPSULE_OPEN_MAX: f32 = 560.0;
     pub const DOCK_HEIGHT: f32 = 92.0;
     pub const DOCK_MARGIN: f32 = 12.0;
@@ -338,13 +346,13 @@ impl Tab {
     fn tint(&self) -> Color {
         let host = self.host();
         if host.is_empty() {
-            return rgb(35, 42, 51);
+            return rgb(44, 44, 48);
         }
         let mut hash: u32 = 2166136261;
         for b in host.bytes() {
             hash = (hash ^ b as u32).wrapping_mul(16777619);
         }
-        hsl((hash % 360) as f32, 0.30, 0.26)
+        hsl(0.0, 0.0, 0.16 + (hash % 13) as f32 * 0.012)
     }
 }
 
@@ -374,6 +382,8 @@ pub enum Hit {
     Prev,
     Next,
     Tab(usize),
+    /// the × on the hovered tab card
+    TabClose(usize),
     Transport,
     Burn,
     Dock,
@@ -430,6 +440,22 @@ pub struct Ui {
     spin: f32,
     toast: Option<(String, f32)>,
     link: Option<String>,
+    /// 0 = the dock is tucked away as a strip at the bottom edge, 1 = shown
+    dock_show: f32,
+    /// seconds the dock stays up after the pointer leaves it
+    dock_hold: f32,
+    /// a tab card held by the mouse (dragging once it has moved)
+    drag: Option<Drag>,
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    index: usize,
+    start_x: f32,
+    /// pointer x minus the card centre when it was grabbed
+    grab: f32,
+    x: f32,
+    moved: bool,
 }
 
 fn ease(v: &mut f32, target: f32, dt: f32) -> bool {
@@ -465,6 +491,9 @@ impl Ui {
             spin: 0.0,
             toast: None,
             link: None,
+            dock_show: 1.0,
+            dock_hold: 0.0,
+            drag: None,
         };
         ui.push_tab();
         ui
@@ -521,9 +550,11 @@ impl Ui {
             arrows = n > visible;
         }
         let dock_w = fixed(arrows) + visible as f32 * theme::SLOT;
+        // tucked away, the dock slides below the bottom edge
+        let tuck = (theme::DOCK_HEIGHT + theme::DOCK_MARGIN + 24.0) * (1.0 - smooth(self.dock_show));
         let dock = Rect {
             x: (w - dock_w) / 2.0,
-            y: h - theme::DOCK_MARGIN - theme::DOCK_HEIGHT,
+            y: h - theme::DOCK_MARGIN - theme::DOCK_HEIGHT + tuck,
             w: dock_w,
             h: theme::DOCK_HEIGHT,
         };
@@ -565,11 +596,24 @@ impl Ui {
         if inside(&g.capsule, if self.addr_open > 0.5 { 8.0 } else { 6.0 }) {
             return Hit::Capsule;
         }
+        if self.dock_show < 0.5 {
+            // only the strip at the bottom edge: touching it brings the dock up
+            let strip_zone = y >= self.h - 26.0 && x >= g.dock.x && x <= g.dock.x + g.dock.w;
+            if strip_zone {
+                return Hit::Dock;
+            }
+            return if inside(&g.viewport, 0.0) { Hit::Page } else { Hit::Nothing };
+        }
         // The hovered card pokes above the dock; keep it hovered while the
         // pointer is over its enlarged face.
-        if let Hit::Tab(i) = self.hover {
+        if let Hit::Tab(i) | Hit::TabClose(i) = self.hover {
             let cx = self.slot_center(&g, i);
             let half = theme::CARD_W * theme::MAGNIFY / 2.0;
+            let top = g.dock.y + 12.0 + theme::CARD_H - theme::LIFT - theme::CARD_H * theme::MAGNIFY;
+            let (bx, by) = close_button(cx, top);
+            if (x - bx).powi(2) + (y - by).powi(2) <= 11.0f32.powi(2) && i < self.tabs.len() {
+                return Hit::TabClose(i);
+            }
             let top = g.dock.y + 12.0 - theme::LIFT - theme::CARD_H * theme::MAGNIFY;
             let in_strip = x >= g.strip.x && x <= g.strip.x + g.strip.w;
             if x >= cx - half && x <= cx + half && y >= top && y <= g.dock.y + g.dock.h && in_strip {
@@ -610,7 +654,69 @@ impl Ui {
     }
 
     pub fn set_hover(&mut self, hit: Hit) {
-        self.hover = hit;
+        if self.drag.is_none() {
+            self.hover = hit;
+        }
+    }
+
+    // ----- dragging tabs ----------------------------------------------------
+
+    /// The mouse went down on tab `index` at `x`: a click or the start of a drag.
+    pub fn press_tab(&mut self, index: usize, x: f32) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let g = self.geom();
+        let grab = x - self.slot_center(&g, index);
+        self.drag = Some(Drag { index, start_x: x, grab, x, moved: false });
+    }
+
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// The held card follows the pointer; crossing a neighbour's slot swaps
+    /// the two, and the neighbour slides over into the freed slot.
+    pub fn drag_to(&mut self, x: f32) {
+        let Some(mut d) = self.drag else { return };
+        d.x = x;
+        if !d.moved && (x - d.start_x).abs() > 5.0 {
+            d.moved = true;
+        }
+        if d.moved {
+            let g = self.geom();
+            let rel = (x - d.grab - g.strip.x - theme::STRIP_PAD) / theme::SLOT + self.offset_anim - 0.5;
+            let first = self.offset;
+            let last = (self.offset + g.visible).min(self.tabs.len()).saturating_sub(1);
+            let target = (rel.round().max(0.0) as usize).clamp(first, last.max(first));
+            while d.index != target {
+                let next = if target > d.index { d.index + 1 } else { d.index - 1 };
+                self.tabs.swap(d.index, next);
+                // the neighbour now sits one slot over: keep it where it was
+                // on screen and let it ease into place
+                let shift = if next > d.index { theme::SLOT } else { -theme::SLOT };
+                self.tabs[d.index].anim.push += shift;
+                if self.active == d.index {
+                    self.active = next;
+                } else if self.active == next {
+                    self.active = d.index;
+                }
+                d.index = next;
+            }
+        }
+        self.drag = Some(d);
+        self.hover = Hit::Tab(d.index);
+    }
+
+    /// The mouse came up. A press that never moved is a click: it selects
+    /// the tab (returns true).
+    pub fn release(&mut self) -> bool {
+        let Some(d) = self.drag.take() else { return false };
+        if !d.moved {
+            self.select(d.index);
+            return true;
+        }
+        false
     }
 
     // ----- navigation -----------------------------------------------------
@@ -732,6 +838,7 @@ impl Ui {
             return;
         }
         self.tabs.remove(index);
+        self.drag = None;
         if self.tabs.is_empty() {
             self.push_tab();
         }
@@ -946,15 +1053,47 @@ impl Ui {
             moving |= ease(&mut self.swipe, 0.0, dt);
             moving |= ease(&mut self.pull, 0.0, dt);
         }
-        let hovered = match self.hover {
-            Hit::Tab(i) => Some(i),
+        // the dock: up while the pointer is on it, a card is held, or there
+        // is no page to look at; it tucks away a moment after the pointer leaves
+        let wants_dock = self.drag.is_some()
+            || self.active_loaded().is_none()
+            || matches!(
+                self.hover,
+                Hit::Dock | Hit::NewTab | Hit::Prev | Hit::Next | Hit::Tab(_) | Hit::TabClose(_) | Hit::Transport | Hit::Burn
+            );
+        if wants_dock {
+            self.dock_hold = 0.7;
+        } else if self.dock_hold > 0.0 {
+            self.dock_hold -= dt;
+            moving = true;
+        }
+        let up = if self.dock_hold > 0.0 { 1.0 } else { 0.0 };
+        moving |= ease(&mut self.dock_show, up, dt * 0.8);
+
+        let hovered = match (self.drag, self.hover) {
+            (Some(d), _) => Some(d.index),
+            (None, Hit::Tab(i) | Hit::TabClose(i)) => Some(i),
             _ => None,
         };
+        let held = self.drag.filter(|d| d.moved).map(|d| {
+            let g = self.geom();
+            (d.index, d.x - d.grab - self.slot_center(&g, d.index))
+        });
         let active = self.active;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let target = card_target(i, hovered, i == active);
+            let target = match held {
+                // while a card is carried its neighbours stand at rest
+                Some((h, _)) if h != i => card_target(i, None, i == active),
+                _ => card_target(i, hovered, i == active),
+            };
             let a = &mut tab.anim;
-            moving |= ease(&mut a.push, target.push, dt);
+            match held {
+                Some((h, push)) if h == i => {
+                    a.push = push;
+                    moving = true;
+                }
+                _ => moving |= ease(&mut a.push, target.push, dt),
+            }
             moving |= ease(&mut a.lift, target.lift, dt);
             moving |= ease(&mut a.tilt, target.tilt, dt);
             moving |= ease(&mut a.scale, target.scale, dt);
@@ -973,6 +1112,35 @@ impl Ui {
             moving = true;
         }
         moving || self.gesture_active
+    }
+}
+
+/// Centre of the × on a hovered card whose face has its top edge at `top`.
+fn close_button(cx: f32, top: f32) -> (f32, f32) {
+    (cx - theme::CARD_W * theme::MAGNIFY / 2.0 + 3.0, top + 3.0)
+}
+
+/// Colours for things drawn on glass, adapted to what is behind it:
+/// `t` = 0 over a dark backdrop (light ink), 1 over a light one (dark ink).
+#[derive(Clone, Copy)]
+struct Ink {
+    t: f32,
+}
+
+impl Ink {
+    fn text(&self) -> Color {
+        mix(rgb(246, 246, 248), rgb(20, 20, 22), self.t)
+    }
+    fn dim(&self) -> Color {
+        mix(rgb(168, 168, 174), rgb(92, 92, 98), self.t)
+    }
+    /// the text colour at opacity `a`: washes, hairlines, pills
+    fn wash(&self, a: f32) -> Color {
+        alpha(self.text(), a)
+    }
+    /// what goes on top of a solid `text()`-coloured shape
+    fn inverse(&self) -> Color {
+        mix(rgb(16, 16, 18), rgb(250, 250, 252), self.t)
     }
 }
 
@@ -1248,7 +1416,10 @@ impl<'a> Painter<'a> {
     }
 
     /// Blur what is already drawn under the rounded rect `r` and lay a tint
-    /// over it: a frosted-glass panel. Three box-blur passes ≈ a Gaussian.
+    /// over it: a frosted-glass panel. The blur runs on a copy downsampled by
+    /// `f` (a wide blur loses nothing to it) and is read back bilinearly, so a
+    /// dock-sized panel costs well under a millisecond. Three box-blur passes
+    /// ≈ a Gaussian.
     fn frosted(&mut self, r: Rect, radius: f32, tint: Color, blur: f32) {
         let s = self.s;
         let reach = (blur * s).ceil() as i32;
@@ -1257,39 +1428,146 @@ impl<'a> Painter<'a> {
         let x1 = (((r.x + r.w) * s).ceil() as i32 + reach).min(cw);
         let y0 = ((r.y * s).floor() as i32 - reach).max(0);
         let y1 = (((r.y + r.h) * s).ceil() as i32 + reach).min(ch);
-        let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
-        if w == 0 || h == 0 {
+        if x1 <= x0 || y1 <= y0 {
             return;
         }
+        let f = ((blur * s) / 6.0).floor().clamp(1.0, 4.0) as usize;
+        let (w, h) = (((x1 - x0) as usize).div_ceil(f), ((y1 - y0) as usize).div_ceil(f));
         let mut buf = vec![[0.0f32; 3]; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                let i = ((y0 as usize + y) * self.c.width + x0 as usize + x) * 4;
-                buf[y * w + x] = [self.c.pixels[i] as f32, self.c.pixels[i + 1] as f32, self.c.pixels[i + 2] as f32];
+        let cwu = self.c.width;
+        for by in 0..h {
+            for bx in 0..w {
+                let mut sum = [0.0f32; 3];
+                let mut n = 0.0;
+                for yy in (y0 as usize + by * f)..(y0 as usize + (by + 1) * f).min(y1 as usize) {
+                    let row = yy * cwu;
+                    for xx in (x0 as usize + bx * f)..(x0 as usize + (bx + 1) * f).min(x1 as usize) {
+                        let i = (row + xx) * 4;
+                        sum[0] += self.c.pixels[i] as f32;
+                        sum[1] += self.c.pixels[i + 1] as f32;
+                        sum[2] += self.c.pixels[i + 2] as f32;
+                        n += 1.0;
+                    }
+                }
+                buf[by * w + bx] = [sum[0] / n, sum[1] / n, sum[2] / n];
             }
         }
-        let pass = ((blur * s) / 3.0).round().max(1.0) as usize;
+        let pass = ((blur * s) / 3.0 / f as f32).round().max(1.0) as usize;
         for _ in 0..3 {
             box_blur(&mut buf, w, h, pass);
         }
         let shape = RoundShape::new(r, radius, s);
         let ta = tint.a as f32 / 255.0;
-        let tc = [tint.r as f32, tint.g as f32, tint.b as f32];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let cov = (0.5 - shape.sd(x, y)).clamp(0.0, 1.0);
+        let tc = [tint.r as f32 * ta, tint.g as f32 * ta, tint.b as f32 * ta];
+        let keep = 1.0 - ta;
+        let inv = 1.0 / f as f32;
+        let (sx0, sx1, sy0, sy1) = shape.bounds(0.0);
+        for y in sy0.max(y0)..sy1.min(y1) {
+            let fy = ((y - y0) as f32 + 0.5) * inv - 0.5;
+            let ya = (fy.floor().max(0.0) as usize).min(h - 1);
+            let yb = (ya + 1).min(h - 1);
+            let ty = (fy - ya as f32).clamp(0.0, 1.0);
+            let (ia, ib) = shape.inner_span(y, 0.0).unwrap_or((sx1, sx1));
+            for x in sx0.max(x0)..sx1.min(x1) {
+                let cov = if x >= ia && x < ib { 1.0 } else { (0.5 - shape.sd(x, y)).clamp(0.0, 1.0) };
                 if cov <= 0.0 {
                     continue;
                 }
-                let b = buf[(y - y0) as usize * w + (x - x0) as usize];
-                let i = (y as usize * self.c.width + x as usize) * 4;
+                let fx = ((x - x0) as f32 + 0.5) * inv - 0.5;
+                let xa = (fx.floor().max(0.0) as usize).min(w - 1);
+                let xb = (xa + 1).min(w - 1);
+                let tx = (fx - xa as f32).clamp(0.0, 1.0);
+                let (p00, p10, p01, p11) = (buf[ya * w + xa], buf[ya * w + xb], buf[yb * w + xa], buf[yb * w + xb]);
+                let i = (y as usize * cwu + x as usize) * 4;
                 for c in 0..3 {
-                    let glass = b[c] * (1.0 - ta) + tc[c] * ta;
+                    let top = p00[c] + (p10[c] - p00[c]) * tx;
+                    let bot = p01[c] + (p11[c] - p01[c]) * tx;
+                    let glass = (top + (bot - top) * ty) * keep + tc[c];
                     let under = self.c.pixels[i + c] as f32;
                     self.c.pixels[i + c] = (glass * cov + under * (1.0 - cov)).round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
+    }
+
+    /// A specular rim: a hairline that is bright along the top edge and fades
+    /// towards the bottom, plus a faint inner glow line under the top edge —
+    /// what makes a frosted panel read as a piece of glass.
+    fn rim(&mut self, r: Rect, radius: f32, strength: f32) {
+        let s = self.s;
+        let shape = RoundShape::new(r, radius, s);
+        let inner = RoundShape::new(Rect { x: r.x + 1.0, y: r.y + 1.0, w: r.w - 2.0, h: r.h - 2.0 }, (radius - 1.0).max(0.0), s);
+        let half = 0.5 * s;
+        let (top, height) = (r.y * s, (r.h * s).max(1.0));
+        let (x0, x1, y0, y1) = shape.bounds(1.0);
+        for y in y0..y1 {
+            let v = ((y as f32 + 0.5 - top) / height).clamp(0.0, 1.0);
+            let edge_a = strength * (0.10 + 0.42 * (1.0 - v).powi(3) + 0.10 * v.powi(4));
+            let glow_a = strength * 0.16 * (1.0 - v * 3.0).max(0.0);
+            let edge = Color { r: 255, g: 255, b: 255, a: (edge_a * 255.0).min(255.0) as u8 };
+            let glow = Color { r: 255, g: 255, b: 255, a: (glow_a * 255.0).min(255.0) as u8 };
+            let (ia, ib) = shape.inner_span(y, half * 2.0 + 2.0 * s + 1.0).unwrap_or((x1, x1));
+            for x in (x0..ia.min(x1)).chain(ib.max(x0)..x1) {
+                let d = shape.sd(x, y) + half;
+                let cov = (half + 0.5 - d.abs()).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.put(x, y, edge, cov);
+                }
+                if glow.a > 0 {
+                    let d = inner.sd(x, y) + half;
+                    let cov = (half + 0.5 - d.abs()).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        self.put(x, y, glow, cov);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mean brightness (0..1) of what is drawn under `r`, from a sparse grid.
+    fn luma(&self, r: Rect) -> f32 {
+        let s = self.s;
+        let (cw, ch) = (self.c.width as f32, self.c.height as f32);
+        let (mut sum, mut n) = (0.0, 0.0);
+        for j in 0..5 {
+            for i in 0..12 {
+                let x = ((r.x + r.w * (i as f32 + 0.5) / 12.0) * s).clamp(0.0, cw - 1.0) as usize;
+                let y = ((r.y + r.h * (j as f32 + 0.5) / 5.0) * s).clamp(0.0, ch - 1.0) as usize;
+                let k = (y * self.c.width + x) * 4;
+                let px = &self.c.pixels[k..k + 3];
+                sum += 0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32;
+                n += 1.0;
+            }
+        }
+        sum / n / 255.0
+    }
+
+    /// The ink for glass laid over `r`: light over dark pages, dark over light.
+    fn ink_over(&self, r: Rect) -> Ink {
+        Ink { t: smooth((self.luma(r) - 0.42) / 0.26) }
+    }
+
+    /// A floating glass panel that adapts to the site behind it: the page
+    /// blurred under a smoky (dark sites) or milky (light sites) wash, a soft
+    /// shadow and a specular rim. Returns the ink to draw on it with.
+    fn glass(&mut self, r: Rect, radius: f32, blur: f32, shadow: f32, opacity: f32) -> Ink {
+        let ink = self.ink_over(r);
+        let tint = mix(theme::GLASS, theme::GLASS_LIGHT, ink.t);
+        if opacity > 0.6 {
+            self.frosted(r, radius, tint, blur);
+        } else {
+            // fading in or out: a plain wash is enough and costs nothing
+            self.round_rect(r, radius, alpha(mix(rgb(40, 40, 44), rgb(250, 250, 252), ink.t), opacity * 0.8));
+        }
+        if shadow > 0.0 {
+            self.shadow(r, radius, 18.0, 8.0, shadow * opacity);
+        }
+        self.rim(r, radius, opacity * (1.0 - 0.5 * ink.t));
+        if ink.t > 0.0 {
+            // white rim vanishes on a white page: a faint dark hairline instead
+            self.round_stroke(r, radius, 1.0, alpha(rgb(0, 0, 0), 0.09 * ink.t * opacity));
+        }
+        ink
     }
 
     fn circle(&mut self, cx: f32, cy: f32, r: f32, color: Color) {
@@ -1375,6 +1653,10 @@ impl<'a> Painter<'a> {
             Icon::Alert => {
                 self.polyline(&map(&[(12.0, 6.5), (12.0, 13.5)]), w * 1.3, color);
                 self.polyline(&map(&[(12.0, 17.5)]), w * 1.6, color);
+            }
+            Icon::Close => {
+                self.polyline(&map(&[(7.0, 7.0), (17.0, 17.0)]), w * 1.2, color);
+                self.polyline(&map(&[(17.0, 7.0), (7.0, 17.0)]), w * 1.2, color);
             }
             Icon::Reload => {
                 self.arc(cx, cy, 7.0 * k, -0.6, 5.2, w, color);
@@ -1473,6 +1755,7 @@ enum Icon {
     Shield,
     Alert,
     Reload,
+    Close,
 }
 
 /// What a tab card shows on its face.
@@ -1698,7 +1981,8 @@ impl Ui {
                 (left, y + i as f32 * 70.0)
             };
             let r = Rect { x: cx, y: cy, w: card_w, h: 64.0 };
-            p.round_stroke(r, 14.0, 1.0, theme::STROKE);
+            p.round_rect(r, 16.0, rgb(22, 22, 25));
+            p.round_stroke(r, 16.0, 1.0, theme::STROKE);
             p.text(fonts, label, r.x + 16.0, r.y + 24.0, 12.0, theme::TEXT_DIM, false);
             p.text(fonts, &fit(fonts, value, 14.0, false, card_w - 32.0), r.x + 16.0, r.y + 46.0, 14.0, *color, false);
         }
@@ -1738,29 +2022,47 @@ impl Ui {
     fn draw_link(&self, p: &mut Painter, fonts: &Fonts, g: &Geom) {
         let Some(href) = &self.link else { return };
         let room = g.dock.x - g.viewport.x - 24.0;
+        let bottom = g.dock.y.min(self.h);
         let (max_w, y) = if room >= 160.0 {
             (room.min(440.0), g.viewport.y + g.viewport.h - 36.0)
         } else {
-            ((g.viewport.w - 24.0).min(440.0), g.dock.y - 36.0)
+            ((g.viewport.w - 24.0).min(440.0), bottom - 36.0)
         };
         let label = fit(fonts, href, 12.0, false, max_w - 20.0);
         let w = fonts.advance(&label, 12.0, false, false) + 20.0;
         let r = Rect { x: g.viewport.x + 12.0, y, w, h: 24.0 };
-        p.round_rect(r, 12.0, alpha(theme::PANEL, 0.94));
-        p.text(fonts, &label, r.x + 10.0, r.y + 16.0, 12.0, theme::TEXT_DIM, false);
+        let ink = p.glass(r, 12.0, 10.0, 0.0, 1.0);
+        p.text(fonts, &label, r.x + 10.0, r.y + 16.0, 12.0, ink.text(), false);
     }
 
     fn draw_dock(&self, p: &mut Painter, fonts: &Fonts, g: &Geom) {
+        let shown = smooth(self.dock_show);
+        if shown < 0.999 {
+            // tucked away: a slim glass strip along the bottom edge
+            let a = 1.0 - shown;
+            let r = Rect { x: self.w / 2.0 - 70.0, y: self.h - 11.0 + 6.0 * shown, w: 140.0, h: 5.0 };
+            let ink = p.ink_over(Rect { x: r.x, y: r.y - 6.0, w: r.w, h: 16.0 });
+            p.shadow(r, 2.5, 6.0, 1.0, 0.18 * a * (1.0 - ink.t));
+            p.round_rect(r, 2.5, ink.wash(0.62 * a));
+        }
+        if shown < 0.01 {
+            return;
+        }
         let d = g.dock;
-        p.shadow(d, 24.0, 22.0, 10.0, 0.5);
-        p.round_rect(d, 24.0, theme::PANEL);
-        p.round_stroke(d, 24.0, 1.0, theme::STROKE);
+        let radius = 28.0;
+        let ink = p.glass(d, radius, 20.0, 0.22, shown);
+        let fade = |c: Color| alpha(c, shown);
 
-        let hover_bg = |hit: Hit, base: Color| if self.hover == hit { theme::RAISED_HOVER } else { base };
-        p.round_rect(g.new_tab, 14.0, hover_bg(Hit::NewTab, theme::RAISED));
-        p.icon(Icon::Plus, g.new_tab.x + 22.0, g.new_tab.y + 22.0, 22.0, theme::TEXT);
+        // controls sit straight on the glass; hover lights a soft pill
+        let wash = |p: &mut Painter, hit: Hit, r: Rect| {
+            if self.hover == hit {
+                p.round_rect(r, 16.0, ink.wash(0.10 * shown));
+            }
+        };
+        wash(p, Hit::NewTab, g.new_tab);
+        p.icon(Icon::Plus, g.new_tab.x + 22.0, g.new_tab.y + 22.0, 20.0, fade(ink.text()));
 
-        let sep = |p: &mut Painter, x: f32| p.round_rect(Rect { x, y: d.y + 30.0, w: 1.0, h: 32.0 }, 0.5, theme::STROKE);
+        let sep = |p: &mut Painter, x: f32| p.round_rect(Rect { x, y: d.y + 32.0, w: 1.0, h: 28.0 }, 0.5, ink.wash(0.14 * shown));
         sep(p, g.new_tab.x + theme::BUTTON + 8.0);
         sep(p, g.chip.x - 9.0);
 
@@ -1768,39 +2070,42 @@ impl Ui {
             let can_prev = self.offset > 0;
             let can_next = self.offset < self.max_offset();
             let tone = |on: bool, hit: Hit| {
-                if !on {
-                    alpha(theme::TEXT_DIM, 0.3)
+                fade(if !on {
+                    alpha(ink.dim(), 0.35)
                 } else if self.hover == hit {
-                    theme::TEXT
+                    ink.text()
                 } else {
-                    theme::TEXT_DIM
-                }
+                    ink.dim()
+                })
             };
             p.icon(Icon::Left, g.prev.x + g.prev.w / 2.0, g.prev.y + 22.0, 16.0, tone(can_prev, Hit::Prev));
             p.icon(Icon::Right, g.next.x + g.next.w / 2.0, g.next.y + 22.0, 16.0, tone(can_next, Hit::Next));
         }
 
-        // transport chip
+        // transport chip: the risky route is the dim one
         let t = self.transport;
-        p.round_rect(g.chip, 14.0, hover_bg(Hit::Transport, theme::RAISED));
-        p.icon(Icon::Shield, g.chip.x + 20.0, g.chip.y + 22.0, 18.0, t.color());
-        p.text(fonts, t.label(), g.chip.x + 36.0, g.chip.y + 27.0, 13.0, t.color(), true);
+        wash(p, Hit::Transport, g.chip);
+        let tone = fade(if self.hover == Hit::Transport || t != Transport::Direct { ink.text() } else { ink.dim() });
+        p.icon(Icon::Shield, g.chip.x + 20.0, g.chip.y + 22.0, 17.0, tone);
+        p.text(fonts, t.label(), g.chip.x + 36.0, g.chip.y + 27.0, 13.0, tone, true);
 
-        // burn
-        if self.hover == Hit::Burn {
-            p.round_rect(g.burn, 14.0, alpha(theme::DANGER, 0.16));
+        // burn: the one solid control, it fills with ink under the pointer
+        let hot = self.hover == Hit::Burn;
+        if hot {
+            p.round_rect(g.burn, 16.0, fade(ink.text()));
         }
-        p.round_stroke(g.burn, 14.0, 1.0, theme::STROKE);
-        let flame = if self.hover == Hit::Burn { theme::DANGER } else { theme::ACCENT };
+        let flame = fade(if hot { ink.inverse() } else { ink.text() });
         p.icon(Icon::Flame, g.burn.x + 22.0, g.burn.y + 22.0, 20.0, flame);
 
-        self.draw_cards(p, fonts, g);
+        self.draw_cards(p, fonts, g, ink);
     }
 
-    fn draw_cards(&self, p: &mut Painter, fonts: &Fonts, g: &Geom) {
+    fn draw_cards(&self, p: &mut Painter, fonts: &Fonts, g: &Geom, ink: Ink) {
+        let shown = smooth(self.dock_show);
         let clip = (g.strip.x + 4.0, g.strip.x + g.strip.w - 4.0);
-        let hovered = match self.hover {
-            Hit::Tab(i) => Some(i),
+        let hovered = match (self.drag, self.hover) {
+            (Some(d), _) => Some(d.index),
+            (None, Hit::Tab(i) | Hit::TabClose(i)) => Some(i),
             _ => None,
         };
         // back to front: farthest from the hovered card first
@@ -1811,6 +2116,8 @@ impl Ui {
         });
         let card_bottom = g.dock.y + 12.0 + theme::CARD_H;
         let icon_y = g.dock.y + 12.0 + 68.0 - 9.0;
+        let edge_on = mix(rgb(238, 238, 242), rgb(28, 28, 30), ink.t);
+        let edge_off = mix(rgb(96, 96, 102), rgb(150, 150, 156), ink.t);
         let mut label: Option<(f32, f32, usize)> = None;
         for i in order {
             let tab = &self.tabs[i];
@@ -1820,6 +2127,8 @@ impl Ui {
                 continue;
             }
             let active = i == self.active;
+            // a carried card may leave the strip; the others stay clipped
+            let carried = self.drag.is_some_and(|d| d.moved && d.index == i);
             let pose = CardPose {
                 cx,
                 bottom: card_bottom - a.lift,
@@ -1828,13 +2137,13 @@ impl Ui {
                 tilt_deg: a.tilt,
                 depth: a.depth,
                 bright: 0.82 + 0.18 * if active { 1.0 } else { 0.0 } + 0.25 * a.hot,
-                border: if a.hot > 0.5 || active { theme::ACCENT } else { rgb(58, 65, 76) },
-                clip,
+                border: if a.hot > 0.5 || active { edge_on } else { edge_off },
+                clip: if carried { (g.dock.x, g.dock.x + g.dock.w) } else { clip },
             };
             if a.hot > 0.05 {
                 let w = pose.w;
                 let r = Rect { x: cx - w / 2.0, y: pose.bottom - pose.h, w, h: pose.h };
-                p.shadow(r, 8.0, 14.0, 10.0, 0.45 * a.hot);
+                p.shadow(r, 8.0, 14.0, 10.0, 0.4 * a.hot * shown);
             }
             let face = match &tab.thumb {
                 Some(img) => Face::Thumb(img),
@@ -1845,63 +2154,69 @@ impl Ui {
             // monogram under the card
             if cx >= clip.0 && cx <= clip.1 {
                 let size = 18.0 * (1.0 + 0.2 * a.hot);
-                if a.hot > 0.01 {
-                    p.circle(cx, icon_y, size / 2.0 + 4.0, alpha(theme::ACCENT, 0.2 * a.hot));
-                }
-                let bg = mix(theme::RAISED, theme::ACCENT, a.hot);
-                let fg = mix(if active { theme::ACCENT } else { rgb(195, 201, 209) }, theme::ON_ACCENT, a.hot);
+                let rest = ink.wash(if active { 0.22 } else { 0.10 });
+                let bg = mix(rest, ink.text(), a.hot);
+                let fg = mix(if active { ink.text() } else { ink.dim() }, ink.inverse(), a.hot);
                 let r = Rect { x: cx - size / 2.0, y: icon_y - size / 2.0, w: size, h: size };
-                p.round_rect(r, size / 3.0, bg);
+                p.round_rect(r, size / 3.0, alpha(bg, shown));
                 let letter = tab.monogram().to_string();
-                p.text_centered(fonts, &letter, cx, icon_y + size * 0.2, size * 0.55, fg, true);
+                p.text_centered(fonts, &letter, cx, icon_y + size * 0.2, size * 0.55, alpha(fg, shown), true);
                 if active {
-                    p.circle(cx, g.dock.y + g.dock.h - 6.0, 2.0, theme::ACCENT);
+                    p.circle(cx, g.dock.y + g.dock.h - 6.0, 2.0, alpha(ink.text(), shown));
                 }
                 if tab.loading.is_some() {
-                    p.arc(cx, icon_y, size / 2.0 + 3.0, self.spin * 6.0, 1.6, 1.6, theme::ACCENT);
+                    p.arc(cx, icon_y, size / 2.0 + 3.0, self.spin * 6.0, 1.6, 1.6, alpha(ink.text(), shown));
                 }
             }
             if a.hot > 0.05 {
-                label = Some((cx, pose.bottom - pose.h - 10.0, i));
+                label = Some((cx, pose.bottom - pose.h, i));
             }
         }
-        if let Some((cx, bottom, i)) = label {
-            let tab = &self.tabs[i];
-            let t = tab.anim.hot;
-            let title = fit(fonts, &tab.title(), 13.0, true, 300.0);
-            let host = tab.host();
-            let tw = fonts.advance(&title, 13.0, true, false).max(fonts.advance(&host, 11.0, false, false));
-            let h = if host.is_empty() { 30.0 } else { 44.0 };
-            let w = tw + 24.0;
-            let x = (cx - w / 2.0).clamp(8.0, self.w - w - 8.0);
-            let r = Rect { x, y: bottom - h + (1.0 - t) * 8.0, w, h };
-            p.shadow(r, 12.0, 12.0, 6.0, 0.4 * t);
-            p.round_rect(r, 12.0, alpha(theme::RAISED, t));
-            p.round_stroke(r, 12.0, 1.0, alpha(rgb(42, 47, 56), t));
-            p.text_centered(fonts, &title, r.x + w / 2.0, r.y + 20.0, 13.0, alpha(theme::TEXT, t), true);
-            if !host.is_empty() {
-                p.text_centered(fonts, &host, r.x + w / 2.0, r.y + 35.0, 11.0, alpha(theme::TEXT_DIM, t), false);
-            }
+        let Some((cx, top, i)) = label else { return };
+        let tab = &self.tabs[i];
+        let t = tab.anim.hot * shown;
+        // the × in the top-left corner of the hovered card (not while carried)
+        if self.drag.is_none_or(|d| !d.moved) && t > 0.3 {
+            let (bx, by) = close_button(cx, top);
+            let hot = self.hover == Hit::TabClose(i);
+            let k = ((t - 0.3) / 0.7).min(1.0);
+            p.shadow(Rect { x: bx - 9.0, y: by - 9.0, w: 18.0, h: 18.0 }, 9.0, 6.0, 2.0, 0.35 * k);
+            p.circle(bx, by, 9.0, alpha(if hot { rgb(250, 250, 252) } else { rgb(36, 36, 40) }, 0.94 * k));
+            p.icon(Icon::Close, bx, by, 12.0, alpha(if hot { rgb(16, 16, 18) } else { rgb(236, 236, 240) }, k));
+        }
+        if self.drag.is_some_and(|d| d.moved) {
+            return;
+        }
+        // title plate above the hovered card
+        let title = fit(fonts, &tab.title(), 13.0, true, 300.0);
+        let host = tab.host();
+        let tw = fonts.advance(&title, 13.0, true, false).max(fonts.advance(&host, 11.0, false, false));
+        let h = if host.is_empty() { 30.0 } else { 44.0 };
+        let w = tw + 24.0;
+        let x = (cx - w / 2.0).clamp(8.0, self.w - w - 8.0);
+        let r = Rect { x, y: top - 10.0 - h + (1.0 - t) * 8.0, w, h };
+        let pink = p.glass(r, 14.0, 14.0, 0.3, t);
+        p.text_centered(fonts, &title, r.x + w / 2.0, r.y + 20.0, 13.0, alpha(pink.text(), t), true);
+        if !host.is_empty() {
+            p.text_centered(fonts, &host, r.x + w / 2.0, r.y + 35.0, 11.0, alpha(pink.dim(), t), false);
         }
     }
 
     fn draw_capsule(&self, p: &mut Painter, fonts: &Fonts, g: &Geom) {
         let c = g.capsule;
         let tab = self.tab();
-        // frosted glass: the page behind, blurred and tinted
-        p.shadow(c, c.h / 2.0, 14.0, 4.0, 0.22);
-        p.frosted(c, c.h / 2.0, alpha(theme::PANEL, 0.62), 14.0);
-        p.round_stroke(c, c.h / 2.0, 1.0, Color { r: 255, g: 255, b: 255, a: 34 });
+        // glass that takes its tone from the site behind it
+        let ink = p.glass(c, c.h / 2.0, 16.0, 0.14, 1.0);
 
         let transport = Transport::of_tab(self.transport, tab);
         // monogram, always visible, at the left end
         let (mx, my) = (c.x + c.h / 2.0, c.y + c.h / 2.0);
-        p.circle(mx, my, 11.0, tab.tint());
-        p.text_centered(fonts, &tab.monogram().to_string(), mx, my + 4.0, 11.0, theme::TEXT, true);
-        p.circle(mx + 8.5, my + 8.5, 4.5, theme::PANEL);
-        p.circle(mx + 8.5, my + 8.5, 3.0, transport.color());
+        p.circle(mx, my, 11.0, ink.wash(0.12));
+        p.text_centered(fonts, &tab.monogram().to_string(), mx, my + 4.0, 11.0, ink.text(), true);
+        p.circle(mx + 8.5, my + 8.5, 4.0, ink.inverse());
+        p.circle(mx + 8.5, my + 8.5, 2.5, if transport == Transport::Direct { ink.dim() } else { ink.text() });
         if tab.loading.is_some() {
-            p.arc(mx, my, 14.5, self.spin * 6.0, 1.8, 1.8, theme::ACCENT);
+            p.arc(mx, my, 14.5, self.spin * 6.0, 1.8, 1.8, ink.text());
         }
 
         let t = ((self.addr_open - 0.35) / 0.65).clamp(0.0, 1.0);
@@ -1912,8 +2227,8 @@ impl Ui {
         let label = transport.label();
         let tag_w = fonts.advance(label, 11.0, true, false) + 14.0;
         let tag = Rect { x: c.x + 38.0, y: my - 10.0, w: tag_w, h: 20.0 };
-        p.round_rect(tag, 10.0, alpha(transport.color(), 0.18 * t));
-        p.text(fonts, label, tag.x + 7.0, my + 4.0, 11.0, alpha(transport.color(), t), true);
+        p.round_rect(tag, 10.0, ink.wash(0.10 * t));
+        p.text(fonts, label, tag.x + 7.0, my + 4.0, 11.0, alpha(ink.text(), t), true);
 
         let text_x = tag.x + tag_w + 10.0;
         let room = c.x + c.w - 16.0 - text_x;
@@ -1922,12 +2237,16 @@ impl Ui {
         }
         if self.editing {
             let shown = fit_tail(fonts, &self.input, 14.0, room - 4.0);
-            let color = if self.replace_input { theme::ACCENT } else { theme::TEXT };
-            p.text(fonts, &shown, text_x, my + 5.0, 14.0, alpha(color, t), false);
+            if self.replace_input && !shown.is_empty() {
+                // everything selected: a soft highlight behind the text
+                let sw = fonts.advance(&shown, 14.0, false, false);
+                p.round_rect(Rect { x: text_x - 3.0, y: my - 10.0, w: sw + 6.0, h: 20.0 }, 5.0, ink.wash(0.16 * t));
+            }
+            p.text(fonts, &shown, text_x, my + 5.0, 14.0, alpha(ink.text(), t), false);
             let caret_x = text_x + fonts.advance(&shown, 14.0, false, false) + 1.0;
-            p.round_rect(Rect { x: caret_x, y: my - 8.0, w: 1.5, h: 16.0 }, 0.75, alpha(theme::ACCENT, t));
+            p.round_rect(Rect { x: caret_x, y: my - 8.0, w: 1.5, h: 16.0 }, 0.75, alpha(ink.text(), t));
             if self.input.is_empty() {
-                p.text(fonts, "Адрес сайта", text_x + 6.0, my + 5.0, 14.0, alpha(theme::TEXT_DIM, t), false);
+                p.text(fonts, "Адрес сайта", text_x + 6.0, my + 5.0, 14.0, alpha(ink.dim(), t), false);
             }
         } else {
             match tab.url() {
@@ -1936,14 +2255,14 @@ impl Ui {
                     let rest = url.to_string();
                     let rest = rest.split_once(&host).map(|(_, r)| r.to_string()).unwrap_or_default();
                     let host_fit = fit(fonts, &host, 14.0, false, room);
-                    p.text(fonts, &host_fit, text_x, my + 5.0, 14.0, alpha(theme::TEXT, t), false);
+                    p.text(fonts, &host_fit, text_x, my + 5.0, 14.0, alpha(ink.text(), t), false);
                     let used = fonts.advance(&host_fit, 14.0, false, false);
                     if host_fit == host && room - used > 30.0 && rest != "/" {
                         let tail = fit(fonts, &rest, 14.0, false, room - used);
-                        p.text(fonts, &tail, text_x + used, my + 5.0, 14.0, alpha(theme::TEXT_DIM, t), false);
+                        p.text(fonts, &tail, text_x + used, my + 5.0, 14.0, alpha(ink.dim(), t), false);
                     }
                 }
-                None => p.text(fonts, "Адрес сайта", text_x, my + 5.0, 14.0, alpha(theme::TEXT_DIM, t), false),
+                None => p.text(fonts, "Адрес сайта", text_x, my + 5.0, 14.0, alpha(ink.dim(), t), false),
             }
         }
     }
@@ -1980,10 +2299,9 @@ impl Ui {
         let Some((message, left)) = &self.toast else { return };
         let t = (left / 0.3).min(1.0);
         let w = fonts.advance(message, 13.0, false, false) + 32.0;
-        let r = Rect { x: (self.w - w) / 2.0, y: g.dock.y - 52.0, w, h: 34.0 };
-        p.shadow(r, 17.0, 14.0, 6.0, 0.4 * t);
-        p.round_rect(r, 17.0, alpha(theme::RAISED, t));
-        p.text_centered(fonts, message, r.x + w / 2.0, r.y + 22.0, 13.0, alpha(theme::TEXT, t), false);
+        let r = Rect { x: (self.w - w) / 2.0, y: (g.dock.y - 52.0).min(self.h - 58.0), w, h: 34.0 };
+        let ink = p.glass(r, 17.0, 14.0, 0.3, t);
+        p.text_centered(fonts, message, r.x + w / 2.0, r.y + 22.0, 13.0, alpha(ink.text(), t), false);
     }
 }
 
@@ -2271,6 +2589,10 @@ impl App {
 
     fn pointer_moved(&mut self, x: f32, y: f32) {
         self.mouse = (x, y);
+        if self.ui.dragging() {
+            self.ui.drag_to(x);
+            return;
+        }
         let hit = self.ui.hit(x, y);
         self.ui.set_hover(hit);
         let link = if hit == Hit::Page { self.link_at(x, y) } else { None };
@@ -2304,7 +2626,13 @@ impl App {
             Hit::NewTab => self.ui.new_tab(),
             Hit::Prev => self.ui.page_by(-3),
             Hit::Next => self.ui.page_by(3),
-            Hit::Tab(i) => self.ui.select(i),
+            // selecting happens on release, so the card can be dragged instead
+            Hit::Tab(i) => self.ui.press_tab(i, x),
+            Hit::TabClose(i) => {
+                self.ui.close_tab(i);
+                let ui = &self.ui;
+                self.sessions.retain(|id, _| ui.has_tab(*id));
+            }
             Hit::Burn => {
                 self.ui.burn();
                 self.page_cache = None;
@@ -2413,7 +2741,7 @@ impl App {
         };
         let (mx, my) = self.mouse;
         match self.ui.hit(mx, my) {
-            Hit::Tab(_) | Hit::Dock | Hit::Prev | Hit::Next | Hit::NewTab | Hit::Transport | Hit::Burn => {
+            Hit::Tab(_) | Hit::TabClose(_) | Hit::Dock | Hit::Prev | Hit::Next | Hit::NewTab | Hit::Transport | Hit::Burn => {
                 let along = if dx.abs() > dy.abs() { -dx } else { -dy };
                 self.ui.carousel_wheel(along);
             }
@@ -2464,8 +2792,16 @@ pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) ->
         builder.with_activation_policy(ActivationPolicy::Regular).with_activate_ignoring_other_apps(false);
     }
     let event_loop = builder.build().map_err(|e| e.to_string())?;
+    let window_builder = WindowBuilder::new();
+    // the page runs under a transparent title bar: no grey strip on top,
+    // the traffic lights float over the site like the capsule does
+    #[cfg(target_os = "macos")]
+    let window_builder = {
+        use winit::platform::macos::WindowBuilderExtMacOS;
+        window_builder.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true)
+    };
     let window = Arc::new(
-        WindowBuilder::new()
+        window_builder
             .with_title("Sepia")
             .with_inner_size(LogicalSize::new(1200.0, 860.0))
             .with_min_inner_size(LogicalSize::new(480.0, 360.0))
@@ -2556,6 +2892,14 @@ pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) ->
                     WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
                         let (x, y) = app.mouse;
                         match button {
+                            // the strip under the transparent title bar moves the window
+                            MouseButton::Left
+                                if y < theme::TITLEBAR
+                                    && matches!(app.ui.hit(x, y), Hit::Page | Hit::Nothing)
+                                    && app.link_at(x, y).is_none() =>
+                            {
+                                let _ = app.window.drag_window();
+                            }
                             MouseButton::Left => app.click(x, y),
                             MouseButton::Middle => {
                                 if let Hit::Tab(i) = app.ui.hit(x, y) {
@@ -2571,6 +2915,11 @@ pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) ->
                                 app.run(load);
                             }
                             _ => {}
+                        }
+                    }
+                    WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                        if app.ui.release() {
+                            app.update_title();
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
@@ -2661,8 +3010,65 @@ mod tests {
             open(&mut ui, url, title);
         }
         ui.select(0);
+        // the pointer rests on the dock, so it stays up
+        ui.set_hover(Hit::Dock);
         settle(&mut ui);
         ui
+    }
+
+    #[test]
+    fn dock_tucks_into_a_strip_and_comes_back() {
+        let mut ui = browsing();
+        let shown = ui.geom().dock;
+        ui.set_hover(Hit::Page);
+        settle(&mut ui);
+        assert!(ui.dock_show < 0.01, "a page is open and the pointer left: the dock hides");
+        assert!(ui.geom().dock.y >= ui.h, "tucked below the bottom edge");
+        let c = frame(&ui, 2.0);
+        dump(&c, "dock-tucked");
+        // the strip at the bottom edge brings it back
+        let hit = ui.hit(ui.w / 2.0, ui.h - 8.0);
+        assert_eq!(hit, Hit::Dock);
+        ui.set_hover(hit);
+        settle(&mut ui);
+        assert!((ui.geom().dock.y - shown.y).abs() < 0.5);
+    }
+
+    #[test]
+    fn tabs_drag_to_reorder_and_close_one_by_one() {
+        let mut ui = browsing();
+        let g = ui.geom();
+        let ids: Vec<u64> = ui.tabs.iter().map(|t| t.id).collect();
+        // a press without moving is a click: it selects
+        let x2 = ui.slot_center(&g, 2);
+        ui.press_tab(2, x2);
+        assert!(ui.release());
+        assert_eq!(ui.active, 2);
+        // carry tab 0 two slots right: it lands at 2, the others shift left
+        ui.select(0);
+        let x0 = ui.slot_center(&g, 0);
+        ui.press_tab(0, x0);
+        for k in 1..=10 {
+            ui.drag_to(x0 + k as f32 * theme::SLOT * 0.2);
+            ui.tick(0.016);
+        }
+        assert!(!ui.release(), "a drag is not a click");
+        let now: Vec<u64> = ui.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(now, vec![ids[1], ids[2], ids[0], ids[3]]);
+        assert_eq!(ui.tabs[ui.active].id, ids[0], "the active tab moved with its card");
+        // the × on a hovered card closes just that tab
+        settle(&mut ui);
+        let x = ui.slot_center(&g, 1);
+        ui.set_hover(Hit::Tab(1));
+        settle(&mut ui);
+        let top = g.dock.y + 12.0 + theme::CARD_H - theme::LIFT - theme::CARD_H * theme::MAGNIFY;
+        let (bx, by) = close_button(x, top);
+        assert_eq!(ui.hit(bx, by), Hit::TabClose(1));
+        let c = frame(&ui, 2.0);
+        dump(&c, "tab-close");
+        ui.close_tab(1);
+        let left: Vec<u64> = ui.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![ids[1], ids[0], ids[3]]);
     }
 
     #[test]
@@ -2685,8 +3091,9 @@ mod tests {
         settle(&mut ui);
         let c = frame(&ui, 1.0);
         dump(&c, "start");
-        // the viewport card is the panel colour, the window around it darker
-        assert_eq!(pixel(&c, 2.0, 300.0, 1.0), [theme::WINDOW.r, theme::WINDOW.g, theme::WINDOW.b]);
+        // the start screen fills the whole window: no frame around it
+        assert_eq!(pixel(&c, 2.0, 300.0, 1.0), [theme::PANEL.r, theme::PANEL.g, theme::PANEL.b]);
+        assert_eq!(pixel(&c, 500.0, 2.0, 1.0)[0], theme::PANEL.r, "no band above the page");
         assert_eq!(pixel(&c, 30.0, 300.0, 1.0), [theme::PANEL.r, theme::PANEL.g, theme::PANEL.b]);
     }
 
@@ -2742,13 +3149,13 @@ mod tests {
         assert_eq!(lifted, Hit::Tab(1));
         let c = frame(&ui, 2.0);
         dump(&c, "dock-hover");
-        // accent border of the hovered card shows above the dock
+        // the outline of the hovered card shows above the dock
         // card bottom rests at dock.y + 12 + CARD_H, lifted; perspective makes it a bit taller
         let top = g.dock.y + 12.0 + theme::CARD_H - theme::LIFT - theme::CARD_H * theme::MAGNIFY * 1.12;
         let found = (0..40).any(|dy| {
             let px = pixel(&c, x, top + dy as f32, 2.0);
-            // the mint accent edge over a white page: green clearly above red
-            px[1] as i32 > px[0] as i32 + 25
+            // the light grey edge of the card over a white page
+            (215..=246).contains(&px[0]) && px[2] >= px[0]
         });
         assert!(found, "hovered card outline not found above the dock");
     }
@@ -2844,7 +3251,7 @@ mod tests {
         time("fill", &mut || Painter { c: &mut canvas, s }.fill(theme::WINDOW));
         time("viewport", &mut || ui.draw_viewport(&mut Painter { c: &mut canvas, s }, &fonts, &g, Some((&view, 0))));
         time("dock", &mut || ui.draw_dock(&mut Painter { c: &mut canvas, s }, &fonts, &g));
-        time("cards", &mut || ui.draw_cards(&mut Painter { c: &mut canvas, s }, &fonts, &g));
+        time("cards", &mut || ui.draw_cards(&mut Painter { c: &mut canvas, s }, &fonts, &g, Ink { t: 1.0 }));
         time("capsule", &mut || ui.draw_capsule(&mut Painter { c: &mut canvas, s }, &fonts, &g));
         let mut out = vec![0u32; canvas.width * canvas.height];
         time("to u32", &mut || {
@@ -2928,7 +3335,7 @@ mod tests {
         dump(&c, "page");
         // page area is white inside the viewport, window colour outside
         assert_eq!(pixel(&c, 600.0, 300.0, 2.0), [255, 255, 255]);
-        assert_eq!(pixel(&c, 2.0, 300.0, 2.0)[0], theme::WINDOW.r, "window colour only in the inset margin");
+        assert_eq!(pixel(&c, 2.0, 300.0, 2.0), [255, 255, 255], "the page runs to the window edges");
         assert_eq!(pixel(&c, 100.0, 20.0, 2.0), [255, 255, 255], "the page runs to the top");
     }
 }
