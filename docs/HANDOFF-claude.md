@@ -86,7 +86,7 @@ pub fn request_headers(url: &Url) -> Vec<(String, String)>;
 1. **Фолбэк шрифтов и эмодзи.** `Fonts` держит несколько фейсов; для codepoint,
    которого нет в Arial, брать следующий локальный фейс; эмодзи — Apple Color
    Emoji / Noto Color Emoji (билинейная интерполяция по глифу). Сейчас emoji
-   рисуются квадратами (см. `docs/gemini-capsule.png`).
+   рисуются квадратами.
 2. **Картинки.** `<img src>`: PNG/JPEG-декодер, `width/height` атрибуты, `alt`,
    вписывание в контейнер, клик — ссылка. Загрузка — через `fetch_with`, не
    напрямую. `srcset`/`loading=lazy` можно игнорировать.
@@ -118,7 +118,7 @@ cargo test --release          # сейчас 48 тестов, должно ос�
 
 # рендер-проверки (детерминированные, без сети):
 ./target/release/sepia-browser --url /путь/к/тесту.html --dump /tmp/a.png --width 900 --height 700
-# сравнить с docs/*.png глазами; для регрессий — новые golden-картинки в docs/
+# сравнить глазами; скриншоты сравнивать глазами и НЕ коммитить
 
 # живые страницы:
 ./target/release/sepia-browser --url https://news.ycombinator.com --dump /tmp/hn.png
@@ -135,7 +135,7 @@ cargo test --release          # сейчас 48 тестов, должно ос�
 
 * `cargo test --release` зелёный, новые функции покрыты тестами;
 * `--audit` печатает ту же поверхность (никаких новых заголовков/сетей);
-* PNG на трёх эталонах не хуже текущих (сравнение глазами + сохранённые скрины);
+* рендер трёх страниц (`example.com`, HN, Wikipedia) не хуже текущего (сравнение глазами);
 * в диффе нет `TcpStream::connect`, `ToSocketAddrs`, `Cookie`, `Referer`,
   `std::fs::write` вне `--dump`.
 
