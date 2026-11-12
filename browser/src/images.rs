@@ -44,6 +44,36 @@ impl Bitmap {
         Bitmap::new(width, height, rgba)
     }
 
+    /// The pixels inside (x, y, w, h), clamped to the bitmap; crops are
+    /// remembered, since the same background is laid out again and again.
+    pub fn crop(self: &Arc<Self>, x: usize, y: usize, w: usize, h: usize) -> Arc<Bitmap> {
+        let x = x.min(self.width.saturating_sub(1));
+        let y = y.min(self.height.saturating_sub(1));
+        let w = w.clamp(1, self.width - x);
+        let h = h.clamp(1, self.height - y);
+        if (x, y, w, h) == (0, 0, self.width, self.height) {
+            return self.clone();
+        }
+        static CROPS: std::sync::OnceLock<Mutex<Vec<((usize, usize, usize, usize, usize), Arc<Bitmap>)>>> = std::sync::OnceLock::new();
+        let key = (Arc::as_ptr(self) as usize, x, y, w, h);
+        let cache = CROPS.get_or_init(Default::default);
+        if let Some((_, hit)) = cache.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+            return hit.clone();
+        }
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for row in y..y + h {
+            let start = (row * self.width + x) * 4;
+            rgba.extend_from_slice(&self.rgba[start..start + w * 4]);
+        }
+        let out = Arc::new(Bitmap::new(w, h, rgba));
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 64 {
+            cache.remove(0);
+        }
+        cache.push((key, out.clone()));
+        out
+    }
+
     /// Size for layout, in CSS px.
     pub fn natural_size(&self) -> (f32, f32) {
         self.natural.unwrap_or((self.width as f32, self.height as f32))
@@ -84,11 +114,36 @@ pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
         decode_jpeg(bytes)
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         decode_gif(bytes)
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        decode_webp(bytes)
     } else if crate::svg::sniff(bytes) {
         crate::svg::decode(bytes)
     } else {
         None
     }
+}
+
+fn decode_webp(bytes: &[u8]) -> Option<Bitmap> {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes)).ok()?;
+    let (w, h) = decoder.dimensions();
+    let (w, h) = (w as usize, h as usize);
+    if !fits(w, h) {
+        return None;
+    }
+    let alpha = decoder.has_alpha();
+    let mut buf = vec![0u8; decoder.output_buffer_size()?];
+    // animated WebP: the first frame
+    decoder.read_image(&mut buf).ok()?;
+    let rgba = if alpha {
+        buf
+    } else {
+        let mut out = Vec::with_capacity(w * h * 4);
+        for px in buf.chunks_exact(3) {
+            out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+        out
+    };
+    Some(Bitmap::from_straight(w, h, rgba))
 }
 
 fn fits(w: usize, h: usize) -> bool {

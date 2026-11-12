@@ -252,6 +252,9 @@ pub struct Layout<'a> {
     flow_width: f32,
     /// a flex/grid item laid out as a block whatever its inline display
     blockify: Option<*const Node>,
+    /// a flex row item laid out at the size the line gave it: its declared
+    /// width (often 100%) yields to that size, margins included
+    flex_main: Option<*const Node>,
     /// positioned ancestors (their padding boxes), innermost last: what
     /// `position: absolute` children are placed against
     containers: Vec<Container>,
@@ -288,7 +291,7 @@ fn out_of_flow(style: &Style) -> bool {
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
         crate::style::set_viewport(viewport_width, 800.0);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -410,6 +413,12 @@ impl<'a> Layout<'a> {
         if style.display == Display::None {
             return 0.0;
         }
+        if self.flex_main == Some(node as *const Node) && !self.measuring {
+            style.width = Some((containing_width - style.margin.horizontal()).max(1.0));
+            style.border_box = true;
+            style.min_width = None;
+            style.max_width = None;
+        }
 
         if style.display == Display::Table {
             let outer_align = parent_style.as_ref().map(|p| p.align).unwrap_or(Align::Left);
@@ -484,6 +493,12 @@ impl<'a> Layout<'a> {
         } else {
             None
         };
+        // a background image goes over the colour, under the content; placed at the end
+        let bg_bitmap = if paints_background { style.bg_image.as_deref().and_then(|src| self.images.and_then(|m| m.get(src))).cloned() } else { None };
+        let bg_index = bg_bitmap.as_ref().map(|_| {
+            self.page.draws.push(blank_draw());
+            self.page.draws.len() - 1
+        });
 
         let positioned = style.position != crate::style::Position::Static;
         if positioned {
@@ -561,6 +576,13 @@ impl<'a> Layout<'a> {
         for index in [shadow_index, fill_index].into_iter().flatten() {
             if let Draw::Shadow { rect: r, .. } | Draw::Fill { rect: r, .. } = &mut self.page.draws[index] {
                 *r = rect;
+            }
+        }
+        if let (Some(index), Some(bitmap)) = (bg_index, bg_bitmap) {
+            // painted inside the border (the padding box)
+            let area = Rect { x: rect.x + b.left, y: rect.y + b.top, w: rect.w - b.left - b.right, h: rect.h - b.top - b.bottom };
+            if let Some(draw) = background_draw(&bitmap, area, style) {
+                self.page.draws[index] = draw;
             }
         }
         if paints && (b.top > 0.0 || b.right > 0.0 || b.bottom > 0.0 || b.left > 0.0) {
@@ -753,7 +775,8 @@ impl<'a> Layout<'a> {
             }
             return;
         }
-        let style = compute(node, Some(parent_style), self.sheet, ancestors, self.viewport_width);
+        // percentages are of the line box being filled, not the window
+        let style = compute(node, Some(parent_style), self.sheet, ancestors, self.flow_width);
         if style.display == Display::None {
             return;
         }
@@ -1311,6 +1334,63 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A draw that paints nothing (holds a place to fill in later).
+fn blank_draw() -> Draw {
+    Draw::Rect { rect: Rect { x: 0.0, y: -1e9, w: 0.0, h: 0.0 }, color: Color { r: 0, g: 0, b: 0, a: 0 } }
+}
+
+/// background-image: sized (auto/cover/contain/lengths), positioned, and cut
+/// to `area`; one copy (no tiling).
+fn background_draw(bitmap: &Arc<crate::images::Bitmap>, area: Rect, style: &Style) -> Option<Draw> {
+    use crate::style::{BgPos, BgSize};
+    if area.w < 1.0 || area.h < 1.0 {
+        return None;
+    }
+    let (nw, nh) = bitmap.natural_size();
+    if nw < 0.5 || nh < 0.5 {
+        return None;
+    }
+    let ratio = nw / nh;
+    let (w, h) = match style.bg_size {
+        BgSize::Auto => (nw, nh),
+        BgSize::Cover => {
+            let s = (area.w / nw).max(area.h / nh);
+            (nw * s, nh * s)
+        }
+        BgSize::Contain => {
+            let s = (area.w / nw).min(area.h / nh);
+            (nw * s, nh * s)
+        }
+        BgSize::Sized(sw, sh) => {
+            let resolve = |v: f32, full: f32| if v.is_nan() { None } else if v < 0.0 { Some(-v * full) } else { Some(v) };
+            match (resolve(sw, area.w), resolve(sh, area.h)) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w / ratio),
+                (None, Some(h)) => (h * ratio, h),
+                (None, None) => (nw, nh),
+            }
+        }
+    };
+    if w < 0.5 || h < 0.5 {
+        return None;
+    }
+    let place = |p: BgPos, free: f32| match p {
+        BgPos::Frac(f) => free * f,
+        BgPos::Px(px) => px,
+    };
+    let x = area.x + place(style.bg_pos.0, area.w - w);
+    let y = area.y + place(style.bg_pos.1, area.h - h);
+    // the part of the placed image inside the area
+    let (vx0, vy0) = (x.max(area.x), y.max(area.y));
+    let (vx1, vy1) = ((x + w).min(area.x + area.w), (y + h).min(area.y + area.h));
+    if vx1 - vx0 < 0.5 || vy1 - vy0 < 0.5 {
+        return None;
+    }
+    let (px_w, px_h) = (bitmap.width as f32 / w, bitmap.height as f32 / h);
+    let crop = bitmap.crop(((vx0 - x) * px_w) as usize, ((vy0 - y) * px_h) as usize, ((vx1 - vx0) * px_w).round() as usize, ((vy1 - vy0) * px_h).round() as usize);
+    Some(Draw::Image { rect: Rect { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, image: Some(crop), alt: String::new() })
+}
+
 fn translate(draw: &mut Draw, dx: f32, dy: f32) {
     match draw {
         Draw::Rect { rect, .. }
@@ -1343,6 +1423,7 @@ impl<'a> Layout<'a> {
             canvas_node: None,
             flow_width: self.flow_width,
             blockify: None,
+            flex_main: None,
             containers: Vec::new(),
             exclusions: Vec::new(),
             page: Page::default(),
@@ -1883,6 +1964,15 @@ impl<'a> Layout<'a> {
         (sub.page, height)
     }
 
+    /// A flex row item at its resolved outer size.
+    fn item_page_sized(&self, node: &Node, ancestors: &[&Node], parent: &Style, width: f32) -> (Page, f32) {
+        let mut sub = self.sub_layout(false);
+        sub.blockify = Some(node as *const Node);
+        sub.flex_main = Some(node as *const Node);
+        let height = sub.layout_block(node, ancestors, Some(parent), 0.0, 0.0, width.max(1.0));
+        (sub.page, height)
+    }
+
     fn paste(&mut self, page: Page, dx: f32, dy: f32) {
         if page.content_right > 0.0 {
             self.page.content_right = self.page.content_right.max(page.content_right + dx);
@@ -1899,6 +1989,7 @@ impl<'a> Layout<'a> {
         for (rect, id) in page.boxes {
             self.page.boxes.push((Rect { x: rect.x + dx, y: rect.y + dy, ..rect }, id));
         }
+        self.page.anchors.extend(page.anchors.into_iter().map(|(name, top)| (name, top + dy)));
         self.page.text.extend(page.text);
     }
 
@@ -2023,7 +2114,7 @@ impl<'a> Layout<'a> {
             };
             let laid: Vec<(Page, f32)> = items[line.clone()]
                 .iter()
-                .map(|item| self.item_page(item.node, ancestors, style, item.size, false))
+                .map(|item| self.item_page_sized(item.node, ancestors, style, item.size))
                 .collect();
             let line_h = laid.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
             for (item, (mut page, h)) in items[line.clone()].iter().zip(laid) {
@@ -2754,6 +2845,32 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert!(hits[0].y < 30.0 && hits[1].y > 490.0, "reading order: {hits:?}");
         assert!(hits[0].x > 20.0 && hits[0].w > 10.0, "inside the run, not at its start: {hits:?}");
+    }
+
+    #[test]
+    fn background_images_cover_contain_and_position() {
+        let bmp = crate::images::decode(include_bytes!("../../docs/fixtures/img/gradient.png")).expect("png");
+        let (nw, nh) = bmp.natural_size();
+        let mut map = ImageMap::new();
+        map.insert("https://x.test/bg.png".to_string(), Arc::new(bmp));
+        let html = "<body style='margin:0'>\
+            <div style='width:400px;height:100px;background:#000 url(\"https://x.test/bg.png\") center / cover no-repeat'></div>\
+            <div style='width:400px;height:100px;background-image:url(https://x.test/bg.png);background-size:contain;background-position:right bottom'></div></body>";
+        let doc = parse_document(html);
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).with_images(&map).build(&doc);
+        let images: Vec<Rect> = page.draws.iter().filter_map(|d| match d {
+            Draw::Image { rect, image: Some(_), .. } => Some(*rect),
+            _ => None,
+        }).collect();
+        assert_eq!(images.len(), 2, "{images:?}");
+        let cover = images[0];
+        assert_eq!((cover.x, cover.y, cover.w, cover.h), (0.0, 0.0, 400.0, 100.0), "cover fills the box, cut to it");
+        let contain = images[1];
+        let s = (400.0 / nw).min(100.0 / nh);
+        assert!((contain.w - nw * s).abs() < 0.5 && (contain.h - nh * s).abs() < 0.5, "{contain:?}");
+        assert!((contain.x + contain.w - 400.0).abs() < 0.5 && (contain.y + contain.h - 200.0).abs() < 0.5, "right bottom: {contain:?}");
     }
 
     #[test]

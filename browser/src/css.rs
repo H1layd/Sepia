@@ -645,20 +645,38 @@ pub struct FontFace {
     pub sources: Vec<String>,
     pub bold: bool,
     pub italic: bool,
+    /// worth loading first: no unicode-range, or one that covers basic Latin or Cyrillic
+    pub common: bool,
 }
 
 impl FontFace {
     fn parse(body: &str) -> Option<FontFace> {
-        let mut face = FontFace { family: String::new(), sources: Vec::new(), bold: false, italic: false };
+        let mut face = FontFace { family: String::new(), sources: Vec::new(), bold: false, italic: false, common: true };
         for d in parse_declarations(body) {
             match d.name.as_str() {
+                "unicode-range" => {
+                    let covers = |cp: u32| {
+                        d.value.split(',').any(|r| {
+                            let r = r.trim().trim_start_matches(['U', 'u']).trim_start_matches('+');
+                            let (a, b) = match r.split_once('-') {
+                                Some((a, b)) => (a.to_string(), b.to_string()),
+                                None if r.contains('?') => (r.replace('?', "0"), r.replace('?', "F")),
+                                None => (r.to_string(), r.to_string()),
+                            };
+                            match (u32::from_str_radix(&a, 16), u32::from_str_radix(&b, 16)) {
+                                (Ok(a), Ok(b)) => (a..=b).contains(&cp),
+                                _ => false,
+                            }
+                        })
+                    };
+                    face.common = covers(0x61) || covers(0x430);
+                }
                 "font-family" => face.family = d.value.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase(),
                 "src" => {
                     for source in split_top_level(&d.value, ',') {
                         let source = source.trim();
                         let lower = source.to_ascii_lowercase();
-                        // WOFF2 needs Brotli and a table rebuild we do not have
-                        if lower.contains("woff2") || !lower.starts_with("url(") {
+                        if !lower.starts_with("url(") {
                             continue;
                         }
                         let inner = &source[4..];
@@ -706,6 +724,66 @@ impl Stylesheet {
     }
 
     /// Append another sheet after this one (later in the cascade).
+    /// `url()`s in backgrounds are relative to the sheet they are written
+    /// in: make them absolute so the page can fetch and key them as written.
+    pub fn absolutize_urls(&mut self, base: &crate::url::Url) {
+        for rule in &mut self.rules {
+            for d in &mut rule.declarations {
+                if d.name.starts_with("background") {
+                    if let Some(found) = css_url(&d.value) {
+                        if !found.starts_with("data:") {
+                            if let Some(abs) = base.resolve(&found) {
+                                d.value = d.value.replacen(&found, &abs.to_string(), 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every background image the page's elements use (each url once):
+    /// from rules whose selector matches an element now, and inline styles.
+    pub fn background_urls(&self, document: &crate::dom::Node) -> Vec<String> {
+        let rules: Vec<(&Rule, String)> = self
+            .rules
+            .iter()
+            .filter(|r| r.media.matches(self.viewport_width))
+            .filter_map(|r| r.declarations.iter().filter(|d| d.name == "background" || d.name == "background-image").find_map(|d| css_url(&d.value)).map(|u| (r, u)))
+            .collect();
+        let mut out: Vec<String> = Vec::new();
+        fn walk<'n>(node: &'n crate::dom::Node, ancestors: &mut Vec<&'n crate::dom::Node>, rules: &[(&Rule, String)], out: &mut Vec<String>) {
+            if out.len() >= 48 {
+                return;
+            }
+            if node.text.is_none() && !matches!(node.tag.as_str(), "#document" | "head" | "script" | "style") {
+                if let Some(inline) = node.attr("style").filter(|s| s.contains("url(")) {
+                    for d in parse_declarations(inline) {
+                        if d.name == "background" || d.name == "background-image" {
+                            if let Some(u) = css_url(&d.value) {
+                                if !out.contains(&u) {
+                                    out.push(u);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (rule, u) in rules {
+                    if !out.contains(u) && matches_selector(&rule.selector, node, ancestors) {
+                        out.push(u.clone());
+                    }
+                }
+            }
+            ancestors.push(node);
+            for child in &node.children {
+                walk(child, ancestors, rules, out);
+            }
+            ancestors.pop();
+        }
+        walk(document, &mut Vec::new(), &rules, &mut out);
+        out
+    }
+
     pub fn append(&mut self, other: Stylesheet) {
         let base = self.rules.len();
         for mut rule in other.rules {
@@ -851,6 +929,21 @@ impl Stylesheet {
         normal.extend(important);
         normal
     }
+}
+
+/// The first `url(...)` in a value, quotes taken off.
+pub fn css_url(value: &str) -> Option<String> {
+    let at = value.to_ascii_lowercase().find("url(")?;
+    let inner = &value[at + 4..];
+    let end = if inner.trim_start().starts_with(['"', '\'']) {
+        let q = inner.trim_start().chars().next()?;
+        let start = inner.find(q)? + 1;
+        start + inner[start..].find(q)? + 1
+    } else {
+        inner.find(')')?
+    };
+    let url = inner[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    (!url.is_empty()).then(|| url.to_string())
 }
 
 fn import_url(rest: &str) -> Option<String> {

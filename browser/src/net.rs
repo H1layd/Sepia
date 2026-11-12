@@ -198,7 +198,7 @@ pub fn request_headers(url: &Url) -> Vec<(String, String)> {
             "Accept".to_string(),
             "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8".to_string(),
         ),
-        ("Accept-Encoding".to_string(), "gzip, deflate".to_string()),
+        ("Accept-Encoding".to_string(), "gzip, deflate, br".to_string()),
         ("Accept-Language".to_string(), "en-US,en;q=0.9".to_string()),
         ("Connection".to_string(), "keep-alive".to_string()),
     ]
@@ -401,6 +401,7 @@ fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Respons
     // gzip / deflate bodies (asked for in Accept-Encoding) are inflated here
     let body = match header("content-encoding").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("gzip") | Some("x-gzip") => gunzip(&body).ok_or("bad gzip body")?,
+        Some("br") => unbrotli(&body).ok_or("bad brotli body")?,
         Some("deflate") => miniz_oxide::inflate::decompress_to_vec_zlib(&body)
             .or_else(|_| miniz_oxide::inflate::decompress_to_vec(&body))
             .map_err(|_| "bad deflate body".to_string())?,
@@ -616,6 +617,14 @@ fn connect_through(
     } else {
         Ok(Transport::Plain(tcp))
     }
+}
+
+/// A Brotli stream (RFC 7932) decoded, at most 64 MB.
+pub fn unbrotli(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    brotli_decompressor::Decompressor::new(data, 64 * 1024).take(64 * 1024 * 1024).read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 /// A gzip member (RFC 1952) inflated: header fields skipped, CRC not checked.

@@ -22,6 +22,7 @@ mod protocols;
 mod resolver;
 mod style;
 mod url;
+mod woff2;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -153,7 +154,7 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     for header in [
         "User-Agent: sepia-browser/0.1",
         "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
-        "Accept-Encoding: gzip, deflate",
+        "Accept-Encoding: gzip, deflate, br",
         "Accept-Language: en-US,en;q=0.9",
         "Connection: keep-alive (reused per site for 30 s, never across sites)",
     ] {

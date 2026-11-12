@@ -165,8 +165,10 @@ impl<'f> Glyph<'f> {
 // Families: fonts pages bring (@font-face) and local generic faces
 // ---------------------------------------------------------------------------
 
-/// Faces of one family: regular, bold, italic, bold italic.
-type Faces = [Option<&'static Font>; 4];
+/// Faces of one family: regular, bold, italic, bold italic. Each may come
+/// in several files (unicode-range subsets: latin, latin-ext, cyrillic…);
+/// the one with basic Latin goes first.
+type Faces = [Vec<&'static Font>; 4];
 
 fn slot(bold: bool, italic: bool) -> usize {
     (bold as usize) | ((italic as usize) << 1)
@@ -184,7 +186,13 @@ static LOADED: OnceLock<Mutex<HashMap<String, Option<&'static Font>>>> = OnceLoc
 impl WebFonts {
     pub fn register(&self, family: &str, bold: bool, italic: bool, font: &'static Font) {
         let mut map = self.families.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(family.to_ascii_lowercase()).or_default()[slot(bold, italic)] = Some(font);
+        let files = &mut map.entry(family.to_ascii_lowercase()).or_default()[slot(bold, italic)];
+        if files.iter().any(|f| std::ptr::eq(*f, font)) {
+            return;
+        }
+        files.push(font);
+        // the subset covering basic Latin leads; the others fill in what it lacks
+        files.sort_by_key(|f| std::cmp::Reverse("aeiouxyz".chars().filter(|c| f.has_glyph(*c)).count()));
     }
 
     pub fn has(&self, family: &str) -> bool {
@@ -195,7 +203,17 @@ impl WebFonts {
     fn face(&self, family: &str, bold: bool, italic: bool) -> Option<&'static Font> {
         let map = self.families.read().unwrap_or_else(|e| e.into_inner());
         let faces = map.get(family)?;
-        faces[slot(bold, italic)].or(faces[slot(false, italic)]).or(faces[slot(bold, false)]).or(faces[0]).or_else(|| faces.iter().flatten().next().copied())
+        Self::files(faces, bold, italic).first().copied()
+    }
+
+    fn files(faces: &Faces, bold: bool, italic: bool) -> &[&'static Font] {
+        [slot(bold, italic), slot(false, italic), slot(bold, false), 0, 1, 2, 3].into_iter().map(|i| &faces[i][..]).find(|v| !v.is_empty()).unwrap_or(&[])
+    }
+
+    /// Another file of the same family and face that has `ch`.
+    fn subset_with(&self, family: &str, bold: bool, italic: bool, ch: char) -> Option<&'static Font> {
+        let map = self.families.read().unwrap_or_else(|e| e.into_inner());
+        Self::files(map.get(family)?, bold, italic).iter().find(|f| f.has_glyph(ch)).copied()
     }
 }
 
@@ -205,7 +223,13 @@ pub fn load_web_font(key: &str, bytes: &[u8]) -> Option<&'static Font> {
     if let Some(done) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
         return *done;
     }
-    let sfnt = if bytes.starts_with(b"wOFF") { woff_to_sfnt(bytes) } else { Some(bytes.to_vec()) };
+    let sfnt = if bytes.starts_with(b"wOFF") {
+        woff_to_sfnt(bytes)
+    } else if bytes.starts_with(b"wOF2") {
+        crate::woff2::to_sfnt(bytes)
+    } else {
+        Some(bytes.to_vec())
+    };
     let font = sfnt
         .filter(|b| b.starts_with(&[0, 1, 0, 0]) || b.starts_with(b"OTTO") || b.starts_with(b"true") || b.starts_with(b"ttcf"))
         .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok())
@@ -319,6 +343,18 @@ impl Fonts {
         self.pick(bold, italic)
     }
 
+    /// A page font file of the chosen family (another unicode-range subset) that has `ch`.
+    fn web_subset(&self, family: Option<&str>, bold: bool, italic: bool, ch: char) -> Option<&'static Font> {
+        let list = family?;
+        for name in list.split(',') {
+            let name = name.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
+            if self.web.face(&name, bold, italic).is_some() {
+                return self.web.subset_with(&name, bold, italic, ch);
+            }
+        }
+        None
+    }
+
     /// Advance of `text` in the face `family` selects.
     pub fn advance_in(&self, text: &str, size: f32, bold: bool, italic: bool, family: Option<&str>) -> f32 {
         let mut width = 0.0;
@@ -372,6 +408,8 @@ impl Fonts {
             after_emoji = false;
             if ch.is_control() || primary.has_glyph(ch) {
                 f(Glyph::Outline(primary, ch));
+            } else if let Some(font) = self.web_subset(family, bold, italic, ch) {
+                f(Glyph::Outline(font, ch));
             } else if let Some(font) = self.fallback.find(ch) {
                 f(Glyph::Outline(font, ch));
             } else if let Some((face, gid)) = self.emoji.get().and_then(|e| e.glyph(ch).map(|g| (e, g))) {

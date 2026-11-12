@@ -31,6 +31,24 @@ pub enum Inner {
     Grid,
 }
 
+/// background-size
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BgSize {
+    Auto,
+    Cover,
+    Contain,
+    /// width, height: px, or a fraction of the box when negative (-0.5 = 50%); NaN = auto
+    Sized(f32, f32),
+}
+
+/// One axis of background-position: a fraction of the free space (0 = start,
+/// 1 = end) or px from the start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BgPos {
+    Frac(f32),
+    Px(f32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
     Static,
@@ -212,6 +230,8 @@ pub struct Style {
     pub margin_auto: (bool, bool),
     pub pre: bool,
     pub marker: Option<&'static str>,
+    /// list-style-type as inherited (set on a <ul>, it reaches its <li>s)
+    pub list_marker: Option<&'static str>,
     /// None = not specified (a cell then takes its row's, else middle).
     pub valign: Option<VAlign>,
     pub border_collapse: bool,
@@ -247,6 +267,10 @@ pub struct Style {
     pub clear: bool,
     /// mask-image: the background is only a colour for an icon shape we cannot cut out
     pub masked: bool,
+    /// background-image url (absolute when it came from a stylesheet)
+    pub bg_image: Option<Arc<str>>,
+    pub bg_size: BgSize,
+    pub bg_pos: (BgPos, BgPos),
     /// a transform that moves the box a whole box-length or more off its place
     pub moved_away: bool,
     /// grid-template-columns, resolved at layout (it needs the width)
@@ -284,6 +308,7 @@ impl Default for Style {
             margin_auto: (false, false),
             pre: false,
             marker: None,
+            list_marker: None,
             valign: None,
             border_collapse: false,
             flex: Flex::default(),
@@ -309,6 +334,9 @@ impl Default for Style {
             clip_y: false,
             clear: false,
             masked: false,
+            bg_image: None,
+            bg_size: BgSize::Auto,
+            bg_pos: (BgPos::Frac(0.0), BgPos::Frac(0.0)),
             moved_away: false,
             grid_columns: None,
             grid_span: GridSpan::Auto,
@@ -443,11 +471,69 @@ pub fn default_style(tag: &str) -> Style {
 /// Lengths: px, em, rem, % (of the containing width), and bare numbers as px.
 /// Viewport size in CSS px, for vw / vh (set by the layout).
 static VIEWPORT_W: AtomicU32 = AtomicU32::new(0x4480_0000); // 1024.0
+thread_local! {
+    /// font-size of <html>: what rem is measured in (set as <html> is styled)
+    static ROOT_FONT: std::cell::Cell<f32> = const { std::cell::Cell::new(16.0) };
+}
+
+pub fn root_font_size() -> f32 {
+    ROOT_FONT.with(|r| r.get())
+}
+
 static VIEWPORT_H: AtomicU32 = AtomicU32::new(0x4448_0000); // 800.0
 
 pub fn set_viewport(width: f32, height: f32) {
     VIEWPORT_W.store(width.to_bits(), Ordering::Relaxed);
     VIEWPORT_H.store(height.to_bits(), Ordering::Relaxed);
+}
+
+fn parse_bg_size(value: &str, font_size: f32) -> BgSize {
+    let v = value.trim().to_ascii_lowercase();
+    let words: Vec<&str> = v.split_whitespace().filter(|w| !w.contains("repeat") && !matches!(*w, "fixed" | "scroll" | "local")).collect();
+    match words.first().copied() {
+        Some("cover") => BgSize::Cover,
+        Some("contain") => BgSize::Contain,
+        None | Some("auto") if words.len() <= 1 => BgSize::Auto,
+        _ => {
+            let one = |w: Option<&&str>| -> f32 {
+                match w {
+                    Some(w) if w.ends_with('%') => -(w.trim_end_matches('%').parse::<f32>().unwrap_or(100.0) / 100.0),
+                    Some(w) if *w != "auto" => parse_length(w, font_size, 0.0).unwrap_or(f32::NAN),
+                    _ => f32::NAN,
+                }
+            };
+            BgSize::Sized(one(words.first()), one(words.get(1)))
+        }
+    }
+}
+
+fn parse_bg_pos(value: &str, font_size: f32) -> Option<(BgPos, BgPos)> {
+    let v = value.trim().to_ascii_lowercase();
+    let mut x: Option<BgPos> = None;
+    let mut y: Option<BgPos> = None;
+    let mut loose: Vec<BgPos> = Vec::new();
+    for w in v.split_whitespace() {
+        match w {
+            "left" => x = Some(BgPos::Frac(0.0)),
+            "right" => x = Some(BgPos::Frac(1.0)),
+            "top" => y = Some(BgPos::Frac(0.0)),
+            "bottom" => y = Some(BgPos::Frac(1.0)),
+            "center" => loose.push(BgPos::Frac(0.5)),
+            w if w.ends_with('%') => loose.push(BgPos::Frac(w.trim_end_matches('%').parse::<f32>().ok()? / 100.0)),
+            w => {
+                if let Some(px) = parse_length(w, font_size, 0.0) {
+                    loose.push(BgPos::Px(px));
+                }
+            }
+        }
+    }
+    let mut loose = loose.into_iter();
+    let x = x.or_else(|| loose.next());
+    let y = y.or_else(|| loose.next());
+    if x.is_none() && y.is_none() {
+        return None;
+    }
+    Some((x.unwrap_or(BgPos::Frac(0.5)), y.unwrap_or(BgPos::Frac(0.5))))
 }
 
 /// Height of the first screen (what `position: fixed; bottom` is measured from).
@@ -500,13 +586,14 @@ pub fn parse_length(value: &str, font_size: f32, percent_base: f32) -> Option<f3
     if let Some(px) = value.strip_suffix("px") {
         return px.trim().parse().ok();
     }
+    // rem before em: "1rem" also ends in "em"
+    if let Some(rem) = value.strip_suffix("rem") {
+        let factor: f32 = rem.trim().parse().ok()?;
+        return Some(factor * root_font_size());
+    }
     if let Some(em) = value.strip_suffix("em") {
         let factor: f32 = em.trim().parse().ok()?;
         return Some(factor * font_size);
-    }
-    if let Some(rem) = value.strip_suffix("rem") {
-        let factor: f32 = rem.trim().parse().ok()?;
-        return Some(factor * 16.0);
     }
     if let Some(pct) = value.strip_suffix('%') {
         let factor: f32 = pct.trim().parse().ok()?;
@@ -711,6 +798,12 @@ pub fn compute(
             style.family = inherit.family.clone();
         }
         style.pre = style.pre || inherit.pre;
+        style.list_marker = parent_style.list_marker;
+        if style.display == Display::ListItem {
+            if let Some(m) = parent_style.list_marker {
+                style.marker = Some(m);
+            }
+        }
     }
 
     presentational_hints(node, &mut style, containing_width);
@@ -755,6 +848,9 @@ pub fn compute(
             }
             apply(&mut style, &declaration.name, &value, containing_width);
         }
+    }
+    if node.tag == "html" {
+        ROOT_FONT.with(|r| r.set(style.font_size.clamp(4.0, 200.0)));
     }
     if style.masked {
         // a solid square where an icon should be reads as a glitch; draw nothing
@@ -872,6 +968,12 @@ fn inherit_property(style: &mut Style, parent: &Style, name: &str) {
         "line-height" => style.line_height = parent.line_height,
         "color" => style.color = parent.color,
         "text-align" => style.align = parent.align,
+        // `*, *::before { box-sizing: inherit }` under `html { border-box }`
+        "box-sizing" => style.border_box = parent.border_box,
+        "list-style" | "list-style-type" => {
+            style.list_marker = parent.list_marker;
+            style.marker = parent.list_marker;
+        }
         "background" | "background-color" => {
             style.background = parent.background;
             style.gradient = parent.gradient.clone();
@@ -1099,14 +1201,35 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.background = Some(color);
             }
         }
+        "background-size" => style.bg_size = parse_bg_size(value, font_size),
+        "background-position" => {
+            if let Some(pos) = parse_bg_pos(value, font_size) {
+                style.bg_pos = pos;
+            }
+        }
         "background" | "background-image" => {
-            // a gradient layer, and/or a colour; url() images are not drawn
+            // a gradient layer, an image and/or a colour
             if value == "none" || value == "transparent" {
                 if name == "background" {
                     style.background = None;
                 }
                 style.gradient = None;
+                style.bg_image = None;
                 return;
+            }
+            style.bg_image = crate::css::css_url(value).map(|u| Arc::from(u.as_str()));
+            if name == "background" && style.bg_image.is_some() {
+                // `url() center / cover no-repeat`: position and size ride along
+                let rest = match value.rfind(')') {
+                    Some(at) => &value[at + 1..],
+                    None => value,
+                };
+                let (pos, size) = match rest.split_once('/') {
+                    Some((p, s)) => (p, Some(s)),
+                    None => (rest, None),
+                };
+                style.bg_pos = parse_bg_pos(pos, font_size).unwrap_or((BgPos::Frac(0.0), BgPos::Frac(0.0)));
+                style.bg_size = size.map(|s| parse_bg_size(s, font_size)).unwrap_or(BgSize::Auto);
             }
             if let Some(gradient) = parse_gradient(value) {
                 style.gradient = Some(gradient);
@@ -1522,11 +1645,13 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 "circle" => "◦",
                 "square" => "▪",
                 _ => "•",
-            })
+            });
+            style.list_marker = style.marker;
         }
         "list-style" => {
-            if value.contains("none") {
+            if value.split_whitespace().any(|w| w == "none") {
                 style.marker = Some("");
+                style.list_marker = style.marker;
             }
         }
         _ => {}
@@ -1537,6 +1662,15 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn rem_is_not_read_as_em_and_follows_the_root() {
+        assert_eq!(parse_length("1rem", 30.0, 0.0), Some(16.0));
+        assert_eq!(parse_length("2em", 30.0, 0.0), Some(60.0));
+        ROOT_FONT.with(|r| r.set(10.0));
+        assert_eq!(parse_length("1.5rem", 30.0, 0.0), Some(15.0));
+        ROOT_FONT.with(|r| r.set(16.0));
+    }
 
     #[test]
     fn defaults_for_common_tags() {

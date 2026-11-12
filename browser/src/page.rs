@@ -208,6 +208,43 @@ fn fetch_images(document: &dom::Node, base: &Url, how: &ImageFetch) -> (ImageMap
     (images, sources.len(), loaded)
 }
 
+/// Fetch and decode images named by URL strings (resolved against `base`;
+/// `data:` decoded in place), keyed by the string as given.
+fn fetch_list(wanted: &[String], base: &Url, how: &ImageFetch) -> ImageMap {
+    let mut images = ImageMap::new();
+    let mut remote: Vec<(&str, Url)> = Vec::new();
+    for src in wanted {
+        if src.starts_with("data:") {
+            if let Some(bitmap) = images::decode_data_uri(src) {
+                images.insert(src.clone(), Arc::new(bitmap));
+            }
+        } else if let Some(u) = base.resolve(src).filter(|u| matches!(u.scheme.as_str(), "http" | "https")) {
+            remote.push((src, u));
+        }
+    }
+    let started = Instant::now();
+    for batch in remote.chunks(IMAGE_PARALLEL) {
+        let left = IMAGE_BUDGET.saturating_sub(started.elapsed());
+        if left < Duration::from_millis(500) {
+            break;
+        }
+        let per_image = how.timeout.min(IMAGE_TIMEOUT).min(left);
+        let got: Vec<(&str, Option<images::Bitmap>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(src, u)| scope.spawn(move || (*src, how.get(u, per_image).ok().filter(|r| r.status < 400).and_then(|r| images::decode(&r.body)))))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for (src, bitmap) in got {
+            if let Some(bitmap) = bitmap {
+                images.insert(src.to_string(), Arc::new(bitmap));
+            }
+        }
+    }
+    images
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish(
     url: &Url,
@@ -266,6 +303,27 @@ fn finish(
         None => (load_styles(&document, url, None).0, ImageMap::new(), Vec::new()),
     };
     sheet.viewport_width = width;
+    // background images: known only now that the styles are in
+    let mut images = images;
+    let mut late = late;
+    if let Some(how) = &fetch {
+        let wanted: Vec<String> = sheet.background_urls(&document).into_iter().filter(|u| !images.contains_key(u)).collect();
+        if !wanted.is_empty() {
+            note = format!("{note} · backgrounds {}", wanted.len());
+            match late.take() {
+                // the page shows first; backgrounds follow with the images
+                Some(first) => {
+                    let (base, chain, resolver, timeout, site) = (url.clone(), how.chain.clone(), how.resolver.cloned(), how.timeout, how.site.clone());
+                    late = Some(std::thread::spawn(move || {
+                        let mut map = first.join().unwrap_or_default();
+                        map.extend(fetch_list(&wanted, &base, &ImageFetch { chain: &chain, resolver: resolver.as_ref(), timeout, site }));
+                        map
+                    }));
+                }
+                None => images.extend(fetch_list(&wanted, url, how)),
+            }
+        }
+    }
     if let Some(how) = &fetch {
         let loaded = load_fonts(&sheet, fonts, how);
         if loaded > 0 {
@@ -301,7 +359,10 @@ const FONT_BUDGET: Duration = Duration::from_secs(6);
 /// first usable source of each) through the page's path and register them
 /// by family. Returns how many faces were registered.
 fn load_fonts(sheet: &Stylesheet, fonts: &Fonts, how: &ImageFetch) -> usize {
-    let faces: Vec<&crate::css::FontFace> = sheet.font_faces.iter().take(MAX_FONTS).collect();
+    // Latin/Cyrillic subsets first: a page may list greek, vietnamese… too
+    let mut faces: Vec<&crate::css::FontFace> = sheet.font_faces.iter().collect();
+    faces.sort_by_key(|f| !f.common);
+    faces.truncate(MAX_FONTS);
     if faces.is_empty() {
         return 0;
     }
@@ -521,12 +582,14 @@ fn load_styles(document: &dom::Node, base: &Url, how: Option<&ImageFetch>) -> (S
                     external += 1;
                     let mut imported = Stylesheet::parse(&css);
                     imported.imports.clear();
+                    imported.absolutize_urls(&url);
                     sheet.append(imported);
                 }
             }
         }
         let mut parsed = parsed;
         parsed.imports.clear();
+        parsed.absolutize_urls(&sheet_url);
         for face in &mut parsed.font_faces {
             face.sources = face.sources.iter().filter_map(|s| sheet_url.resolve(s).map(|u| u.to_string())).collect();
         }

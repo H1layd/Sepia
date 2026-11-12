@@ -117,6 +117,7 @@ mod text {
     pub const LOADING: &str = "Загрузка";
     pub const BAD_ADDRESS: &str = "Это не похоже на адрес";
     pub const NOT_FOUND: &str = "На странице не найдено";
+    pub const FIND_PLACEHOLDER: &str = "Найти на странице";
     pub const NO_BACK: &str = "Назад некуда";
     pub const NO_FORWARD: &str = "Вперёд некуда";
     pub const BURNED: &str = "Вкладки и история стёрты из памяти";
@@ -557,12 +558,14 @@ impl Ui {
 
     fn geom(&self) -> Geom {
         let (w, h) = (self.w, self.h);
-        // the page runs to the top; the capsule floats over it
+        // The page starts under the title bar, so the traffic lights never
+        // cover it; the strip above is painted in the page's own top colour
+        // (see `draw`), so it reads as part of the site, not as a bar.
         let viewport = Rect {
             x: theme::INSET,
-            y: theme::INSET,
+            y: theme::TITLEBAR,
             w: w - theme::INSET * 2.0,
-            h: h - theme::INSET * 2.0,
+            h: h - theme::TITLEBAR - theme::INSET,
         };
         let open_w = theme::CAPSULE_OPEN_MAX.min(w - 32.0);
         let t = smooth(self.addr_open);
@@ -1004,7 +1007,9 @@ impl Ui {
         };
         let mut shown = base.clone();
         for (i, hit) in hits.iter().enumerate() {
-            let color = if i == current { Color { r: 255, g: 150, b: 0, a: 150 } } else { Color { r: 255, g: 220, b: 0, a: 110 } };
+            // colourless like the rest of the chrome: a mid-grey veil that
+            // reads on light and dark pages alike, the current one denser
+            let color = if i == current { Color { r: 112, g: 112, b: 120, a: 150 } } else { Color { r: 150, g: 150, b: 158, a: 80 } };
             shown.draws.push(Draw::Fill { rect: *hit, radius: 2.0, color: Some(color), gradient: None });
         }
         let tab = &mut self.tabs[active];
@@ -1259,6 +1264,26 @@ impl Ui {
         }
         moving || self.gesture_active
     }
+}
+
+/// The colour along the top edge of the visible page: the average of a few
+/// pixels near both side margins of its first row, where a site's
+/// background shows rather than its text.
+fn top_colour(view: &Canvas, row: usize) -> Color {
+    if view.width < 8 || view.height == 0 {
+        return theme::PAGE;
+    }
+    let y = row.min(view.height - 1);
+    let mut sum = [0u32; 3];
+    let xs = [1, 3, view.width - 2, view.width - 4];
+    for x in xs {
+        let i = (y * view.width + x) * 4;
+        for c in 0..3 {
+            sum[c] += view.pixels[i + c] as u32;
+        }
+    }
+    let n = xs.len() as u32;
+    rgb((sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8)
 }
 
 /// Centre of the × on a hovered card whose face has its top edge at `top`.
@@ -1798,6 +1823,11 @@ impl<'a> Painter<'a> {
                 self.polyline(&map(&[(12.0, 6.5), (12.0, 13.5)]), w * 1.3, color);
                 self.polyline(&map(&[(12.0, 17.5)]), w * 1.6, color);
             }
+            Icon::Search => {
+                let (lx, ly) = (cx + (10.5 - 12.0) * k, cy + (10.5 - 12.0) * k);
+                self.arc(lx, ly, 6.0 * k, 0.0, std::f32::consts::TAU, w, color);
+                self.polyline(&map(&[(15.0, 15.0), (19.5, 19.5)]), w * 1.1, color);
+            }
             Icon::Close => {
                 self.polyline(&map(&[(7.0, 7.0), (17.0, 17.0)]), w * 1.2, color);
                 self.polyline(&map(&[(17.0, 7.0), (7.0, 17.0)]), w * 1.2, color);
@@ -1900,6 +1930,7 @@ enum Icon {
     Alert,
     Reload,
     Close,
+    Search,
 }
 
 /// What a tab card shows on its face.
@@ -2056,6 +2087,12 @@ impl Ui {
         let g = self.geom();
         let mut p = Painter { c: canvas, s: scale };
         p.fill(theme::WINDOW);
+        let band = Rect { x: 0.0, y: 0.0, w: self.w, h: g.viewport.y };
+        let band_color = match (page_view, &self.tab().failure) {
+            (Some((view, row)), None) => top_colour(view, row),
+            _ => theme::PANEL,
+        };
+        p.round_rect(band, 0.0, band_color);
         self.draw_viewport(&mut p, fonts, &g, page_view);
         self.draw_link(&mut p, fonts, &g);
         self.draw_dock(&mut p, fonts, &g);
@@ -2357,8 +2394,19 @@ impl Ui {
         let ink = p.glass(c, c.h / 2.0, 16.0, 0.07, 1.0);
 
         let transport = Transport::of_tab(self.transport, tab);
-        // monogram, always visible, at the left end
         let (mx, my) = (c.x + c.h / 2.0, c.y + c.h / 2.0);
+        let finding = self.finding && self.editing;
+        if finding {
+            // find in page: a magnifier in place of the site circle
+            p.circle(mx, my, 11.0, ink.wash(0.12));
+            p.icon(Icon::Search, mx, my, 15.0, ink.text());
+            let t = ((self.addr_open - 0.35) / 0.65).clamp(0.0, 1.0);
+            if t > 0.0 {
+                self.draw_find_field(p, fonts, c, my, ink, t);
+            }
+            return;
+        }
+        // monogram, always visible, at the left end
         p.circle(mx, my, 11.0, ink.wash(0.12));
         p.text_centered(fonts, &tab.monogram().to_string(), mx, my + 4.0, 11.0, ink.text(), true);
         p.circle(mx + 8.5, my + 8.5, 4.0, ink.inverse());
@@ -2412,6 +2460,37 @@ impl Ui {
                 }
                 None => p.text(fonts, "Адрес сайта", text_x, my + 5.0, 14.0, alpha(ink.dim(), t), false),
             }
+        }
+    }
+
+    /// The open capsule while finding: the query, a caret, and the
+    /// "2 / 7" counter at the right end.
+    fn draw_find_field(&self, p: &mut Painter, fonts: &Fonts, c: Rect, my: f32, ink: Ink, t: f32) {
+        let text_x = c.x + 40.0;
+        let mut right = c.x + c.w - 16.0;
+        if let Some((current, total)) = self.find_status().filter(|_| !self.input.trim().is_empty()) {
+            let label = format!("{current} / {total}");
+            let w = fonts.advance(&label, 12.0, true, false);
+            let pill = Rect { x: right - w - 12.0, y: my - 10.0, w: w + 16.0, h: 20.0 };
+            let tone = if total == 0 { ink.dim() } else { ink.text() };
+            p.round_rect(pill, 10.0, ink.wash(0.10 * t));
+            p.text(fonts, &label, pill.x + 8.0, my + 4.0, 12.0, alpha(tone, t), true);
+            right = pill.x - 8.0;
+        }
+        let room = right - text_x;
+        if room < 24.0 {
+            return;
+        }
+        let shown = fit_tail(fonts, &self.input, 14.0, room - 4.0);
+        if self.replace_input && !shown.is_empty() {
+            let sw = fonts.advance(&shown, 14.0, false, false);
+            p.round_rect(Rect { x: text_x - 3.0, y: my - 10.0, w: sw + 6.0, h: 20.0 }, 5.0, ink.wash(0.16 * t));
+        }
+        p.text(fonts, &shown, text_x, my + 5.0, 14.0, alpha(ink.text(), t), false);
+        let caret_x = text_x + fonts.advance(&shown, 14.0, false, false) + 1.0;
+        p.round_rect(Rect { x: caret_x, y: my - 8.0, w: 1.5, h: 16.0 }, 0.75, alpha(ink.text(), t));
+        if self.input.is_empty() {
+            p.text(fonts, text::FIND_PLACEHOLDER, text_x + 6.0, my + 5.0, 14.0, alpha(ink.dim(), t), false);
         }
     }
 
@@ -3187,6 +3266,8 @@ mod tests {
         assert_eq!(ui.active_page().unwrap().3.draws.len(), draws_before + 3);
         ui.find_step(&fonts, 1);
         assert_eq!(ui.find_status(), Some((2, 3)));
+        settle(&mut ui);
+        dump(&frame(&ui, 2.0), "find");
         assert!(ui.active_scroll() > 2000.0, "the second match is brought into view");
         ui.find_step(&fonts, -1);
         ui.find_step(&fonts, -1);
