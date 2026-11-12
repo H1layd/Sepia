@@ -277,6 +277,7 @@ struct State {
     focus: Option<usize>,
     navigate: Option<String>,
     form: Option<String>,
+    jump: Option<String>,
     log: Vec<String>,
     dirty: bool,
     net: Option<Net>,
@@ -480,6 +481,9 @@ fn register(ctx: &mut Context) {
                     }
                 }
             }
+            if !hash.is_empty() && hash != st.hash {
+                st.jump = Some(hash.clone());
+            }
             st.hash = hash;
         });
         Ok(JsValue::undefined())
@@ -578,6 +582,8 @@ pub struct Outcome {
     pub form: Option<String>,
     /// A text field that took focus.
     pub focus: Option<(usize, String)>,
+    /// `location.hash` changed: scroll to that anchor
+    pub jump: Option<String>,
 }
 
 /// One live page: DOM, scripts, styles, images.
@@ -674,6 +680,7 @@ impl Session {
             st.dirty = false;
             st.navigate = None;
             st.form = None;
+            st.jump = None;
             st.focus = None;
         });
         let call = match &event {
@@ -689,14 +696,14 @@ impl Session {
             with(|st| st.log.push(format!("event: {e}")));
         }
         self.settle();
-        let (dirty, navigate, form, focus, title) = with(|st| {
+        let (dirty, navigate, form, jump, focus, title) = with(|st| {
             let focus = st.focus.and_then(|f| {
                 let tag = st.dom.nodes[f].tag.clone();
                 matches!(tag.as_str(), "input" | "textarea").then(|| (f, st.dom.attr(f, "value").unwrap_or("").to_string()))
             });
-            (st.dirty, st.navigate.take(), st.form.take(), focus, st.title.clone())
+            (st.dirty, st.navigate.take(), st.form.take(), st.jump.take(), focus, st.title.clone())
         });
-        Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, form, focus }
+        Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, form, jump, focus }
     }
 }
 

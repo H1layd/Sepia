@@ -35,7 +35,7 @@ use winit::window::{Window, WindowBuilder};
 
 use crate::css::Color;
 use crate::js::{Outcome, PageEvent};
-use crate::layout::{Fonts, Page, Rect};
+use crate::layout::{Draw, Fonts, Page, Rect};
 use crate::net::{Chain, HopKind};
 use crate::page::{self, Loaded};
 use crate::paint::Canvas;
@@ -116,6 +116,7 @@ mod text {
     pub const ERROR_RETRY: &str = "Потяните страницу вниз или нажмите ⌘R, чтобы повторить";
     pub const LOADING: &str = "Загрузка";
     pub const BAD_ADDRESS: &str = "Это не похоже на адрес";
+    pub const NOT_FOUND: &str = "На странице не найдено";
     pub const NO_BACK: &str = "Назад некуда";
     pub const NO_FORWARD: &str = "Вперёд некуда";
     pub const BURNED: &str = "Вкладки и история стёрты из памяти";
@@ -258,6 +259,33 @@ struct Pending {
     nav: u64,
     url: Url,
     push: bool,
+    /// the `#fragment` to scroll to once it is shown
+    anchor: Option<String>,
+}
+
+/// `#fragment` out of a URL (our `Url` keeps it inside path or query).
+fn split_fragment(url: Url) -> (Url, Option<String>) {
+    let mut url = url;
+    let mut fragment = None;
+    for part in [&mut url.query, &mut url.path] {
+        if let Some(at) = part.find('#') {
+            fragment = Some(part[at + 1..].to_string());
+            part.truncate(at);
+            break;
+        }
+    }
+    (url, fragment)
+}
+
+/// Find in page: matches on the active tab, drawn as highlights over a copy
+/// of its page; `base` is the page without them.
+struct FindState {
+    tab_id: u64,
+    /// the tab generation showing the highlights (anything newer drops them)
+    generation: u64,
+    base: Page,
+    hits: Vec<Rect>,
+    current: usize,
 }
 
 struct Failure {
@@ -426,6 +454,9 @@ pub struct Ui {
     h: f32,
     hover: Hit,
     pub editing: bool,
+    /// the address field holds a find-in-page query, not an address
+    pub finding: bool,
+    find: Option<FindState>,
     input: String,
     replace_input: bool,
     addr_open: f32,
@@ -479,6 +510,8 @@ impl Ui {
             h: 900.0,
             hover: Hit::Nothing,
             editing: false,
+            finding: false,
+            find: None,
             input: String::new(),
             replace_input: false,
             addr_open: 0.0,
@@ -724,8 +757,9 @@ impl Ui {
     fn start_load(&mut self, index: usize, url: Url, push: bool) -> Load {
         let nav = self.next_nav;
         self.next_nav += 1;
+        let (url, anchor) = split_fragment(url);
         let tab = &mut self.tabs[index];
-        tab.loading = Some(Pending { nav, url: url.clone(), push });
+        tab.loading = Some(Pending { nav, url: url.clone(), push, anchor });
         Load { tab_id: tab.id, nav, url, form: None }
     }
 
@@ -812,6 +846,9 @@ impl Ui {
         tab.scroll = 0.0;
         match result {
             Ok((loaded, thumb)) => {
+                if let Some(y) = pending.anchor.as_deref().and_then(|a| loaded.page.anchor(a)) {
+                    tab.scroll = y.min(loaded.page.height).max(0.0);
+                }
                 tab.loaded = Some(loaded);
                 tab.thumb = Some(thumb);
                 tab.failure = None;
@@ -907,9 +944,114 @@ impl Ui {
         }
     }
 
+    // ----- anchors and find in page ---------------------------------------
+
+    /// A link to `#somewhere` in the page already shown: scroll, no load.
+    /// True when it was handled that way.
+    pub fn jump(&mut self, url: &Url) -> bool {
+        let (bare, fragment) = split_fragment(url.clone());
+        let Some(fragment) = fragment else { return false };
+        let same = self.active_loaded().is_some_and(|l| split_fragment(l.url.clone()).0 == bare);
+        same && self.jump_to(&fragment)
+    }
+
+    /// Scroll the active page to an anchor; false when there is none by that name.
+    pub fn jump_to(&mut self, fragment: &str) -> bool {
+        let Some(y) = self.active_loaded().and_then(|l| l.page.anchor(fragment)) else { return false };
+        self.scroll_to(y);
+        true
+    }
+
+    /// ⌘F: the address field becomes a search over the page.
+    pub fn begin_find(&mut self) {
+        if self.active_loaded().is_none() {
+            return;
+        }
+        self.editing = true;
+        self.finding = true;
+        self.replace_input = !self.input.is_empty() && self.find.is_some();
+        if self.find.is_none() {
+            self.input.clear();
+        }
+    }
+
+    /// Search again for what is typed and move `step` matches on (0 = stay
+    /// on the nearest from the top of the screen, 1 = next, -1 = previous).
+    pub fn find_step(&mut self, fonts: &Fonts, step: isize) {
+        let query = self.input.trim().to_string();
+        let active = self.active;
+        let tab_id = self.tabs[active].id;
+        let generation = self.tabs[active].generation;
+        let previous = self.find.as_ref().and_then(|f| f.hits.get(f.current).copied());
+        // the page without old highlights
+        let state = self.find.take().filter(|f| f.tab_id == tab_id && f.generation == generation);
+        let base = match state {
+            Some(f) => f.base,
+            None => match self.tabs[active].loaded.as_ref() {
+                Some(l) => l.page.clone(),
+                None => return,
+            },
+        };
+        let hits = base.find(fonts, &query);
+        let scroll = self.tabs[active].scroll;
+        let current = if hits.is_empty() {
+            0
+        } else if step == 0 || previous.is_none() {
+            hits.iter().position(|r| r.y >= scroll).unwrap_or(0)
+        } else {
+            let at = previous.and_then(|p| hits.iter().position(|r| r.y == p.y && r.x == p.x)).unwrap_or(0);
+            (at as isize + step).rem_euclid(hits.len() as isize) as usize
+        };
+        let mut shown = base.clone();
+        for (i, hit) in hits.iter().enumerate() {
+            let color = if i == current { Color { r: 255, g: 150, b: 0, a: 150 } } else { Color { r: 255, g: 220, b: 0, a: 110 } };
+            shown.draws.push(Draw::Fill { rect: *hit, radius: 2.0, color: Some(color), gradient: None });
+        }
+        let tab = &mut self.tabs[active];
+        if let Some(loaded) = tab.loaded.as_mut() {
+            loaded.page = shown;
+        }
+        tab.generation += 1;
+        let target = hits.get(current).map(|r| r.y);
+        self.find = Some(FindState { tab_id, generation: tab.generation, base, hits, current });
+        if let Some(y) = target {
+            // bring the match into view, a third of the way down
+            let v = self.viewport();
+            let scroll = self.tabs[active].scroll;
+            if y < scroll + 60.0 || y > scroll + v.h - 120.0 {
+                self.scroll_to(y - v.h / 3.0);
+            }
+        } else if !query.is_empty() {
+            self.toast(text::NOT_FOUND);
+        }
+    }
+
+    /// Leave find: the field closes, highlights go away.
+    pub fn end_find(&mut self) {
+        self.finding = false;
+        self.editing = false;
+        if let Some(f) = self.find.take() {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == f.tab_id && t.generation == f.generation) {
+                if let Some(loaded) = tab.loaded.as_mut() {
+                    loaded.page = f.base;
+                    tab.generation += 1;
+                }
+            }
+        }
+    }
+
+    /// (current match, 1-based; total) while finding.
+    pub fn find_status(&self) -> Option<(usize, usize)> {
+        let f = self.find.as_ref()?;
+        Some((if f.hits.is_empty() { 0 } else { f.current + 1 }, f.hits.len()))
+    }
+
     // ----- address field ----------------------------------------------------
 
     pub fn begin_editing(&mut self, prefill: bool) {
+        if self.finding {
+            self.end_find();
+        }
         self.editing = true;
         self.input = if prefill { self.tab().url().map(|u| u.to_string()).unwrap_or_default() } else { String::new() };
         self.replace_input = prefill && !self.input.is_empty();
@@ -1029,6 +1171,10 @@ impl Ui {
         if let Some(page) = page {
             loaded.page = page;
             tab.generation += 1;
+            if self.find.as_ref().is_some_and(|f| f.tab_id == tab_id) {
+                // the page changed under the highlights
+                self.find = None;
+            }
             let max = (loaded.page.height + theme::DOCK_HEIGHT + theme::DOCK_MARGIN * 2.0).max(0.0);
             tab.scroll = tab.scroll.min(max);
         }
@@ -1420,7 +1566,7 @@ impl<'a> Painter<'a> {
     /// `f` (a wide blur loses nothing to it) and is read back bilinearly, so a
     /// dock-sized panel costs well under a millisecond. Three box-blur passes
     /// ≈ a Gaussian.
-    fn frosted(&mut self, r: Rect, radius: f32, tint: Color, blur: f32) {
+    fn frosted(&mut self, r: Rect, radius: f32, tint: Color, blur: f32, opacity: f32) {
         let s = self.s;
         let reach = (blur * s).ceil() as i32;
         let (cw, ch) = (self.c.width as i32, self.c.height as i32);
@@ -1469,7 +1615,7 @@ impl<'a> Painter<'a> {
             let ty = (fy - ya as f32).clamp(0.0, 1.0);
             let (ia, ib) = shape.inner_span(y, 0.0).unwrap_or((sx1, sx1));
             for x in sx0.max(x0)..sx1.min(x1) {
-                let cov = if x >= ia && x < ib { 1.0 } else { (0.5 - shape.sd(x, y)).clamp(0.0, 1.0) };
+                let cov = opacity * if x >= ia && x < ib { 1.0 } else { (0.5 - shape.sd(x, y)).clamp(0.0, 1.0) };
                 if cov <= 0.0 {
                     continue;
                 }
@@ -1553,11 +1699,9 @@ impl<'a> Painter<'a> {
     fn glass(&mut self, r: Rect, radius: f32, blur: f32, shadow: f32, opacity: f32) -> Ink {
         let ink = self.ink_over(r);
         let tint = mix(theme::GLASS, theme::GLASS_LIGHT, ink.t);
-        if opacity > 0.6 {
-            self.frosted(r, radius, tint, blur);
-        } else {
-            // fading in or out: a plain wash is enough and costs nothing
-            self.round_rect(r, radius, alpha(mix(rgb(40, 40, 44), rgb(250, 250, 252), ink.t), opacity * 0.8));
+        // fading glass stays glass: the panel's coverage simply follows `opacity`
+        if opacity > 0.01 {
+            self.frosted(r, radius, tint, blur, opacity.min(1.0));
         }
         if shadow > 0.0 {
             self.shadow(r, radius, 18.0, 8.0, shadow * opacity);
@@ -1951,7 +2095,10 @@ impl Ui {
             let x0 = x.max(v.x + theme::VIEW_RADIUS);
             let x1 = (x + span).min(v.x + v.w - theme::VIEW_RADIUS);
             if x1 > x0 {
-                p.round_rect(Rect { x: x0, y: v.y, w: x1 - x0, h: 2.5 }, 1.25, theme::ACCENT);
+                // dark on light sites, light on dark ones
+                let bar = Rect { x: x0, y: v.y, w: x1 - x0, h: 2.5 };
+                let ink = p.ink_over(Rect { y: v.y, h: 6.0, ..bar });
+                p.round_rect(bar, 1.25, ink.wash(0.75));
             }
         }
     }
@@ -2037,9 +2184,10 @@ impl Ui {
 
     fn draw_dock(&self, p: &mut Painter, fonts: &Fonts, g: &Geom) {
         let shown = smooth(self.dock_show);
-        if shown < 0.999 {
-            // tucked away: a slim glass strip along the bottom edge
-            let a = 1.0 - shown;
+        let a = (1.0 - shown * 2.5).max(0.0);
+        if a > 0.0 {
+            // tucked away: a slim strip along the bottom edge; it is gone
+            // before the rising dock reaches it, so it never shows through
             let r = Rect { x: self.w / 2.0 - 70.0, y: self.h - 11.0 + 6.0 * shown, w: 140.0, h: 5.0 };
             let ink = p.ink_over(Rect { x: r.x, y: r.y - 6.0, w: r.w, h: 16.0 });
             p.shadow(r, 2.5, 6.0, 1.0, 0.18 * a * (1.0 - ink.t));
@@ -2050,7 +2198,7 @@ impl Ui {
         }
         let d = g.dock;
         let radius = 28.0;
-        let ink = p.glass(d, radius, 20.0, 0.22, shown);
+        let ink = p.glass(d, radius, 20.0, 0.16, shown);
         let fade = |c: Color| alpha(c, shown);
 
         // controls sit straight on the glass; hover lights a soft pill
@@ -2195,7 +2343,7 @@ impl Ui {
         let w = tw + 24.0;
         let x = (cx - w / 2.0).clamp(8.0, self.w - w - 8.0);
         let r = Rect { x, y: top - 10.0 - h + (1.0 - t) * 8.0, w, h };
-        let pink = p.glass(r, 14.0, 14.0, 0.3, t);
+        let pink = p.glass(r, 14.0, 14.0, 0.16, t);
         p.text_centered(fonts, &title, r.x + w / 2.0, r.y + 20.0, 13.0, alpha(pink.text(), t), true);
         if !host.is_empty() {
             p.text_centered(fonts, &host, r.x + w / 2.0, r.y + 35.0, 11.0, alpha(pink.dim(), t), false);
@@ -2206,7 +2354,7 @@ impl Ui {
         let c = g.capsule;
         let tab = self.tab();
         // glass that takes its tone from the site behind it
-        let ink = p.glass(c, c.h / 2.0, 16.0, 0.14, 1.0);
+        let ink = p.glass(c, c.h / 2.0, 16.0, 0.07, 1.0);
 
         let transport = Transport::of_tab(self.transport, tab);
         // monogram, always visible, at the left end
@@ -2269,6 +2417,15 @@ impl Ui {
 
     fn draw_gestures(&self, p: &mut Painter, g: &Geom) {
         let v = g.viewport;
+        // a glass bubble that fills with ink once releasing would act
+        let bubble = |p: &mut Painter, x: f32, y: f32, r: f32, progress: f32, ready: bool| -> Ink {
+            let rect = Rect { x: x - r, y: y - r, w: r * 2.0, h: r * 2.0 };
+            let ink = p.glass(rect, r, 10.0, 0.3, progress.max(0.6));
+            if ready {
+                p.circle(x, y, r, ink.text());
+            }
+            ink
+        };
         if self.swipe.abs() > 0.02 {
             let back = self.swipe > 0.0;
             let progress = self.swipe.abs().min(1.0);
@@ -2276,21 +2433,20 @@ impl Ui {
             let travel = 56.0 * smooth(progress);
             let x = if back { v.x - 22.0 + travel } else { v.x + v.w + 22.0 - travel };
             let y = v.y + v.h / 2.0;
-            p.shadow(Rect { x: x - 22.0, y: y - 22.0, w: 44.0, h: 44.0 }, 22.0, 12.0, 4.0, 0.4 * progress);
-            p.circle(x, y, 22.0, if ready { theme::ACCENT } else { alpha(theme::RAISED, progress.max(0.6)) });
+            let ink = bubble(p, x, y, 22.0, progress, ready);
             let icon = if back { Icon::Left } else { Icon::Right };
-            p.icon(icon, x, y, 20.0, if ready { theme::ON_ACCENT } else { alpha(theme::TEXT, progress) });
+            p.icon(icon, x, y, 20.0, if ready { ink.inverse() } else { alpha(ink.text(), progress) });
         }
         if self.pull > 0.02 {
             let progress = self.pull.min(1.0);
             let ready = self.pull >= 1.0;
-            let (x, y) = (v.x + v.w / 2.0, v.y + 8.0 + 36.0 * smooth(progress));
-            p.circle(x, y, 18.0, if ready { theme::ACCENT } else { theme::RAISED });
-            let color = if ready { theme::ON_ACCENT } else { theme::TEXT };
+            // below the capsule, never over it
+            let (x, y) = (v.x + v.w / 2.0, g.capsule.y + g.capsule.h + 6.0 + 36.0 * smooth(progress));
+            let ink = bubble(p, x, y, 18.0, progress, ready);
             if ready {
-                p.icon(Icon::Reload, x, y, 20.0, color);
+                p.icon(Icon::Reload, x, y, 20.0, ink.inverse());
             } else {
-                p.arc(x, y, 8.0, -std::f32::consts::FRAC_PI_2, progress * 6.0, 1.8, color);
+                p.arc(x, y, 8.0, -std::f32::consts::FRAC_PI_2, progress * 6.0, 1.8, ink.text());
             }
         }
     }
@@ -2300,7 +2456,7 @@ impl Ui {
         let t = (left / 0.3).min(1.0);
         let w = fonts.advance(message, 13.0, false, false) + 32.0;
         let r = Rect { x: (self.w - w) / 2.0, y: (g.dock.y - 52.0).min(self.h - 58.0), w, h: 34.0 };
-        let ink = p.glass(r, 17.0, 14.0, 0.3, t);
+        let ink = p.glass(r, 17.0, 14.0, 0.16, t);
         p.text_centered(fonts, message, r.x + w / 2.0, r.y + 22.0, 13.0, alpha(ink.text(), t), false);
     }
 }
@@ -2474,9 +2630,16 @@ impl App {
         if let Some((node, value)) = outcome.focus {
             self.field = Some(Field { tab_id, nav, node, value });
         }
+        if let Some(fragment) = outcome.jump.as_deref() {
+            self.ui.jump_to(fragment);
+        }
         if let Some(target) = outcome.navigate {
             let base = self.ui.active_loaded().map(|l| l.url.clone());
             if let Some(url) = base.and_then(|b| b.resolve(&target)).or_else(|| Url::parse(&target)) {
+                if self.ui.jump(&url) {
+                    self.update_title();
+                    return;
+                }
                 let mut load = self.ui.navigate(url);
                 load.form = outcome.form;
                 self.spawn(load);
@@ -2615,6 +2778,7 @@ impl App {
     fn click(&mut self, x: f32, y: f32) {
         let hit = self.ui.hit(x, y);
         if hit != Hit::Capsule && self.ui.editing {
+            // closing a find field keeps its highlights (⌘G steps on, Esc clears)
             self.ui.editing = false;
         }
         match hit {
@@ -2653,8 +2817,10 @@ impl App {
                 }
                 if let Some(href) = self.link_at(x, y) {
                     if let Some(url) = Url::parse(&href) {
-                        let load = self.ui.navigate(url);
-                        self.spawn(load);
+                        if !self.ui.jump(&url) {
+                            let load = self.ui.navigate(url);
+                            self.spawn(load);
+                        }
                     }
                 }
             }
@@ -2669,6 +2835,13 @@ impl App {
             match key {
                 Key::Character(c) => match c.as_str() {
                     "l" | "д" => self.ui.begin_editing(true),
+                    "f" | "а" => self.ui.begin_find(),
+                    "g" | "п" => {
+                        if self.ui.find_status().is_some() {
+                            let step = if self.mods.shift_key() { -1 } else { 1 };
+                            self.ui.find_step(&self.fonts, step);
+                        }
+                    }
                     "t" | "е" => self.ui.new_tab(),
                     "w" | "ц" => {
                         self.ui.close_active();
@@ -2704,6 +2877,26 @@ impl App {
         if !self.ui.editing && self.type_into_field(key, typed) {
             return true;
         }
+        if self.ui.editing && self.ui.finding {
+            match key {
+                Key::Named(NamedKey::Escape) => self.ui.end_find(),
+                Key::Named(NamedKey::Enter) => {
+                    let step = if self.mods.shift_key() { -1 } else { 1 };
+                    self.ui.find_step(&self.fonts, step);
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.ui.backspace();
+                    self.ui.find_step(&self.fonts, 0);
+                }
+                _ => {
+                    if let Some(text) = typed {
+                        self.ui.type_text(text);
+                        self.ui.find_step(&self.fonts, 0);
+                    }
+                }
+            }
+            return true;
+        }
         if self.ui.editing {
             match key {
                 Key::Named(NamedKey::Escape) => self.ui.editing = false,
@@ -2729,6 +2922,7 @@ impl App {
             Key::Named(NamedKey::Home) => self.ui.scroll_to(0.0),
             Key::Named(NamedKey::End) => self.ui.scroll_to(f32::MAX),
             Key::Character(c) if c.as_str() == "/" => self.ui.begin_editing(false),
+            Key::Named(NamedKey::Escape) if self.ui.find_status().is_some() => self.ui.end_find(),
             _ => {}
         }
         true
@@ -2963,6 +3157,43 @@ mod tests {
         let loaded = fake_loaded(url, title);
         let thumb = thumbnail(&fonts, &loaded.page, 1184.0);
         ui.finish(load.tab_id, load.nav, Ok((loaded, thumb)));
+    }
+
+    #[test]
+    fn anchors_scroll_and_find_highlights() {
+        let fonts = Fonts::load();
+        let mut ui = Ui::new(Transport::Direct, true);
+        let sheet = crate::css::Stylesheet::default();
+        let long = "<p style='height:3000px'>start needle</p><h2 id='deep'>Deep needle section</h2><p style='height:3000px'>needle tail</p>";
+        let page = crate::layout::Layout::new(&fonts, &sheet, 1184.0).build(&crate::dom::parse_document(long));
+        let deep = page.anchor("deep").unwrap();
+        // a load with #deep lands on it
+        let load = ui.navigate(Url::parse("https://a.example/doc#deep").unwrap());
+        assert!(!load.url.to_string().contains('#'), "the fragment is not sent: {:?}", load.url);
+        let loaded = Loaded { url: load.url.clone(), title: "Doc".into(), page, status: 200, rules: 0, note: String::new() };
+        let thumb = thumbnail(&fonts, &loaded.page, 1184.0);
+        ui.finish(load.tab_id, load.nav, Ok((loaded, thumb)));
+        assert_eq!(ui.active_scroll(), deep);
+        // a same-page #link scrolls without loading
+        assert!(ui.jump(&Url::parse("https://a.example/doc#top").unwrap()));
+        assert_eq!(ui.active_scroll(), 0.0);
+        assert!(!ui.jump(&Url::parse("https://b.example/doc#deep").unwrap()), "another page loads");
+        // find: three matches, highlighted, Enter walks them, Esc clears
+        let draws_before = ui.active_page().unwrap().3.draws.len();
+        ui.begin_find();
+        ui.type_text("NEEDLE");
+        ui.find_step(&fonts, 0);
+        assert_eq!(ui.find_status(), Some((1, 3)));
+        assert_eq!(ui.active_page().unwrap().3.draws.len(), draws_before + 3);
+        ui.find_step(&fonts, 1);
+        assert_eq!(ui.find_status(), Some((2, 3)));
+        assert!(ui.active_scroll() > 2000.0, "the second match is brought into view");
+        ui.find_step(&fonts, -1);
+        ui.find_step(&fonts, -1);
+        assert_eq!(ui.find_status(), Some((3, 3)), "wraps around");
+        ui.end_find();
+        assert_eq!(ui.find_status(), None);
+        assert_eq!(ui.active_page().unwrap().3.draws.len(), draws_before, "highlights removed");
     }
 
     fn settle(ui: &mut Ui) {

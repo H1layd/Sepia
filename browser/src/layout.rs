@@ -90,6 +90,8 @@ pub struct Page {
     /// Element boxes with their `data-sepia-id` (only when scripts run):
     /// what a click lands on.
     pub boxes: Vec<(Rect, usize)>,
+    /// `id` (and `<a name>`) of block boxes with their top: where `#fragment` scrolls
+    pub anchors: Vec<(String, f32)>,
 }
 
 pub struct Fonts {
@@ -566,6 +568,11 @@ impl<'a> Layout<'a> {
         }
         if let Some(id) = node.attr("data-sepia-id").and_then(|v| v.parse::<usize>().ok()) {
             self.page.boxes.push((rect, id));
+        }
+        for name in [node.attr("id"), (node.tag == "a").then(|| node.attr("name")).flatten()].into_iter().flatten() {
+            if !name.is_empty() {
+                self.page.anchors.push((name.to_string(), box_y));
+            }
         }
         if style.clip_x || style.clip_y {
             self.clip(first_child_draw, first_child_link, rect, style.clip_x, style.clip_y);
@@ -1242,6 +1249,68 @@ fn px_attr(node: &Node, name: &str) -> Option<f32> {
     node.attr(name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+impl Page {
+    /// Top of the element a `#fragment` names (`top` = page start).
+    pub fn anchor(&self, fragment: &str) -> Option<f32> {
+        let decoded = percent_decode(fragment);
+        if decoded.is_empty() || decoded.eq_ignore_ascii_case("top") {
+            return Some(0.0);
+        }
+        self.anchors.iter().find(|(name, _)| *name == decoded).map(|(_, y)| *y)
+    }
+
+    /// Every place `query` appears in the drawn text (case-insensitive),
+    /// in reading order: the boxes find-in-page highlights.
+    pub fn find(&self, fonts: &Fonts, query: &str) -> Vec<Rect> {
+        let needle: Vec<char> = query.to_lowercase().chars().collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for draw in &self.draws {
+            let Draw::Text { x, baseline, text, size, bold, italic, letter_spacing, family, .. } = draw else { continue };
+            let lower: Vec<char> = text.chars().flat_map(|c| c.to_lowercase()).collect();
+            let original: Vec<char> = text.chars().collect();
+            // lowercasing can change lengths (rare); then positions are approximate
+            let same = lower.len() == original.len();
+            let mut i = 0;
+            while i + needle.len() <= lower.len() {
+                if lower[i..i + needle.len()] == needle[..] {
+                    let (a, b) = if same { (i, i + needle.len()) } else { (i.min(original.len()), (i + needle.len()).min(original.len())) };
+                    let before: String = original[..a].iter().collect();
+                    let word: String = original[a..b].iter().collect();
+                    let advance = |t: &str| fonts.advance_in(t, *size, *bold, *italic, family.as_deref()) + letter_spacing * t.chars().count() as f32;
+                    let x0 = x + advance(&before);
+                    hits.push(Rect { x: x0 - 1.0, y: baseline - size * 0.92, w: advance(&word) + 2.0, h: size * 1.2 });
+                    i += needle.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        hits.sort_by(|a, b| (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap_or(std::cmp::Ordering::Equal));
+        hits
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() && s.is_char_boundary(i + 3) {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn translate(draw: &mut Draw, dx: f32, dy: f32) {
     match draw {
         Draw::Rect { rect, .. }
@@ -1403,6 +1472,7 @@ impl<'a> Layout<'a> {
             (rect, id)
         }));
         self.page.content_right = self.page.content_right.max(x + sub.content_right);
+        self.page.anchors.extend(sub.anchors.into_iter().map(|(name, top)| (name, top + y)));
     }
 
     /// Height the pending inline items would take (for an absolute box's static position).
@@ -2669,6 +2739,21 @@ mod tests {
         assert!(texts.iter().any(|t| t.0 < 20.0), "first line starts at the top, beside the float");
         assert!(texts.iter().filter(|t| t.0 < 95.0).all(|t| t.2 <= 700.5), "no text under the float");
         assert!(texts.iter().any(|t| t.0 > 110.0 && t.2 > 750.0), "below it lines are full width again");
+    }
+
+    #[test]
+    fn anchors_and_find_in_page() {
+        let doc = parse_document("<body style='margin:0'><p style='margin:0;height:500px'>Intro rust text</p><h2 id='History' style='margin:0'>History of Rust</h2><a name='x'></a></body>");
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        assert_eq!(page.anchor("History"), Some(500.0));
+        assert_eq!(page.anchor("top"), Some(0.0));
+        assert_eq!(page.anchor("missing"), None);
+        let hits = page.find(&fonts, "RUST");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].y < 30.0 && hits[1].y > 490.0, "reading order: {hits:?}");
+        assert!(hits[0].x > 20.0 && hits[0].w > 10.0, "inside the run, not at its start: {hits:?}");
     }
 
     #[test]
