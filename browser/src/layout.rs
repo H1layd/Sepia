@@ -250,13 +250,43 @@ pub struct Layout<'a> {
     flow_width: f32,
     /// a flex/grid item laid out as a block whatever its inline display
     blockify: Option<*const Node>,
+    /// positioned ancestors (their padding boxes), innermost last: what
+    /// `position: absolute` children are placed against
+    containers: Vec<Container>,
+    /// floats placed so far in this flow (page coordinates): lines beside them get shorter
+    exclusions: Vec<Exclusion>,
     page: Page,
+}
+
+#[derive(Clone, Copy)]
+struct Exclusion {
+    top: f32,
+    bottom: f32,
+    /// the float's outer box, margins included
+    x0: f32,
+    x1: f32,
+    right: bool,
+}
+
+/// The padding box of a positioned element while its children are laid out.
+/// Its height is known only at the end, so absolutes anchored by `bottom`
+/// are moved into place then.
+struct Container {
+    x: f32,
+    y: f32,
+    w: f32,
+    /// (draws, links, boxes) ranges to move, and where their bottom edge goes: `bottom` and box height
+    bottom_fixes: Vec<(std::ops::Range<usize>, std::ops::Range<usize>, std::ops::Range<usize>, f32, f32)>,
+}
+
+fn out_of_flow(style: &Style) -> bool {
+    matches!(style.position, crate::style::Position::Absolute | crate::style::Position::Fixed) && style.display != Display::None
 }
 
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
         crate::style::set_viewport(viewport_width, 800.0);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -453,6 +483,12 @@ impl<'a> Layout<'a> {
             None
         };
 
+        let positioned = style.position != crate::style::Position::Static;
+        if positioned {
+            self.containers.push(Container { x: box_x + b.left, y: box_y + b.top, w: outer_width - b.left - b.right, bottom_fixes: Vec::new() });
+        }
+        let first_draw = shadow_index.or(fill_index).unwrap_or(self.page.draws.len());
+        let (first_link, first_box) = (self.page.links.len(), self.page.boxes.len());
         let mut cursor = inner_y;
         // list marker
         if style.display == Display::ListItem && !style.hidden {
@@ -501,7 +537,8 @@ impl<'a> Layout<'a> {
         let mut content_height = cursor - inner_y;
         let content_box = |h: f32| if style.border_box { (h - chrome_h).max(0.0) } else { h };
         if let Some(height) = style.height {
-            content_height = content_height.max(content_box(height));
+            // a clipped box keeps its height; others grow to hold what is in them
+            content_height = if style.clip_y { content_box(height) } else { content_height.max(content_box(height)) };
         }
         if let Some(min_height) = style.min_height {
             content_height = content_height.max(content_box(min_height));
@@ -530,6 +567,26 @@ impl<'a> Layout<'a> {
         if let Some(id) = node.attr("data-sepia-id").and_then(|v| v.parse::<usize>().ok()) {
             self.page.boxes.push((rect, id));
         }
+        if style.clip_x || style.clip_y {
+            self.clip(first_child_draw, first_child_link, rect, style.clip_x, style.clip_y);
+        }
+        if positioned {
+            if let Some(container) = self.containers.pop() {
+                let inner_h = total - b.top - b.bottom;
+                for (draws, links, boxes, bottom, h) in container.bottom_fixes {
+                    self.shift(draws, links, boxes, 0.0, inner_h - bottom - h);
+                }
+            }
+        }
+        // position: relative moves the box and what is in it, leaving its place in the flow
+        if style.position == crate::style::Position::Relative {
+            let dx = style.left.or(style.right.map(|r| -r)).unwrap_or(0.0);
+            let dy = style.top.or(style.bottom.map(|b| -b)).unwrap_or(0.0);
+            if dx != 0.0 || dy != 0.0 {
+                let (d, l, bx) = (self.page.draws.len(), self.page.links.len(), self.page.boxes.len());
+                self.shift(first_draw..d, first_link..l, first_box..bx, dx, dy);
+            }
+        }
         self.last_margin_bottom = margin_bottom;
         total + margin.top + margin_bottom
     }
@@ -545,6 +602,7 @@ impl<'a> Layout<'a> {
     fn layout_children(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32, collapse_top: f32) -> f32 {
         let saved_flow = std::mem::replace(&mut self.flow_width, width);
         let mut cursor = y;
+        let saved_exclusions = self.exclusions.len();
         let mut previous_margin: Option<f32> = Some(collapse_top);
         let mut last_was_block = false;
         let mut items: Vec<InlineItem> = Vec::new();
@@ -552,6 +610,62 @@ impl<'a> Layout<'a> {
             if node.tag == "a" { node.attr("href").map(|h| h.to_string()) } else { None };
         for child in &node.children {
             let child_style = child.text.is_none().then(|| compute(child, Some(style), self.sheet, ancestors, width));
+            if let Some(cs) = child_style.as_ref().filter(|cs| out_of_flow(cs)) {
+                // its static position: where the next line would start
+                let pending = if items.is_empty() { 0.0 } else { self.measure_inline_height(&items, width) };
+                self.place_out_of_flow(child, ancestors, cs, x, cursor + pending);
+                continue;
+            }
+            if let Some(cs) = child_style.as_ref().filter(|cs| cs.float.is_some() && cs.display != Display::None && !matches!(child.tag.as_str(), "img" | "svg")) {
+                if !items.is_empty() {
+                    let used = self.layout_inline(&items, x, cursor, width);
+                    items.clear();
+                    if used > 0.0 {
+                        cursor += used;
+                        previous_margin = None;
+                    }
+                }
+                let mut with_node: Vec<&Node> = ancestors.to_vec();
+                with_node.push(child);
+                let mut fs = cs.clone();
+                if fs.display == Display::Inline {
+                    fs.display = Display::InlineBlock;
+                }
+                let saved = std::mem::replace(&mut self.flow_width, width);
+                let atom = self.atom_of(child, &with_node, &fs);
+                self.flow_width = saved;
+                if let Some((sub, w, h)) = atom {
+                    // the highest place with room for it, beside floats already there
+                    let mut top = cursor;
+                    let (mut lx, mut lw) = (x, width);
+                    for _ in 0..32 {
+                        let (bx, bw, next) = self.band(top, h.max(1.0), x, width);
+                        (lx, lw) = (bx, bw);
+                        match next {
+                            Some(below) if bw + 0.5 < w => top = below,
+                            _ => break,
+                        }
+                    }
+                    let right = cs.float == Some(Align::Right);
+                    let fx = if right { lx + lw - w } else { lx };
+                    self.append_page(sub, fx, top);
+                    self.exclusions.push(Exclusion { top, bottom: top + h, x0: fx, x1: fx + w, right });
+                }
+                previous_margin = None;
+                continue;
+            }
+            if child_style.as_ref().is_some_and(|cs| cs.clear) {
+                if !items.is_empty() {
+                    let used = self.layout_inline(&items, x, cursor, width);
+                    items.clear();
+                    cursor += used;
+                }
+                let lowest = self.exclusions.iter().map(|e| e.bottom).fold(cursor, f32::max);
+                if lowest > cursor {
+                    cursor = lowest;
+                    previous_margin = None;
+                }
+            }
             let child_is_block = child_style.as_ref().is_some_and(|s| !matches!(s.display, Display::Inline | Display::InlineBlock | Display::None));
             if child_is_block {
                 if !items.is_empty() {
@@ -580,6 +694,10 @@ impl<'a> Layout<'a> {
                 cursor += used;
                 last_was_block = false;
             }
+        }
+        // the parent grows to hold its own floats (as if clearfixed); they stop here
+        for e in self.exclusions.drain(saved_exclusions..) {
+            cursor = cursor.max(e.bottom);
         }
         self.trailing_margin = if last_was_block { previous_margin.unwrap_or(0.0) } else { 0.0 };
         self.flow_width = saved_flow;
@@ -630,6 +748,12 @@ impl<'a> Layout<'a> {
         }
         let style = compute(node, Some(parent_style), self.sheet, ancestors, self.viewport_width);
         if style.display == Display::None {
+            return;
+        }
+        if out_of_flow(&style) {
+            // placed against its container; the static position (mid-line) is not known here
+            let (x, y) = self.containers.last().map(|c| (c.x, c.y)).unwrap_or((0.0, 0.0));
+            self.place_out_of_flow(node, ancestors, &style, x, y);
             return;
         }
         if style.display == Display::InlineBlock && node.tag != "img" {
@@ -805,7 +929,9 @@ impl<'a> Layout<'a> {
         if items.is_empty() {
             return 0.0;
         }
-        let mut cursor_y = y;
+        // lines beside floats are shorter: each line asks where it may go
+        let line_guess = items.first().map(|i| i.style.font_size * 1.3).unwrap_or(20.0);
+        let (mut cursor_y, mut lx, mut lw) = self.line_slot(y, x, width, line_guess);
         let mut line: Vec<(String, InlineItem)> = Vec::new();
         let mut line_width = 0.0f32;
         // text-indent: the first line of the block starts further right
@@ -838,8 +964,9 @@ impl<'a> Layout<'a> {
                 } else {
                     0.0
                 };
-                if line_width + space + w > width - indent && line_width > 0.0 && !item.style.nowrap {
-                    self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                if line_width + space + w > lw - indent && line_width > 0.0 && !item.style.nowrap {
+                    self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                     indent = 0.0;
                     line.clear();
                     line_width = 0.0;
@@ -857,8 +984,9 @@ impl<'a> Layout<'a> {
                 need_space = false;
             } else if item.image {
                 let advance = self.text_width(&item.text, &item.style);
-                if line_width + advance > width - indent && line_width > 0.0 && !item.style.nowrap {
-                    self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                if line_width + advance > lw - indent && line_width > 0.0 && !item.style.nowrap {
+                    self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                     indent = 0.0;
                     line.clear();
                     line_width = 0.0;
@@ -877,7 +1005,8 @@ impl<'a> Layout<'a> {
                         continue;
                     }
                     if word == "\n" {
-                        self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                        self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                         indent = 0.0;
                         line.clear();
                         line_width = 0.0;
@@ -891,8 +1020,9 @@ impl<'a> Layout<'a> {
                         piece = format!(" {piece}");
                         piece_width += self.text_width(" ", &item.style);
                     }
-                    if line_width + piece_width > width - indent && line_width > 0.0 && !item.style.nowrap {
-                        self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                    if line_width + piece_width > lw - indent && line_width > 0.0 && !item.style.nowrap {
+                        self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                         indent = 0.0;
                         line.clear();
                         line_width = 0.0;
@@ -911,7 +1041,8 @@ impl<'a> Layout<'a> {
                 }
             }
             if line_done {
-                self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+                self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                 indent = 0.0;
                 line.clear();
                 line_width = 0.0;
@@ -921,7 +1052,8 @@ impl<'a> Layout<'a> {
             }
         }
         if !line.is_empty() {
-            self.flush_line(&mut line, x, &mut cursor_y, width, max_size);
+            self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
         }
         self.pending_indent = 0.0;
         cursor_y - y
@@ -1142,7 +1274,190 @@ impl<'a> Layout<'a> {
             canvas_node: None,
             flow_width: self.flow_width,
             blockify: None,
+            containers: Vec::new(),
+            exclusions: Vec::new(),
             page: Page::default(),
+        }
+    }
+
+    /// Move what was drawn in these ranges (a positioned box) by (dx, dy).
+    fn shift(&mut self, draws: std::ops::Range<usize>, links: std::ops::Range<usize>, boxes: std::ops::Range<usize>, dx: f32, dy: f32) {
+        for draw in &mut self.page.draws[draws] {
+            translate(draw, dx, dy);
+        }
+        for link in &mut self.page.links[links] {
+            link.rect.x += dx;
+            link.rect.y += dy;
+        }
+        for (rect, _) in &mut self.page.boxes[boxes] {
+            rect.x += dx;
+            rect.y += dy;
+        }
+    }
+
+    /// overflow: hidden. Draws from `first_draw` on that fall wholly outside
+    /// `rect` on a clipped axis are blanked (kept as empty draws so ranges
+    /// recorded elsewhere stay valid); boxes reaching out are cut to it.
+    fn clip(&mut self, first_draw: usize, first_link: usize, rect: Rect, clip_x: bool, clip_y: bool) {
+        let (left, right, top, bottom) = (rect.x, rect.x + rect.w, rect.y, rect.y + rect.h);
+        let fonts = self.fonts;
+        let outside = |x0: f32, x1: f32, y0: f32, y1: f32| (clip_x && (x1 <= left || x0 >= right)) || (clip_y && (y1 <= top || y0 >= bottom));
+        let blank = Draw::Rect { rect: Rect { x: 0.0, y: -1e9, w: 0.0, h: 0.0 }, color: Color { r: 0, g: 0, b: 0, a: 0 } };
+        for draw in &mut self.page.draws[first_draw..] {
+            let gone = match draw {
+                Draw::Text { x, baseline, text, size, bold, italic, family, .. } => {
+                    let w = fonts.advance_in(text, *size, *bold, *italic, family.as_deref());
+                    outside(*x, *x + w, *baseline - *size * 0.8, *baseline + *size * 0.25)
+                }
+                Draw::Image { rect: r, .. } | Draw::Shadow { rect: r, .. } | Draw::Edges { rect: r, .. } => outside(r.x, r.x + r.w, r.y, r.y + r.h),
+                Draw::Fill { rect: r, .. } | Draw::Rect { rect: r, .. } | Draw::Border { rect: r, .. } => {
+                    if outside(r.x, r.x + r.w, r.y, r.y + r.h) {
+                        true
+                    } else {
+                        // cut solid boxes to the clip
+                        if clip_x {
+                            let (a, b) = (r.x.max(left), (r.x + r.w).min(right));
+                            r.x = a;
+                            r.w = b - a;
+                        }
+                        if clip_y {
+                            let (a, b) = (r.y.max(top), (r.y + r.h).min(bottom));
+                            r.y = a;
+                            r.h = b - a;
+                        }
+                        false
+                    }
+                }
+            };
+            if gone {
+                *draw = blank.clone();
+            }
+        }
+        for link in &mut self.page.links[first_link..] {
+            let r = link.rect;
+            if outside(r.x, r.x + r.w, r.y, r.y + r.h) {
+                link.rect = Rect { x: 0.0, y: -1e9, w: 0.0, h: 0.0 };
+            }
+        }
+    }
+
+    /// A box laid out on its own at the origin, shrink-to-fit unless sized:
+    /// (page, outer width, outer height). Tables get the table algorithm.
+    fn atom_of(&self, node: &Node, with_node: &[&Node], style: &Style) -> Option<(Page, f32, f32)> {
+        if style.display == Display::Table {
+            let mut sub = self.sub_layout(false);
+            let parent = &with_node[..with_node.len() - 1];
+            let h = sub.layout_table(node, parent, style, Align::Left, 0.0, 0.0, self.flow_width.max(1.0));
+            let w = (self.extent(&sub.page) + style.margin.right).min(self.flow_width.max(1.0));
+            return Some((sub.page, w, h));
+        }
+        self.make_atom(node, with_node, style).map(|(page, _, w, h)| (page, w, h))
+    }
+
+    /// The part of a line [y, y + h) between `x` and `x + width` left free by
+    /// floats: (left, width, the next y where that changes, if a float narrows it).
+    fn band(&self, y: f32, h: f32, x: f32, width: f32) -> (f32, f32, Option<f32>) {
+        let (mut l, mut r) = (x, x + width);
+        let mut next: Option<f32> = None;
+        for e in &self.exclusions {
+            if e.top < y + h && e.bottom > y + 0.01 && e.x1 > x && e.x0 < x + width {
+                if e.right {
+                    r = r.min(e.x0);
+                } else {
+                    l = l.max(e.x1);
+                }
+                next = Some(next.map_or(e.bottom, |n: f32| n.min(e.bottom)));
+            }
+        }
+        (l, (r - l).max(0.0), next)
+    }
+
+    /// Where the next line goes: (y, left, width), moved down below floats
+    /// when they leave too little room beside them.
+    fn line_slot(&self, y: f32, x: f32, width: f32, line_h: f32) -> (f32, f32, f32) {
+        let mut y = y;
+        for _ in 0..32 {
+            let (l, w, next) = self.band(y, line_h, x, width);
+            match next {
+                Some(below) if w < (width * 0.25).min(80.0) => y = below,
+                _ => return (y, l, w.max(1.0)),
+            }
+        }
+        (y, x, width)
+    }
+
+    /// Put a sub-layout's page (laid out at the origin) at (x, y) on this one.
+    fn append_page(&mut self, sub: Page, x: f32, y: f32) {
+        self.page.draws.extend(sub.draws.into_iter().map(|mut draw| {
+            translate(&mut draw, x, y);
+            draw
+        }));
+        self.page.links.extend(sub.links.into_iter().map(|mut link| {
+            link.rect.x += x;
+            link.rect.y += y;
+            link
+        }));
+        self.page.boxes.extend(sub.boxes.into_iter().map(|(mut rect, id)| {
+            rect.x += x;
+            rect.y += y;
+            (rect, id)
+        }));
+        self.page.content_right = self.page.content_right.max(x + sub.content_right);
+    }
+
+    /// Height the pending inline items would take (for an absolute box's static position).
+    fn measure_inline_height(&self, items: &[InlineItem], width: f32) -> f32 {
+        let mut probe = self.sub_layout(true);
+        probe.layout_inline(items, 0.0, 0.0, width)
+    }
+
+    /// `position: absolute | fixed`: out of the flow, placed by left/top/
+    /// right/bottom against the nearest positioned ancestor (fixed: the
+    /// first screen), shrink-to-fit unless sized or stretched by left+right.
+    /// It takes no room where it sits; it is drawn over what came before.
+    /// `ancestors` ends with the parent; (static_x, static_y) is where it
+    /// would have gone in the flow, used when no offset is given.
+    fn place_out_of_flow(&mut self, node: &Node, ancestors: &[&Node], style: &Style, static_x: f32, static_y: f32) {
+        let fixed = style.position == crate::style::Position::Fixed;
+        let (cb_x, cb_y, cb_w) = match self.containers.last() {
+            Some(c) if !fixed => (c.x, c.y, c.w),
+            _ => (0.0, 0.0, self.viewport_width),
+        };
+        let mut style = style.clone();
+        if style.width.is_none() {
+            if let (Some(l), Some(r)) = (style.left, style.right) {
+                style.width = Some((cb_w - l - r - style.margin.horizontal()).max(1.0));
+                style.border_box = true;
+            }
+        }
+        let mut with_node: Vec<&Node> = ancestors.to_vec();
+        with_node.push(node);
+        let saved_flow = std::mem::replace(&mut self.flow_width, cb_w.max(1.0));
+        let atom = self.atom_of(node, &with_node, &style);
+        self.flow_width = saved_flow;
+        let Some((sub, w, h)) = atom else { return };
+        let x = match (style.left, style.right) {
+            (Some(l), _) => cb_x + l,
+            (None, Some(r)) => cb_x + cb_w - r - w,
+            _ => static_x,
+        };
+        let mut bottom_fix = None;
+        let y = match (style.top, style.bottom) {
+            (Some(t), _) => cb_y + t,
+            (None, Some(b)) if fixed || self.containers.is_empty() => crate::style::viewport_height() - b - h,
+            (None, Some(b)) => {
+                bottom_fix = Some(b);
+                cb_y
+            }
+            _ => static_y,
+        };
+        let (d, l, bx) = (self.page.draws.len(), self.page.links.len(), self.page.boxes.len());
+        self.append_page(sub, x, y);
+        if let Some(b) = bottom_fix {
+            let ranges = (d..self.page.draws.len(), l..self.page.links.len(), bx..self.page.boxes.len());
+            if let Some(container) = self.containers.last_mut() {
+                container.bottom_fixes.push((ranges.0, ranges.1, ranges.2, b, h));
+            }
         }
     }
 
@@ -1538,6 +1853,10 @@ impl<'a> Layout<'a> {
                     if s.display == Display::None {
                         continue;
                     }
+                    if out_of_flow(&s) {
+                        self.place_out_of_flow(child, ancestors, &s, x, y);
+                        continue;
+                    }
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
                     let min_outer = s.min_width.map(|m| m + chrome + s.margin.horizontal()).unwrap_or(0.0);
                     (s.flex, s.margin.top, s.margin.bottom, s.padding.right + s.border.right + s.margin.right, min_outer)
@@ -1877,6 +2196,10 @@ impl<'a> Layout<'a> {
                 None => {
                     let s = compute(child, Some(style), self.sheet, ancestors, width);
                     if s.display == Display::None {
+                        continue;
+                    }
+                    if out_of_flow(&s) {
+                        self.place_out_of_flow(child, ancestors, &s, x, y);
                         continue;
                     }
                     let span = match s.grid_span {
@@ -2238,6 +2561,110 @@ mod tests {
             split_words("a\nb", false),
             vec![("a".to_string(), false), ("\n".to_string(), false), ("b".to_string(), false)]
         );
+    }
+
+    #[test]
+    fn absolute_boxes_leave_the_flow_and_sit_on_their_container() {
+        let doc = parse_document(
+            "<body style='margin:0'>\
+             <div style='position:relative;height:100px;background:#eee'>\
+               <span style='position:absolute;right:10px;top:5px;width:20px;height:20px;background:red'></span>\
+               <div style='position:absolute;left:0;right:0;bottom:0;height:10px;background:blue'></div>\
+             </div>\
+             <p style='margin:0'>after</p>\
+             <div style='position:fixed;bottom:0;left:0;right:0;height:50px;background:green'></div></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let fill = |c: Color| page.draws.iter().find_map(|d| match d {
+            Draw::Fill { rect, color: Some(col), .. } if *col == c => Some(*rect),
+            _ => None,
+        }).unwrap_or_else(|| panic!("no fill {c:?}"));
+        let red = fill(Color::rgb(255, 0, 0));
+        assert_eq!((red.x, red.y, red.w), (770.0, 5.0, 20.0), "right/top against the relative box");
+        let blue = fill(Color::rgb(0, 0, 255));
+        assert_eq!((blue.x, blue.y, blue.w), (0.0, 90.0, 800.0), "left+right stretch, bottom anchors after height is known");
+        let green = fill(Color::rgb(0, 128, 0));
+        assert_eq!((green.y, green.w), (800.0 - 50.0, 800.0), "fixed sits at the bottom of the first screen");
+        let after = page.draws.iter().find_map(|d| match d {
+            Draw::Text { text, baseline, .. } if text.contains("after") => Some(*baseline),
+            _ => None,
+        }).unwrap();
+        assert!(after > 100.0 && after < 125.0, "absolutes take no room: {after}");
+    }
+
+    #[test]
+    fn floats_sit_side_by_side_and_the_parent_holds_them() {
+        let doc = parse_document(
+            "<body style='margin:0'><div id=w>\
+               <div style='float:left;width:30%;height:40px;background:red'></div>\
+               <div style='float:left;width:30%;height:60px;background:blue'></div>\
+               <div style='float:right;width:100px;height:20px;background:green'></div>\
+             </div><p style='margin:0'>below</p></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 1000.0).build(&doc);
+        let fill = |c: Color| page.draws.iter().find_map(|d| match d {
+            Draw::Fill { rect, color: Some(col), .. } if *col == c => Some(*rect),
+            _ => None,
+        }).unwrap();
+        assert_eq!((fill(Color::rgb(255, 0, 0)).x, fill(Color::rgb(255, 0, 0)).y), (0.0, 0.0));
+        assert_eq!((fill(Color::rgb(0, 0, 255)).x, fill(Color::rgb(0, 0, 255)).y), (300.0, 0.0));
+        assert_eq!(fill(Color::rgb(0, 128, 0)).x, 900.0);
+        let below = page.draws.iter().find_map(|d| match d {
+            Draw::Text { text, baseline, .. } if text.contains("below") => Some(*baseline),
+            _ => None,
+        }).unwrap();
+        assert!(below > 60.0 && below < 85.0, "text starts under the tallest float: {below}");
+    }
+
+    #[test]
+    fn overflow_hidden_keeps_its_height_and_hides_what_spills() {
+        let doc = parse_document(
+            "<body style='margin:0'><div style='overflow:hidden;height:30px'>\
+               <div style='height:20px;background:red'></div>\
+               <div style='height:20px;background:blue'></div>\
+               <div style='height:20px;background:green'></div>\
+             </div><p style='margin:0'>after</p></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 400.0).build(&doc);
+        let fill = |c: Color| page.draws.iter().find_map(|d| match d {
+            Draw::Fill { rect, color: Some(col), .. } if *col == c => Some(*rect),
+            _ => None,
+        });
+        assert_eq!(fill(Color::rgb(0, 0, 255)).map(|r| (r.y, r.h)), Some((20.0, 10.0)), "cut at the edge");
+        assert!(fill(Color::rgb(0, 128, 0)).is_none(), "wholly outside: not drawn");
+        let after = page.draws.iter().find_map(|d| match d {
+            Draw::Text { text, baseline, .. } if text.contains("after") => Some(*baseline),
+            _ => None,
+        }).unwrap();
+        assert!(after > 30.0 && after < 55.0, "the box stays 30px: {after}");
+    }
+
+    #[test]
+    fn text_flows_beside_a_float_then_under_it() {
+        let words = "word ".repeat(200);
+        let html = format!("<body style='margin:0'><div style='float:right;width:300px;height:100px;background:red'></div><p style='margin:0'>{words}</p></body>");
+        let doc = parse_document(&html);
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 1000.0).build(&doc);
+        let red = page.draws.iter().find_map(|d| match d {
+            Draw::Fill { rect, color: Some(c), .. } if *c == Color::rgb(255, 0, 0) => Some(*rect),
+            _ => None,
+        }).unwrap();
+        assert_eq!((red.x, red.y), (700.0, 0.0));
+        let texts: Vec<(f32, f32, f32)> = page.draws.iter().filter_map(|d| match d {
+            Draw::Text { x, baseline, text, size, bold, italic, family, .. } => Some((*baseline, *x, *x + fonts.advance_in(text, *size, *bold, *italic, family.as_deref()))),
+            _ => None,
+        }).collect();
+        assert!(texts.iter().any(|t| t.0 < 20.0), "first line starts at the top, beside the float");
+        assert!(texts.iter().filter(|t| t.0 < 95.0).all(|t| t.2 <= 700.5), "no text under the float");
+        assert!(texts.iter().any(|t| t.0 > 110.0 && t.2 > 750.0), "below it lines are full width again");
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub enum Position {
     Relative,
     Absolute,
     Fixed,
+    /// sticky: stays in flow (we do not scroll-pin it) but contains absolutes
+    Sticky,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +236,15 @@ pub struct Style {
     pub position: Position,
     pub left: Option<f32>,
     pub top: Option<f32>,
+    pub right: Option<f32>,
+    pub bottom: Option<f32>,
+    /// float: left / right (not inherited)
+    pub float: Option<Align>,
+    /// overflow hidden/clip on each axis: what spills out is not drawn
+    pub clip_x: bool,
+    pub clip_y: bool,
+    /// clear: start below the floats before it
+    pub clear: bool,
     /// a transform that moves the box a whole box-length or more off its place
     pub moved_away: bool,
     /// grid-template-columns, resolved at layout (it needs the width)
@@ -289,6 +300,12 @@ impl Default for Style {
             position: Position::Static,
             left: None,
             top: None,
+            right: None,
+            bottom: None,
+            float: None,
+            clip_x: false,
+            clip_y: false,
+            clear: false,
             moved_away: false,
             grid_columns: None,
             grid_span: GridSpan::Auto,
@@ -428,6 +445,11 @@ static VIEWPORT_H: AtomicU32 = AtomicU32::new(0x4448_0000); // 800.0
 pub fn set_viewport(width: f32, height: f32) {
     VIEWPORT_W.store(width.to_bits(), Ordering::Relaxed);
     VIEWPORT_H.store(height.to_bits(), Ordering::Relaxed);
+}
+
+/// Height of the first screen (what `position: fixed; bottom` is measured from).
+pub fn viewport_height() -> f32 {
+    f32::from_bits(VIEWPORT_H.load(Ordering::Relaxed))
 }
 
 /// Lengths: px, em, rem, %, vw/vh/vmin/vmax, pt, ch/ex, bare numbers as px,
@@ -1171,11 +1193,42 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             style.position = match value {
                 "absolute" => Position::Absolute,
                 "fixed" => Position::Fixed,
-                "relative" | "sticky" | "-webkit-sticky" => Position::Relative,
+                "relative" => Position::Relative,
+                "sticky" | "-webkit-sticky" => Position::Sticky,
                 _ => Position::Static,
             }
         }
         "left" => style.left = parse_length(value, font_size, containing_width),
+        "right" => style.right = parse_length(value, font_size, containing_width),
+        "overflow" => {
+            let mut parts = value.split_whitespace();
+            let x = parts.next().unwrap_or("");
+            let y = parts.next().unwrap_or(x);
+            style.clip_x = matches!(x, "hidden" | "clip");
+            style.clip_y = matches!(y, "hidden" | "clip");
+        }
+        "clear" => style.clear = matches!(value, "both" | "left" | "right" | "inline-start" | "inline-end"),
+        "overflow-x" => style.clip_x = matches!(value, "hidden" | "clip"),
+        "overflow-y" => style.clip_y = matches!(value, "hidden" | "clip"),
+        "float" => {
+            style.float = match value {
+                "left" | "inline-start" => Some(Align::Left),
+                "right" | "inline-end" => Some(Align::Right),
+                _ => None,
+            }
+        }
+        "bottom" => style.bottom = parse_length(value, font_size, containing_width),
+        "inset" => {
+            let parts: Vec<Option<f32>> = value.split_whitespace().map(|v| parse_length(v, font_size, containing_width)).collect();
+            let at = |i: usize| parts.get(i).copied().flatten();
+            let (t, r, b, l) = match parts.len() {
+                1 => (at(0), at(0), at(0), at(0)),
+                2 => (at(0), at(1), at(0), at(1)),
+                3 => (at(0), at(1), at(2), at(1)),
+                _ => (at(0), at(1), at(2), at(3)),
+            };
+            (style.top, style.right, style.bottom, style.left) = (t, r, b, l);
+        }
         "transform" => {
             // translate(-100%…) and friends park skip links and drawers off-screen
             let v = value.replace(' ', "");
