@@ -1,5 +1,5 @@
 // Sepia's Web API, written over the engine's __dom_* natives.
-// Anonymity: no cookies, storage in memory only, same-origin fetch only,
+// Anonymity: cookies in memory only, partitioned by site, storage in memory only, same-origin fetch only,
 // and navigator/screen report the same values for everyone.
 'use strict';
 (() => {
@@ -318,8 +318,8 @@
     get body() { return wrap(__dom_find_tag('body')); }
     get title() { return __dom_title(); }
     set title(v) { __dom_set_title(String(v)); }
-    get cookie() { return ''; }
-    set cookie(_) {}
+    get cookie() { return __cookie_get(); }
+    set cookie(v) { __cookie_set(String(v)); }
     get referrer() { return ''; }
     get readyState() { return G.__readyState || 'loading'; }
     get visibilityState() { return 'visible'; }
@@ -561,7 +561,7 @@
   G.navigator = {
     userAgent: 'sepia-browser/0.1', appName: 'Netscape', appVersion: '5.0', platform: '', vendor: '', product: 'Gecko',
     language: 'en-US', languages: ['en-US'], hardwareConcurrency: 2, deviceMemory: 4, maxTouchPoints: 0,
-    cookieEnabled: false, onLine: true, doNotTrack: null, webdriver: false, pdfViewerEnabled: false,
+    cookieEnabled: true, onLine: true, doNotTrack: null, webdriver: false, pdfViewerEnabled: false,
     plugins: [], mimeTypes: [], clipboard: { writeText: () => Promise.reject(new Error('blocked')), readText: () => Promise.reject(new Error('blocked')) },
     sendBeacon: () => false, vibrate: () => false, share: () => Promise.reject(new Error('blocked')),
     serviceWorker: undefined, geolocation: undefined, mediaDevices: undefined,
@@ -618,7 +618,7 @@
     const form = button && button.closest('form');
     if (form && (button.getAttribute('type') || 'submit') === 'submit') {
       const ok = form.dispatchEvent(new SubmitEvent('submit', { bubbles: true }));
-      if (ok) __page_navigate(formUrl(form));
+      if (ok) submitForm(form);
       return;
     }
     const box = el.closest('input[type=checkbox], input[type=radio]');
@@ -629,7 +629,13 @@
       if (href.startsWith('#')) location.hash = href; else __page_navigate(href);
     }
   };
-  function formUrl(form) {
+  function submitForm(form) {
+    const method = (form.getAttribute('method') || 'get').toLowerCase();
+    const action = form.getAttribute('action') || location.pathname + location.search;
+    if (method === 'post') __page_navigate(action, formBody(form));
+    else __page_navigate(formUrl(form));
+  }
+  function formBody(form) {
     const params = new URLSearchParams();
     for (const f of form.querySelectorAll('input, select, textarea')) {
       if (!f.name || f.disabled) continue;
@@ -637,8 +643,11 @@
       if (['submit', 'button', 'reset', 'file', 'image'].includes(f.type)) continue;
       params.append(f.name, f.value);
     }
+    return params.toString();
+  }
+  function formUrl(form) {
     const action = form.getAttribute('action') || location.pathname;
-    return action.split('?')[0] + '?' + params.toString();
+    return action.split('?')[0] + '?' + formBody(form);
   }
   G.__sepia_input = (id, value) => {
     const el = wrap(id);
@@ -652,7 +661,7 @@
     el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key }));
     if (down && key === 'Enter' && el.closest && el.closest('form') && el.localName === 'input') {
       const form = el.closest('form');
-      if (form.dispatchEvent(new SubmitEvent('submit', { bubbles: true }))) __page_navigate(formUrl(form));
+      if (form.dispatchEvent(new SubmitEvent('submit', { bubbles: true }))) submitForm(form);
       return;
     }
     if (down && key === 'Enter' && el.dispatchEvent) el.dispatchEvent(new Event('change', { bubbles: true }));

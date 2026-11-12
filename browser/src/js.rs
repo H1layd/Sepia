@@ -9,7 +9,8 @@
 //! What scripts cannot do (the anonymity rules that still hold):
 //! * network: `fetch` reaches only the page's own origin, through the same
 //!   chain and DoH as the page; no XHR, WebSocket, beacons, workers
-//! * storage: no cookies; localStorage/sessionStorage live in memory only
+//! * storage: cookies and localStorage/sessionStorage live in memory only,
+//!   cookies partitioned by site (see `cookies.rs`)
 //! * fingerprinting: navigator/screen report the same values for every
 //!   user, no canvas, WebGL, audio, battery, devices or high-resolution time
 //! * runaway code: loop and recursion limits stop a script, not the browser
@@ -28,7 +29,7 @@ use crate::css::{matches_selector, split_top_level, Selector, Stylesheet};
 use crate::dom::{self, Node};
 use crate::images::ImageMap;
 use crate::layout::{Fonts, Layout, Page};
-use crate::net::{fetch_with, Chain};
+use crate::net::{fetch_in, Chain, PageRequest};
 use crate::resolver::Resolver;
 use crate::url::Url;
 
@@ -275,6 +276,7 @@ struct State {
     title: Option<String>,
     focus: Option<usize>,
     navigate: Option<String>,
+    form: Option<String>,
     log: Vec<String>,
     dirty: bool,
     net: Option<Net>,
@@ -482,9 +484,16 @@ fn register(ctx: &mut Context) {
         });
         Ok(JsValue::undefined())
     });
-    native!(ctx, "__page_navigate", 1, |_, a, ctx| {
+    native!(ctx, "__page_navigate", 2, |_, a, ctx| {
         let target = arg_str(a, 0, ctx)?;
-        with(|st| st.navigate = Some(target));
+        let form = match a.get(1) {
+            Some(v) if !v.is_undefined() => Some(v.to_string(ctx)?.to_std_string_escaped()),
+            _ => None,
+        };
+        with(|st| {
+            st.navigate = Some(target);
+            st.form = form;
+        });
         Ok(JsValue::undefined())
     });
     native!(ctx, "__log", 1, |_, a, ctx| {
@@ -492,6 +501,19 @@ fn register(ctx: &mut Context) {
         with(|st| {
             if st.log.len() < 200 {
                 st.log.push(line);
+            }
+        });
+        Ok(JsValue::undefined())
+    });
+    native!(ctx, "__cookie_get", 0, |_, _, _| {
+        let line = with(|st| st.url.as_ref().map(|u| crate::cookies::script_view(&crate::cookies::site_of(&u.host), u)).unwrap_or_default());
+        Ok(s(line))
+    });
+    native!(ctx, "__cookie_set", 1, |_, a, ctx| {
+        let assignment = arg_str(a, 0, ctx)?;
+        with(|st| {
+            if let Some(u) = st.url.as_ref().filter(|u| u.scheme == "http" || u.scheme == "https") {
+                crate::cookies::store_from_script(&crate::cookies::site_of(&u.host), u, &assignment);
             }
         });
         Ok(JsValue::undefined())
@@ -506,7 +528,8 @@ fn register(ctx: &mut Context) {
             if url.scheme != net.origin.scheme || url.host != net.origin.host || url.port != net.origin.port {
                 return Err(format!("blocked: {} is not this page's origin", url.host));
             }
-            let response = fetch_with(&url, &net.chain, net.resolver.as_ref(), net.timeout)?;
+            let site = crate::cookies::site_of(&net.origin.host);
+            let response = fetch_in(&url, &net.chain, net.resolver.as_ref(), net.timeout, &PageRequest { site: &site, form: None })?;
             Ok((response.status, String::from_utf8_lossy(&response.body).into_owned(), url.to_string()))
         });
         match result {
@@ -541,6 +564,8 @@ pub struct Outcome {
     pub title: Option<String>,
     /// Somewhere to go: a link that was not prevented, or `location.assign`.
     pub navigate: Option<String>,
+    /// set when `navigate` is a form POST: its urlencoded body
+    pub form: Option<String>,
     /// A text field that took focus.
     pub focus: Option<(usize, String)>,
 }
@@ -638,6 +663,7 @@ impl Session {
         with(|st| {
             st.dirty = false;
             st.navigate = None;
+            st.form = None;
             st.focus = None;
         });
         let call = match &event {
@@ -653,14 +679,14 @@ impl Session {
             with(|st| st.log.push(format!("event: {e}")));
         }
         self.settle();
-        let (dirty, navigate, focus, title) = with(|st| {
+        let (dirty, navigate, form, focus, title) = with(|st| {
             let focus = st.focus.and_then(|f| {
                 let tag = st.dom.nodes[f].tag.clone();
                 matches!(tag.as_str(), "input" | "textarea").then(|| (f, st.dom.attr(f, "value").unwrap_or("").to_string()))
             });
-            (st.dirty, st.navigate.take(), focus, st.title.clone())
+            (st.dirty, st.navigate.take(), st.form.take(), focus, st.title.clone())
         });
-        Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, focus }
+        Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, form, focus }
     }
 }
 
@@ -762,7 +788,7 @@ mod tests {
              document.getElementById('o').textContent = [navigator.userAgent, document.cookie === '' ? 'nocookie' : 'cookie', localStorage.getItem('k'), screen.width, typeof Intl.PluralRules].join('|');",
         );
         let t = text(&s);
-        assert!(t.contains("sepia-browser/0.1|nocookie|v|1280|function"), "{t} {:?}", s.log());
+        assert!(t.contains("sepia-browser/0.1|cookie|v|1280|function"), "{t} {:?}", s.log());
     }
 
     #[test]
@@ -790,7 +816,7 @@ mod tests {
         let Ok(address) = std::env::var("SEPIA_BENCH_URL") else { return };
         let fonts = Fonts::load();
         let url = Url::parse(&address).unwrap();
-        let (loaded, session, _) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false, false).unwrap();
+        let (loaded, session, _) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false, false, None).unwrap();
         let mut session = session.expect("scripts ran");
         println!("note: {}  log: {:?}", loaded.note, session.log());
         let tree = session.tree();
@@ -810,7 +836,7 @@ mod tests {
         let Ok(address) = std::env::var("SEPIA_BENCH_URL") else { return };
         let fonts = Fonts::load();
         let url = Url::parse(&address).unwrap();
-        let (_, session, _) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false, false).unwrap();
+        let (_, session, _) = crate::page::open(&url, &Chain::default(), Some(&Resolver::default()), 1184.0, &fonts, Duration::from_secs(20), false, false, None).unwrap();
         let mut session = session.expect("session");
         fn buttons(node: &Node, out: &mut Vec<(usize, String)>) {
             if node.tag == "button" || (node.tag == "input" && matches!(node.attr("type"), Some("submit") | Some("button"))) {

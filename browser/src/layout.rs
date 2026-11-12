@@ -363,6 +363,11 @@ impl<'a> Layout<'a> {
 
         let parent_style = parent.cloned().or_else(|| ancestors.last().map(|n| default_for(n)));
         let mut style = compute(node, parent_style.as_ref(), self.sheet, ancestors, containing_width);
+        // a form control as a flex/grid item takes the size its line gives it
+        if self.blockify == Some(node as *const Node) && !self.measuring && matches!(node.tag.as_str(), "input" | "select" | "textarea") && style.width.is_none() {
+            style.width = Some((containing_width - style.margin.horizontal()).max(1.0));
+            style.border_box = true;
+        }
         if self.blockify == Some(node as *const Node) && matches!(style.display, Display::Inline | Display::InlineBlock) && node.tag != "img" && !matches!(node.tag.as_str(), "input" | "select" | "textarea") {
             style.display = match (style.display, style.inner) {
                 (Display::InlineBlock, Inner::Flex) => Display::Flex,

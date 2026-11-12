@@ -8,7 +8,7 @@ use crate::dom;
 use crate::images::{self, ImageMap};
 use crate::js::Session;
 use crate::layout::{Fonts, Layout, Page};
-use crate::net::{fetch_with, Chain, Response};
+use crate::net::{fetch_in, Chain, PageRequest, Response};
 use crate::protocols;
 use crate::resolver::Resolver;
 use crate::url::Url;
@@ -42,7 +42,7 @@ pub fn load(
     timeout: Duration,
     insecure_tls: bool,
 ) -> Result<Loaded, String> {
-    open(url, chain, resolver, width, fonts, timeout, insecure_tls, false).map(|(loaded, _, _)| loaded)
+    open(url, chain, resolver, width, fonts, timeout, insecure_tls, false, None).map(|(loaded, _, _)| loaded)
 }
 
 /// Images still on their way: the page is shown without them first.
@@ -62,7 +62,9 @@ pub fn open(
     timeout: Duration,
     insecure_tls: bool,
     defer_images: bool,
+    form: Option<&str>,
 ) -> Result<(Loaded, Option<Session>, Option<LateImages>), String> {
+    let final_site = crate::cookies::site_of(&url.host);
     require_overlay(url, chain)?;
     match url.scheme.as_str() {
         "gemini" => {
@@ -75,7 +77,24 @@ pub fn open(
             Ok((finish(url, text_page.html, 200, text_page.title, text_page.note, width, fonts, 0, None, false).0, None, None))
         }
         _ => {
-            let response: Response = fetch_with(url, chain, resolver, timeout)?;
+            // YouTube: videos play in mpv, search runs through yt-dlp; both
+            // through the browser's own path (see media.rs)
+            if let Some(route) = crate::media::route(url) {
+                let (title, html) = crate::media::page(&route, chain, resolver);
+                return Ok(finish(
+                    url,
+                    html,
+                    200,
+                    title,
+                    "youtube via mpv/yt-dlp".into(),
+                    width,
+                    fonts,
+                    0,
+                    Some(ImageFetch { chain, resolver, timeout, site: final_site.clone() }),
+                    defer_images,
+                ));
+            }
+            let response: Response = fetch_in(url, chain, resolver, timeout, &PageRequest { site: &final_site, form })?;
             let body = String::from_utf8_lossy(&response.body).to_string();
             Ok(finish(
                 url,
@@ -86,7 +105,7 @@ pub fn open(
                 width,
                 fonts,
                 0,
-                Some(ImageFetch { chain, resolver, timeout }),
+                Some(ImageFetch { chain, resolver, timeout, site: final_site.clone() }),
                 defer_images,
             ))
         }
@@ -99,6 +118,14 @@ struct ImageFetch<'a> {
     chain: &'a Chain,
     resolver: Option<&'a Resolver>,
     timeout: Duration,
+    /// the page's site: whose cookie partition subresources use
+    site: String,
+}
+
+impl ImageFetch<'_> {
+    fn get(&self, url: &Url, timeout: Duration) -> Result<Response, String> {
+        fetch_in(url, self.chain, self.resolver, timeout, &PageRequest { site: &self.site, form: None })
+    }
 }
 
 const MAX_IMAGES: usize = 64;
@@ -161,7 +188,7 @@ fn fetch_images(document: &dom::Node, base: &Url, how: &ImageFetch) -> (ImageMap
                 .iter()
                 .map(|(src, url)| {
                     scope.spawn(move || {
-                        let bitmap = fetch_with(url, how.chain, how.resolver, per_image)
+                        let bitmap = how.get(url, per_image)
                             .ok()
                             .filter(|r| r.status < 400)
                             .and_then(|r| images::decode(&r.body));
@@ -207,8 +234,8 @@ fn finish(
     // images either come with the page or follow it on their own thread
     let late: Option<LateImages> = match (&fetch, defer_images) {
         (Some(how), true) => {
-            let (doc, base, chain, resolver, timeout) = (document.clone(), url.clone(), how.chain.clone(), how.resolver.cloned(), how.timeout);
-            Some(std::thread::spawn(move || fetch_images(&doc, &base, &ImageFetch { chain: &chain, resolver: resolver.as_ref(), timeout }).0))
+            let (doc, base, chain, resolver, timeout, site) = (document.clone(), url.clone(), how.chain.clone(), how.resolver.cloned(), how.timeout, how.site.clone());
+            Some(std::thread::spawn(move || fetch_images(&doc, &base, &ImageFetch { chain: &chain, resolver: resolver.as_ref(), timeout, site }).0))
         }
         _ => None,
     };
@@ -292,7 +319,7 @@ fn load_fonts(sheet: &Stylesheet, fonts: &Fonts, how: &ImageFetch) -> usize {
                     scope.spawn(move || {
                         let font = face.sources.iter().find_map(|source| {
                             let url = Url::parse(source)?;
-                            let response = fetch_with(&url, how.chain, how.resolver, how.timeout.min(left)).ok()?;
+                            let response = how.get(&url, how.timeout.min(left)).ok()?;
                             (response.status < 400).then_some(())?;
                             crate::fonts::load_web_font(source, &response.body)
                         });
@@ -364,7 +391,7 @@ fn load_scripts(document: &dom::Node, base: &Url, how: &ImageFetch) -> crate::js
                 .iter()
                 .map(|url| {
                     scope.spawn(move || {
-                        let body = fetch_with(url, how.chain, how.resolver, timeout)
+                        let body = how.get(url, timeout)
                             .ok()
                             .filter(|r| r.status < 400 && r.body.len() <= MAX_SCRIPT_BYTES)
                             .map(|r| String::from_utf8_lossy(&r.body).into_owned());
@@ -509,7 +536,7 @@ fn load_styles(document: &dom::Node, base: &Url, how: Option<&ImageFetch>) -> (S
 }
 
 fn fetch_css(url: &Url, how: &ImageFetch, timeout: Duration) -> Option<String> {
-    let response = fetch_with(url, how.chain, how.resolver, timeout).ok()?;
+    let response = how.get(url, timeout).ok()?;
     if response.status >= 400 || response.body.len() > MAX_CSS_BYTES {
         return None;
     }

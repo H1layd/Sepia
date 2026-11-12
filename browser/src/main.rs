@@ -4,6 +4,7 @@
 //! own CSS parser and cascade, own block/inline layout, own software rasteriser.
 //! No engine, no webview, no driver.
 
+mod cookies;
 mod css;
 mod gui;
 mod dom;
@@ -11,6 +12,7 @@ mod fonts;
 mod html;
 mod images;
 mod js;
+mod media;
 mod svg;
 mod layout;
 mod net;
@@ -138,7 +140,6 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!("absent by construction");
     for row in [
         ("canvas / webgl", "not implemented: getContext() returns null, no audio, no devices"),
-        ("cookies", "not implemented: nothing is sent, stored or replayed"),
         ("webrtc", "not implemented: no UDP, no ICE, no local address exposure"),
         ("cache / profile", "no disk state: nothing written unless you --dump a PNG"),
         ("client hints", "none sent"),
@@ -152,16 +153,21 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     for header in [
         "User-Agent: sepia-browser/0.1",
         "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
-        "Accept-Encoding: identity",
+        "Accept-Encoding: gzip, deflate",
         "Accept-Language: en-US,en;q=0.9",
         "Connection: keep-alive (reused per site for 30 s, never across sites)",
     ] {
         println!("  {header}");
     }
     println!();
+    println!("kept in memory, never on disk");
+    println!("  {:<16} {}", "cookies", "partitioned by the site in the address bar (a tracker embedded in");
+    println!("  {:<16} {}", "", "two sites gets two unrelated jars), at most a day; the burn button and quit");
+    println!("  {:<16} {}", "", "erase them; sent only on page, subresource and same-origin fetch requests");
+    println!();
     println!("requests a page triggers");
     println!("  {:<16} {}", "images", "<img src> of http(s) pages, up to 64, 6 at a time: same path, DoH and");
-    println!("  {:<16} {}", "", "headers as the page (no Referer, no cookies); data: URIs decoded locally;");
+    println!("  {:<16} {}", "", "headers as the page (no Referer; the site's own cookies); data: URIs locally;");
     println!("  {:<16} {}", "", "1x1 (tracking) images are never requested; 8 s budget per page");
     println!("  {:<16} {}", "stylesheets", "<link rel=stylesheet> and @import, up to 24 (+8 imports), any origin, same");
     println!("  {:<16} {}", "", "path and headers as the page; 8 s budget; url() images in CSS are never");
@@ -170,8 +176,10 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!("  {:<16} {}", "", "headers as the page, 6 s budget; kept in memory only");
     println!("  {:<16} {}", "scripts", "<script src> fetched like stylesheets (any origin) and run in Boa; fetch()");
     println!("  {:<16} {}", "", "reaches only the page's own origin, GET, same path and headers; no XHR,");
-    println!("  {:<16} {}", "", "WebSocket, beacons or workers; no cookies; storage in memory only;");
+    println!("  {:<16} {}", "", "WebSocket, beacons or workers; cookies and storage in memory only;");
     println!("  {:<16} {}", "", "navigator/screen fixed (sepia-browser/0.1, en-US, 1280x800); 100 ms timers");
+    println!("  {:<16} {}", "youtube", "addresses open in mpv, search runs in yt-dlp; both only through a proxy on");
+    println!("  {:<16} {}", "", "127.0.0.1 that carries each CONNECT (ports 80/443) along the same path");
     println!();
     println!("network path");
     match resolver {

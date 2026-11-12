@@ -113,6 +113,58 @@ pub fn fetch_with(
     Err("too many redirects".into())
 }
 
+/// A page-level request: the site whose cookie partition applies, and an
+/// optional form body (which makes it a POST).
+pub struct PageRequest<'a> {
+    /// the top-level site (cookies are kept apart per site)
+    pub site: &'a str,
+    /// `application/x-www-form-urlencoded` body for a POST
+    pub form: Option<&'a str>,
+}
+
+/// `fetch_with` for pages and their subresources: first-party cookies of
+/// `ctx.site`'s partition are sent and stored (memory only), and a form body
+/// makes the first request a POST (a 301/302/303 after it continues as GET).
+pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Resolver>, timeout: Duration, ctx: &PageRequest) -> Result<Response, String> {
+    let mut current = url.clone();
+    let mut form = ctx.form;
+    for _ in 0..6 {
+        let cookie = crate::cookies::header_for(ctx.site, &current);
+        let mut request = format!("{} {} HTTP/1.1\r\n", if form.is_some() { "POST" } else { "GET" }, current.request_target());
+        for (name, value) in request_headers(&current) {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        if let Some(cookie) = &cookie {
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        if let Some(body) = form {
+            request.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+            request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        } else {
+            request.push_str("\r\n");
+        }
+        let response = fetch_request(&current, chain, resolver, timeout, request.as_bytes(), form.is_none())?;
+        for (name, value) in &response.headers {
+            if name.eq_ignore_ascii_case("set-cookie") {
+                crate::cookies::store(ctx.site, &current, value);
+            }
+        }
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            if let Some(next) = response.header("location").and_then(|l| current.resolve(l)) {
+                if !matches!(response.status, 307 | 308) {
+                    form = None;
+                }
+                current = next;
+                continue;
+            }
+        }
+        let mut response = response;
+        response.final_url = current.to_string();
+        return Ok(response);
+    }
+    Err("too many redirects".into())
+}
+
 /// The complete set of headers this browser will ever send. Keeping the list in
 /// one function makes it possible to test that nothing else (cookies, referer,
 /// client hints, auth) sneaks into the request.
@@ -124,7 +176,7 @@ pub fn request_headers(url: &Url) -> Vec<(String, String)> {
             "Accept".to_string(),
             "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8".to_string(),
         ),
-        ("Accept-Encoding".to_string(), "identity".to_string()),
+        ("Accept-Encoding".to_string(), "gzip, deflate".to_string()),
         ("Accept-Language".to_string(), "en-US,en;q=0.9".to_string()),
         ("Connection".to_string(), "keep-alive".to_string()),
     ]
@@ -145,6 +197,19 @@ fn fetch_once(
     resolver: Option<&crate::resolver::Resolver>,
     timeout: Duration,
 ) -> Result<Response, String> {
+    fetch_request(url, chain, resolver, timeout, build_request(url).as_bytes(), true)
+}
+
+/// Send `request` (a complete HTTP/1.1 request) to `url`'s origin. `reuse`
+/// allows a pooled connection (not for a POST: it must not be sent twice).
+fn fetch_request(
+    url: &Url,
+    chain: &Chain,
+    resolver: Option<&crate::resolver::Resolver>,
+    timeout: Duration,
+    request: &[u8],
+    reuse: bool,
+) -> Result<Response, String> {
     let last_is_http = chain
         .hops
         .last()
@@ -156,8 +221,8 @@ fn fetch_once(
 
     // reuse an open connection to this origin when there is one
     let key = pool_key(url, chain);
-    if let Some(stream) = take_pooled(&key) {
-        if let Ok((response, keep)) = exchange(stream, url) {
+    if let Some(stream) = reuse.then(|| take_pooled(&key)).flatten() {
+        if let Ok((response, keep)) = exchange(stream, url, request) {
             if let Some(stream) = keep {
                 put_pooled(key, stream);
             }
@@ -166,7 +231,7 @@ fn fetch_once(
         // a stale connection the server had closed: open a fresh one
     }
     let stream = connect_through(url, chain, resolver, timeout)?;
-    let (response, keep) = exchange(stream, url)?;
+    let (response, keep) = exchange(stream, url, request)?;
     if let Some(stream) = keep {
         put_pooled(key, stream);
     }
@@ -214,10 +279,9 @@ pub fn forget_connections() {
 
 /// One request and its response over `stream`; the stream comes back when
 /// it can carry another request.
-fn exchange(mut stream: Transport, url: &Url) -> Result<(Response, Option<Transport>), String> {
-    let request = build_request(url);
+fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Response, Option<Transport>), String> {
     stream
-        .write_all(request.as_bytes())
+        .write_all(request)
         .map_err(|e| format!("write failed: {e}"))?;
     stream.flush().ok();
 
@@ -311,6 +375,14 @@ fn exchange(mut stream: Transport, url: &Url) -> Result<(Response, Option<Transp
             }
         }
         body
+    };
+    // gzip / deflate bodies (asked for in Accept-Encoding) are inflated here
+    let body = match header("content-encoding").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("gzip") | Some("x-gzip") => gunzip(&body).ok_or("bad gzip body")?,
+        Some("deflate") => miniz_oxide::inflate::decompress_to_vec_zlib(&body)
+            .or_else(|_| miniz_oxide::inflate::decompress_to_vec(&body))
+            .map_err(|_| "bad deflate body".to_string())?,
+        _ => body,
     };
 
     // the connection can carry the next request when the response was
@@ -524,6 +596,62 @@ fn connect_through(
     }
 }
 
+/// A gzip member (RFC 1952) inflated: header fields skipped, CRC not checked.
+fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 8 {
+        return None;
+    }
+    let flags = data[3];
+    let mut at = 10;
+    if flags & 4 != 0 {
+        let extra = u16::from_le_bytes([*data.get(at)?, *data.get(at + 1)?]) as usize;
+        at += 2 + extra;
+    }
+    for bit in [8u8, 16] {
+        if flags & bit != 0 {
+            at += data.get(at..)?.iter().position(|b| *b == 0)? + 1;
+        }
+    }
+    if flags & 2 != 0 {
+        at += 2;
+    }
+    let end = data.len().checked_sub(8)?;
+    let mut out = miniz_oxide::inflate::decompress_to_vec(data.get(at..end)?).ok()?;
+    if out.len() > 64 * 1024 * 1024 {
+        out.truncate(64 * 1024 * 1024);
+    }
+    Some(out)
+}
+
+/// A TCP stream to `host:port` along the browser's own path: through the
+/// chain when there is one, else to an address found over DoH (the system
+/// resolver only when DoH was switched off). The media proxy uses this, so
+/// a player reaches the network exactly like a page does.
+pub fn open_path(
+    host: &str,
+    port: u16,
+    chain: &Chain,
+    resolver: Option<&crate::resolver::Resolver>,
+    timeout: Duration,
+) -> Result<TcpStream, String> {
+    if !chain.hops.is_empty() {
+        return open_tunnel(chain, host, port, timeout);
+    }
+    match resolver {
+        Some(resolver) => {
+            let mut last = String::from("no address");
+            for address in resolver.resolve(host, chain, timeout)? {
+                match tcp_connect_addr(address, port, timeout) {
+                    Ok(stream) => return Ok(stream),
+                    Err(err) => last = err,
+                }
+            }
+            Err(format!("connect failed via DoH: {last}"))
+        }
+        None => tcp_connect(host, port, timeout),
+    }
+}
+
 /// Establish a tunnel to `host:port` through the chain, honouring hop kinds.
 pub fn open_tunnel(chain: &Chain, host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
     let first = chain.hops.first().ok_or("empty chain")?;
@@ -719,6 +847,14 @@ fn socks5_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gunzip_inflates() {
+        // "hello\n" gzipped
+        let gz = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xe7, 0x02, 0x00, 0x20, 0x30, 0x3a, 0x36, 0x06, 0, 0, 0];
+        assert_eq!(gunzip(&gz).as_deref(), Some(&b"hello\n"[..]));
+        assert!(gunzip(b"not gzip at all......").is_none());
+    }
 
     /// `cargo test --release fetch_timing -- --ignored --nocapture`
     #[test]

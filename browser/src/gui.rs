@@ -386,6 +386,8 @@ pub struct Load {
     pub tab_id: u64,
     pub nav: u64,
     pub url: Url,
+    /// a form POST body (sent once; reloads and history go back to GET)
+    pub form: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -618,12 +620,27 @@ impl Ui {
         self.next_nav += 1;
         let tab = &mut self.tabs[index];
         tab.loading = Some(Pending { nav, url: url.clone(), push });
-        Load { tab_id: tab.id, nav, url }
+        Load { tab_id: tab.id, nav, url, form: None }
     }
 
     /// Parse what was typed in the address field and load it in the active tab.
     pub fn submit(&mut self) -> Option<Load> {
         let typed = self.input.trim().to_string();
+        // `yt something`: a YouTube search
+        if let Some(query) = typed.strip_prefix("yt ").map(str::trim).filter(|q| !q.is_empty()) {
+            let encoded: String = query
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+                    b' ' => "+".to_string(),
+                    b => format!("%{b:02X}"),
+                })
+                .collect();
+            if let Some(url) = Url::parse(&format!("https://www.youtube.com/results?search_query={encoded}")) {
+                self.editing = false;
+                return Some(self.start_load(self.active, url, true));
+            }
+        }
         let looks_like_address = !typed.is_empty()
             && !typed.contains(char::is_whitespace)
             && (typed.contains("://") || typed.contains('.') || typed.starts_with("localhost"));
@@ -2072,7 +2089,7 @@ impl App {
         self.field = None;
         std::thread::spawn(move || {
             // show the page as soon as HTML, CSS and scripts are in; images follow
-            let opened = page::open(&load.url, &chain, resolver.as_ref(), width, &fonts, Duration::from_secs(20), false, true);
+            let opened = page::open(&load.url, &chain, resolver.as_ref(), width, &fonts, Duration::from_secs(20), false, true, load.form.as_deref());
             let (result, session, late) = match opened {
                 Ok((loaded, session, late)) => {
                     let thumb = thumbnail(&fonts, &loaded.page, width);
@@ -2142,7 +2159,8 @@ impl App {
         if let Some(target) = outcome.navigate {
             let base = self.ui.active_loaded().map(|l| l.url.clone());
             if let Some(url) = base.and_then(|b| b.resolve(&target)).or_else(|| Url::parse(&target)) {
-                let load = self.ui.navigate(url);
+                let mut load = self.ui.navigate(url);
+                load.form = outcome.form;
                 self.spawn(load);
             }
         }
@@ -2295,6 +2313,7 @@ impl App {
                 // nothing of the past session stays: open connections, DNS answers
                 crate::net::forget_connections();
                 crate::resolver::forget();
+                crate::cookies::forget();
             }
             Hit::Page => {
                 // pages with scripts get the click; they decide what happens
