@@ -1653,7 +1653,8 @@ impl<'a> Layout<'a> {
         };
         let spacing = if style.border_collapse { 0.0 } else { px_attr(node, "cellspacing").unwrap_or(2.0) };
         let cellpadding = px_attr(node, "cellpadding").unwrap_or(1.0);
-        let cell_border = if frame > 0.0 { 1.0 } else { 0.0 };
+        // the HTML border attribute rules every cell; a CSS border on the table does not
+        let cell_border = if frame > 0.0 && node.attr("border").is_some() { 1.0 } else { 0.0 };
 
         // ----- rows and cells on the grid ---------------------------------
         let mut table_ancestors: Vec<&Node> = ancestors.to_vec();
@@ -2871,6 +2872,21 @@ mod tests {
         let s = (400.0 / nw).min(100.0 / nh);
         assert!((contain.w - nw * s).abs() < 0.5 && (contain.h - nh * s).abs() < 0.5, "{contain:?}");
         assert!((contain.x + contain.w - 400.0).abs() < 0.5 && (contain.y + contain.h - 200.0).abs() < 0.5, "right bottom: {contain:?}");
+    }
+
+    #[test]
+    fn a_block_table_still_lays_out_rows_as_rows() {
+        let doc = parse_document("<table style='display:block'><tr><th>Label</th><td>Value</td></tr></table>");
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 600.0).build(&doc);
+        let at = |w: &str| page.draws.iter().find_map(|d| match d {
+            Draw::Text { x, baseline, text, .. } if text.contains(w) => Some((*x, *baseline)),
+            _ => None,
+        }).unwrap();
+        let (label, value) = (at("Label"), at("Value"));
+        assert_eq!(label.1, value.1, "same row");
+        assert!(value.0 > label.0 + 20.0);
     }
 
     #[test]

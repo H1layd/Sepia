@@ -849,6 +849,11 @@ pub fn compute(
             apply(&mut style, &declaration.name, &value, containing_width);
         }
     }
+    // a <table> made display:block still holds rows: CSS wraps them in an
+    // anonymous table, so it lays out as one
+    if node.tag == "table" && matches!(style.display, Display::Block | Display::ListItem) {
+        style.display = Display::Table;
+    }
     if node.tag == "html" {
         ROOT_FONT.with(|r| r.set(style.font_size.clamp(4.0, 200.0)));
     }

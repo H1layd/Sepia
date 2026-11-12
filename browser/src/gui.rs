@@ -262,6 +262,37 @@ struct Pending {
     push: bool,
     /// the `#fragment` to scroll to once it is shown
     anchor: Option<String>,
+    /// the history entry being left (its page is kept as a snapshot)
+    from: usize,
+}
+
+/// A page left behind in a tab's history, kept in memory (with its script
+/// session, which stays alive under `nav`): going back to it is instant.
+struct Snapshot {
+    index: usize,
+    nav: u64,
+    loaded: Loaded,
+    thumb: Option<Image>,
+    scroll: f32,
+}
+
+/// How many pages back (and forward) a tab keeps ready.
+const SNAPSHOTS: usize = 6;
+
+/// The system clipboard as text (macOS `pbpaste`; nothing elsewhere).
+/// Local only: no network, no files.
+fn clipboard_text() -> String {
+    std::process::Command::new("pbpaste").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+}
+
+fn set_clipboard_text(text: &str) {
+    use std::io::Write;
+    if let Ok(mut child) = std::process::Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn() {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 /// `#fragment` out of a URL (our `Url` keeps it inside path or query).
@@ -318,6 +349,7 @@ struct Tab {
     loading: Option<Pending>,
     failure: Option<Failure>,
     scroll: f32,
+    snapshots: Vec<Snapshot>,
     anim: CardAnim,
 }
 
@@ -334,6 +366,7 @@ impl Tab {
             loading: None,
             failure: None,
             scroll: 0.0,
+            snapshots: Vec::new(),
             anim: CardAnim { tilt: theme::TILT_DEG, scale: 1.0, ..CardAnim::default() },
         }
     }
@@ -762,7 +795,8 @@ impl Ui {
         self.next_nav += 1;
         let (url, anchor) = split_fragment(url);
         let tab = &mut self.tabs[index];
-        tab.loading = Some(Pending { nav, url: url.clone(), push, anchor });
+        let from = tab.index;
+        tab.loading = Some(Pending { nav, url: url.clone(), push, anchor, from });
         Load { tab_id: tab.id, nav, url, form: None }
     }
 
@@ -804,25 +838,75 @@ impl Ui {
     }
 
     pub fn back(&mut self) -> Option<Load> {
-        let tab = &mut self.tabs[self.active];
+        let tab = &self.tabs[self.active];
         if tab.index == 0 || tab.history.is_empty() {
             self.toast(text::NO_BACK);
             return None;
         }
-        tab.index -= 1;
-        let url = tab.history[tab.index].clone();
-        Some(self.start_load(self.active, url, false))
+        self.go_to(tab.index - 1)
     }
 
     pub fn forward(&mut self) -> Option<Load> {
-        let tab = &mut self.tabs[self.active];
+        let tab = &self.tabs[self.active];
         if tab.index + 1 >= tab.history.len() {
             self.toast(text::NO_FORWARD);
             return None;
         }
-        tab.index += 1;
-        let url = tab.history[tab.index].clone();
-        Some(self.start_load(self.active, url, false))
+        self.go_to(tab.index + 1)
+    }
+
+    /// Move the active tab to history entry `target`: from its snapshot when
+    /// one is kept (instant, scroll and scripts as they were), else loaded.
+    fn go_to(&mut self, target: usize) -> Option<Load> {
+        let active = self.active;
+        let tab = &mut self.tabs[active];
+        if let Some(pos) = tab.snapshots.iter().position(|s| s.index == target) {
+            let snap = tab.snapshots.remove(pos);
+            if let Some(current) = tab.loaded.take() {
+                tab.snapshots.push(Snapshot { index: tab.index, nav: tab.live_nav, loaded: current, thumb: tab.thumb.take(), scroll: tab.scroll });
+            }
+            tab.loaded = Some(snap.loaded);
+            tab.thumb = snap.thumb;
+            tab.scroll = snap.scroll;
+            tab.live_nav = snap.nav;
+            tab.index = target;
+            tab.loading = None;
+            tab.failure = None;
+            tab.generation += 1;
+            Self::trim_snapshots(tab);
+            return None;
+        }
+        let url = tab.history[target].clone();
+        let load = self.start_load(active, url, false);
+        self.tabs[active].index = target;
+        Some(load)
+    }
+
+    fn trim_snapshots(tab: &mut Tab) {
+        // keep the entries nearest to where the tab is
+        let at = tab.index;
+        tab.snapshots.sort_by_key(|s| s.index.abs_diff(at));
+        tab.snapshots.truncate(SNAPSHOTS);
+    }
+
+    /// Every (tab, nav) whose page is shown, loading or kept: their script
+    /// sessions stay, the rest can end.
+    pub fn kept_navs(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            out.push((tab.id, tab.live_nav));
+            if let Some(p) = &tab.loading {
+                out.push((tab.id, p.nav));
+            }
+            out.extend(tab.snapshots.iter().map(|s| (tab.id, s.nav)));
+        }
+        out
+    }
+
+    /// ⌘-click: the link opens in a new tab behind the current one.
+    pub fn open_in_background(&mut self, url: Url) -> Load {
+        let index = self.push_tab();
+        self.start_load(index, url, true)
     }
 
     pub fn reload(&mut self) -> Option<Load> {
@@ -838,9 +922,19 @@ impl Ui {
             return;
         }
         let pending = tab.loading.take().expect("checked above");
+        // the page being left stays ready for going back to it
+        if let Some(old) = tab.loaded.take() {
+            if tab.failure.is_none() {
+                tab.snapshots.retain(|s| s.index != pending.from);
+                tab.snapshots.push(Snapshot { index: pending.from, nav: tab.live_nav, loaded: old, thumb: tab.thumb.take(), scroll: tab.scroll });
+            }
+        }
         if pending.push {
             if !tab.history.is_empty() {
                 tab.history.truncate(tab.index + 1);
+                // forward entries are gone, and so are their pages
+                let keep = tab.index;
+                tab.snapshots.retain(|s| s.index <= keep);
             }
             tab.history.push(pending.url.clone());
             tab.index = tab.history.len() - 1;
@@ -863,6 +957,7 @@ impl Ui {
                 tab.failure = Some(Failure { url: pending.url, reason });
             }
         }
+        Self::trim_snapshots(tab);
     }
 
     // ----- tabs -----------------------------------------------------------
@@ -904,7 +999,10 @@ impl Ui {
     /// Close every tab and forget all history. Everything lives in memory
     /// only, so dropping it is the whole job.
     pub fn burn(&mut self) {
+        // every tab, with its kept pages and find highlights
         self.tabs.clear();
+        self.find = None;
+        self.finding = false;
         self.active = self.push_tab();
         self.offset = 0;
         self.editing = false;
@@ -1071,6 +1169,15 @@ impl Ui {
             self.replace_input = false;
         }
         self.input.extend(typed.chars().filter(|c| !c.is_control()));
+    }
+
+    pub fn input_text(&self) -> &str {
+        &self.input
+    }
+
+    /// ⌘A: the next key replaces the whole field.
+    pub fn select_all(&mut self) {
+        self.replace_input = !self.input.is_empty();
     }
 
     pub fn backspace(&mut self) {
@@ -2612,7 +2719,7 @@ struct App {
     proxy: EventLoopProxy<PageMsg>,
     ui: Ui,
     /// Each tab's live page: the channel to the thread holding its scripts.
-    sessions: HashMap<u64, (u64, mpsc::Sender<PageEvent>)>,
+    sessions: HashMap<(u64, u64), mpsc::Sender<PageEvent>>,
     field: Option<Field>,
     frame: Canvas,
     page_cache: Option<PageCache>,
@@ -2637,8 +2744,9 @@ impl App {
         let proxy = self.proxy.clone();
         let width = self.ui.viewport().w;
         let (events, inbox) = mpsc::channel::<PageEvent>();
-        // replacing the sender ends the previous page's thread
-        self.sessions.insert(load.tab_id, (load.nav, events));
+        // pages kept for back/forward keep their threads; dropping a sender ends one
+        self.sessions.insert((load.tab_id, load.nav), events);
+        self.prune_sessions();
         self.field = None;
         std::thread::spawn(move || {
             // show the page as soon as HTML, CSS and scripts are in; images follow
@@ -2677,9 +2785,9 @@ impl App {
     /// Send an event to the active page's scripts; false when it has none.
     fn to_page(&self, event: PageEvent) -> bool {
         let Some((tab_id, nav)) = self.ui.active_live() else { return false };
-        match self.sessions.get(&tab_id) {
-            Some((live, tx)) if *live == nav => tx.send(event).is_ok(),
-            _ => false,
+        match self.sessions.get(&(tab_id, nav)) {
+            Some(tx) => tx.send(event).is_ok(),
+            None => false,
         }
     }
 
@@ -2762,9 +2870,22 @@ impl App {
     }
 
     fn run(&mut self, load: Option<Load>) {
-        if let Some(load) = load {
-            self.spawn(load);
+        match load {
+            Some(load) => self.spawn(load),
+            // restored from a snapshot
+            None => {
+                self.field = None;
+                self.prune_sessions();
+                self.update_title();
+                self.window.request_redraw();
+            }
         }
+    }
+
+    /// End the script threads of pages no tab shows, loads or keeps.
+    fn prune_sessions(&mut self) {
+        let kept = self.ui.kept_navs();
+        self.sessions.retain(|key, _| kept.contains(key));
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -2874,7 +2995,7 @@ impl App {
             Hit::TabClose(i) => {
                 self.ui.close_tab(i);
                 let ui = &self.ui;
-                self.sessions.retain(|id, _| ui.has_tab(*id));
+                self.sessions.retain(|(id, _), _| ui.has_tab(*id));
             }
             Hit::Burn => {
                 self.ui.burn();
@@ -2888,7 +3009,8 @@ impl App {
             }
             Hit::Page => {
                 // pages with scripts get the click; they decide what happens
-                if let Some((node, href)) = self.element_at(x, y) {
+                let new_tab = self.mods.super_key() || self.mods.control_key();
+                if let Some((node, href)) = self.element_at(x, y).filter(|_| !new_tab) {
                     self.field = None;
                     if self.to_page(PageEvent::Click { node, href }) {
                         return;
@@ -2896,7 +3018,11 @@ impl App {
                 }
                 if let Some(href) = self.link_at(x, y) {
                     if let Some(url) = Url::parse(&href) {
-                        if !self.ui.jump(&url) {
+                        if self.mods.super_key() || self.mods.control_key() {
+                            // ⌘-click: a background tab
+                            let load = self.ui.open_in_background(url);
+                            self.spawn(load);
+                        } else if !self.ui.jump(&url) {
                             let load = self.ui.navigate(url);
                             self.spawn(load);
                         }
@@ -2914,6 +3040,47 @@ impl App {
             match key {
                 Key::Character(c) => match c.as_str() {
                     "l" | "д" => self.ui.begin_editing(true),
+                    "v" | "м" => {
+                        let pasted: String = clipboard_text().chars().map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c }).collect();
+                        let pasted = pasted.trim().to_string();
+                        if !pasted.is_empty() {
+                            if self.ui.editing {
+                                self.ui.type_text(&pasted);
+                                if self.ui.finding {
+                                    self.ui.find_step(&self.fonts, 0);
+                                }
+                            } else if self.field.is_some() {
+                                self.type_into_field(&Key::Character("".into()), Some(&pasted));
+                            } else {
+                                // pasting with nothing focused: straight into the address field
+                                self.ui.begin_editing(false);
+                                self.ui.type_text(&pasted);
+                            }
+                        }
+                    }
+                    "c" | "с" | "x" | "ч" => {
+                        let cut = matches!(c.as_str(), "x" | "ч");
+                        let text = if self.ui.editing {
+                            self.ui.input_text().to_string()
+                        } else if let Some(field) = &self.field {
+                            field.value.clone()
+                        } else {
+                            // nothing selected on a page: the page address
+                            self.ui.active_loaded().map(|l| l.url.to_string()).unwrap_or_default()
+                        };
+                        if !text.is_empty() {
+                            set_clipboard_text(&text);
+                            if cut && self.ui.editing {
+                                self.ui.select_all();
+                                self.ui.backspace();
+                            }
+                        }
+                    }
+                    "a" | "ф" => {
+                        if self.ui.editing {
+                            self.ui.select_all();
+                        }
+                    }
                     "f" | "а" => self.ui.begin_find(),
                     "g" | "п" => {
                         if self.ui.find_status().is_some() {
@@ -2925,7 +3092,7 @@ impl App {
                     "w" | "ц" => {
                         self.ui.close_active();
                         let ui = &self.ui;
-                        self.sessions.retain(|id, _| ui.has_tab(*id));
+                        self.sessions.retain(|(id, _), _| ui.has_tab(*id));
                     }
                     "r" | "к" => {
                         let load = self.ui.reload();
@@ -3121,6 +3288,7 @@ pub fn run(initial: Option<String>, chain: Chain, resolver: Option<Resolver>) ->
         .run(move |event, target| match event {
             Event::UserEvent(PageMsg::Done(done)) => {
                 app.ui.finish(done.tab_id, done.nav, done.result);
+                app.prune_sessions();
                 app.page_cache = None;
                 app.update_title();
                 app.window.request_redraw();
@@ -3236,6 +3404,31 @@ mod tests {
         let loaded = fake_loaded(url, title);
         let thumb = thumbnail(&fonts, &loaded.page, 1184.0);
         ui.finish(load.tab_id, load.nav, Ok((loaded, thumb)));
+    }
+
+    #[test]
+    fn back_and_forward_come_from_memory() {
+        let mut ui = Ui::new(Transport::Direct, true);
+        open(&mut ui, "https://a.example/", "A");
+        ui.scroll_to(40.0);
+        let a_scroll = ui.active_scroll();
+        let a_nav = ui.active_live().unwrap().1;
+        open(&mut ui, "https://b.example/", "B");
+        assert!(ui.back().is_none(), "no load: the page is kept");
+        assert_eq!(ui.active_loaded().unwrap().title, "A");
+        assert_eq!(ui.active_scroll(), a_scroll, "scroll as it was");
+        assert_eq!(ui.active_live().unwrap().1, a_nav, "its script session answers again");
+        assert!(ui.kept_navs().len() >= 2, "B is kept too");
+        assert!(ui.forward().is_none());
+        assert_eq!(ui.active_loaded().unwrap().title, "B");
+        // a new page from A drops B (the forward entry) with its snapshot
+        assert!(ui.back().is_none());
+        open(&mut ui, "https://c.example/", "C");
+        assert!(ui.forward().is_none() && ui.active_loaded().unwrap().title == "C", "nothing forward of C");
+        assert!(ui.back().is_none());
+        assert_eq!(ui.active_loaded().unwrap().title, "A");
+        let tab = &ui.tabs[ui.active];
+        assert!(tab.snapshots.iter().all(|s| s.loaded.title != "B"), "B is gone");
     }
 
     #[test]
@@ -3414,13 +3607,17 @@ mod tests {
         let mut ui = Ui::new(Transport::Tor, true);
         open(&mut ui, "https://a.example/", "A");
         open(&mut ui, "https://b.example/", "B");
+        // without a kept page, going back loads it again
+        ui.tabs[ui.active].snapshots.clear();
         let back = ui.back().expect("can go back");
         assert_eq!(back.url.host, "a.example");
         ui.finish(back.tab_id, back.nav, Err("timed out".into()));
         assert!(ui.tab().failure.is_some());
         assert!(ui.active_page().is_none(), "failure screen, not the stale page");
-        let fwd = ui.forward().expect("can go forward");
-        assert_eq!(fwd.url.host, "b.example");
+        // B was kept when we left it: forward shows it again at once
+        assert!(ui.forward().is_none());
+        assert_eq!(ui.active_loaded().unwrap().url.host, "b.example");
+        assert!(ui.tab().failure.is_none());
         // a superseded navigation is ignored
         let stale = ui.reload().unwrap();
         let fresh = ui.reload().unwrap();
@@ -3512,6 +3709,7 @@ mod tests {
             ui.gesture(30.0, 2.0);
         }
         dump(&frame(&ui, 1.0), "swipe-back");
+        ui.tabs[ui.active].snapshots.clear();
         let load = ui.gesture_end().expect("long swipe goes back");
         assert_eq!(load.url.path, "/");
         ui.finish(load.tab_id, load.nav, Err("x".into()));
