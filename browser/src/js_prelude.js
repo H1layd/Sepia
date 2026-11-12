@@ -487,16 +487,75 @@
     json() { return Promise.resolve().then(() => JSON.parse(this.__body)); }
     clone() { return new Response(this.__body, { status: this.status, url: this.url }); }
   }
-  // same-origin only, through the page's chain (enforced natively)
+  // the page's own site only, through the page's chain (enforced natively);
+  // custom request headers are dropped, only Content-Type goes out
+  function bodyOf(b, headers) {
+    let type = headers && (headers.get ? headers.get('content-type') : (headers['Content-Type'] || headers['content-type']));
+    if (b == null) return [undefined, undefined];
+    if (b instanceof URLSearchParams) return [b.toString(), type || 'application/x-www-form-urlencoded;charset=UTF-8'];
+    if (typeof FormData !== 'undefined' && b instanceof FormData) return [new URLSearchParams(b.__pairs).toString(), 'application/x-www-form-urlencoded;charset=UTF-8'];
+    if (typeof b === 'object' && !(typeof b === 'string')) return [JSON.stringify(b), type || 'application/json'];
+    return [String(b), type || 'text/plain;charset=UTF-8'];
+  }
+  function sendNow(url, method, body, headers) {
+    const [data, type] = bodyOf(body, headers);
+    return __fetch(String(url), method ? String(method) : (data === undefined ? 'GET' : 'POST'), data, type);
+  }
   G.fetch = (input, opts = {}) => new Promise((resolve, reject) => {
     try {
       const url = typeof input === 'string' ? input : input && (input.href || input.url);
-      if (opts.method && String(opts.method).toUpperCase() !== 'GET') throw new TypeError('only GET is supported');
-      const [status, body, finalUrl] = __fetch(String(url));
-      resolve(new Response(body, { status, url: finalUrl }));
+      const req = input && typeof input === 'object' && input.url ? input : {};
+      const [status, body, finalUrl, type] = sendNow(url, opts.method || req.method, opts.body ?? req.body, opts.headers || req.headers);
+      const response = new Response(body, { status, url: finalUrl });
+      if (type) response.headers.set('content-type', type);
+      resolve(response);
     } catch (e) { reject(e instanceof Error ? e : new TypeError(String(e))); }
   });
-  G.Request = class Request { constructor(u, o = {}) { this.url = String(u); this.method = o.method || 'GET'; } };
+  G.Request = class Request { constructor(u, o = {}) { this.url = String(u && u.url || u); this.method = o.method || 'GET'; this.body = o.body; this.headers = o.headers; } };
+  G.FormData = class FormData {
+    constructor(form) {
+      this.__pairs = [];
+      if (form && form.querySelectorAll) for (const f of form.querySelectorAll('input, select, textarea')) {
+        if (!f.name || f.disabled || ((f.type === 'checkbox' || f.type === 'radio') && !f.checked) || ['submit', 'button', 'reset', 'file', 'image'].includes(f.type)) continue;
+        this.__pairs.push([f.name, f.value]);
+      }
+    }
+    append(k, v) { this.__pairs.push([String(k), String(v)]); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    get(k) { const p = this.__pairs.find(p => p[0] === k); return p ? p[1] : null; }
+    getAll(k) { return this.__pairs.filter(p => p[0] === k).map(p => p[1]); }
+    has(k) { return this.__pairs.some(p => p[0] === k); }
+    delete(k) { this.__pairs = this.__pairs.filter(p => p[0] !== k); }
+    entries() { return this.__pairs[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.__pairs[Symbol.iterator](); }
+    forEach(f) { this.__pairs.forEach(([k, v]) => f(v, k, this)); }
+  };
+  // XMLHttpRequest over the same native call; events fire on the next tick
+  G.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
+    constructor() { super(); this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this.response = ''; this.responseType = ''; this.responseURL = ''; this.__h = {}; this.__rh = ''; this.timeout = 0; this.withCredentials = false; this.upload = new EventTarget(); }
+    open(method, url) { this.__m = method; this.__u = url; this.readyState = 1; }
+    setRequestHeader(k, v) { this.__h[k] = v; }
+    getResponseHeader(k) { return String(k).toLowerCase() === 'content-type' ? (this.__rh || null) : null; }
+    getAllResponseHeaders() { return this.__rh ? 'content-type: ' + this.__rh + '\r\n' : ''; }
+    overrideMimeType() {}
+    abort() { this.__aborted = true; }
+    send(body) {
+      setTimeout(() => {
+        if (this.__aborted) return;
+        const fire = (type) => { const e = new Event(type); this.dispatchEvent(e); const h = this['on' + type]; if (typeof h === 'function') h.call(this, e); };
+        try {
+          const [status, text, finalUrl, type] = sendNow(this.__u, this.__m, body, this.__h);
+          Object.assign(this, { status, responseText: text, responseURL: finalUrl, __rh: type, readyState: 4, statusText: status === 200 ? 'OK' : '' });
+          this.response = this.responseType === 'json' ? (() => { try { return JSON.parse(text); } catch (_) { return null; } })() : text;
+          fire('readystatechange'); fire('load');
+        } catch (e) {
+          this.readyState = 4; fire('readystatechange'); fire('error');
+        }
+        fire('loadend');
+      }, 0);
+    }
+  };
+  for (const [k, v] of Object.entries({ UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 })) G.XMLHttpRequest[k] = v;
   G.AbortController = class AbortController { constructor() { this.signal = { aborted: false, addEventListener() {}, removeEventListener() {} }; } abort() { this.signal.aborted = true; } };
 
   // Intl, the parts pages lean on (the engine is built without ICU data)

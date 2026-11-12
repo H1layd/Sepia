@@ -2041,6 +2041,10 @@ impl<'a> Layout<'a> {
                 let kind = node.attr("type").unwrap_or("text").to_ascii_lowercase();
                 match kind.as_str() {
                     "hidden" => return None,
+                    "checkbox" | "radio" if style.hidden => {
+                        // opacity:0 checkboxes behind custom toggles and menus
+                        return Some((Page::default(), 0.0, 0.0, 0.0));
+                    }
                     "checkbox" | "radio" => {
                         let size = 13.0;
                         let mut page = Page::default();

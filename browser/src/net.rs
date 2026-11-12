@@ -118,8 +118,18 @@ pub fn fetch_with(
 pub struct PageRequest<'a> {
     /// the top-level site (cookies are kept apart per site)
     pub site: &'a str,
-    /// `application/x-www-form-urlencoded` body for a POST
+    /// a request body (a form, or a script's fetch): makes it a POST unless `method` says otherwise
     pub form: Option<&'a str>,
+    /// the body's type; default `application/x-www-form-urlencoded`
+    pub content_type: Option<&'a str>,
+    /// GET/POST/PUT/PATCH/DELETE/HEAD from a script; None = by the body
+    pub method: Option<&'a str>,
+}
+
+impl<'a> PageRequest<'a> {
+    pub fn get(site: &'a str) -> PageRequest<'a> {
+        PageRequest { site, form: None, content_type: None, method: None }
+    }
 }
 
 /// `fetch_with` for pages and their subresources: first-party cookies of
@@ -128,9 +138,20 @@ pub struct PageRequest<'a> {
 pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Resolver>, timeout: Duration, ctx: &PageRequest) -> Result<Response, String> {
     let mut current = url.clone();
     let mut form = ctx.form;
+    let mut method = match ctx.method.map(str::to_ascii_uppercase) {
+        Some(m) if ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].contains(&m.as_str()) => m,
+        Some(m) => return Err(format!("method {m} is not allowed")),
+        None if form.is_some() => "POST".into(),
+        None => "GET".into(),
+    };
+    if method == "GET" || method == "HEAD" {
+        form = None;
+    }
+    // only a plain media type: nothing that could smuggle another header in
+    let content_type = ctx.content_type.filter(|t| t.len() < 120 && t.chars().all(|c| c.is_ascii_graphic() || c == ' ')).unwrap_or("application/x-www-form-urlencoded");
     for _ in 0..6 {
         let cookie = crate::cookies::header_for(ctx.site, &current);
-        let mut request = format!("{} {} HTTP/1.1\r\n", if form.is_some() { "POST" } else { "GET" }, current.request_target());
+        let mut request = format!("{method} {} HTTP/1.1\r\n", current.request_target());
         for (name, value) in request_headers(&current) {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -138,7 +159,7 @@ pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Res
             request.push_str(&format!("Cookie: {cookie}\r\n"));
         }
         if let Some(body) = form {
-            request.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+            request.push_str(&format!("Content-Type: {content_type}\r\n"));
             request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
         } else {
             request.push_str("\r\n");
@@ -153,6 +174,7 @@ pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Res
             if let Some(next) = response.header("location").and_then(|l| current.resolve(l)) {
                 if !matches!(response.status, 307 | 308) {
                     form = None;
+                    method = "GET".into();
                 }
                 current = next;
                 continue;

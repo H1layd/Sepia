@@ -94,7 +94,7 @@ pub fn open(
                     defer_images,
                 ));
             }
-            let response: Response = fetch_in(url, chain, resolver, timeout, &PageRequest { site: &final_site, form })?;
+            let response: Response = fetch_in(url, chain, resolver, timeout, &PageRequest { form, ..PageRequest::get(&final_site) })?;
             let body = String::from_utf8_lossy(&response.body).to_string();
             Ok(finish(
                 url,
@@ -124,7 +124,7 @@ struct ImageFetch<'a> {
 
 impl ImageFetch<'_> {
     fn get(&self, url: &Url, timeout: Duration) -> Result<Response, String> {
-        fetch_in(url, self.chain, self.resolver, timeout, &PageRequest { site: &self.site, form: None })
+        fetch_in(url, self.chain, self.resolver, timeout, &PageRequest::get(&self.site))
     }
 }
 

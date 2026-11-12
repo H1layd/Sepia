@@ -518,22 +518,32 @@ fn register(ctx: &mut Context) {
         });
         Ok(JsValue::undefined())
     });
-    native!(ctx, "__fetch", 1, |_, a, ctx| {
-        // same-origin only, through the page's chain; returns [status, body, url]
+    native!(ctx, "__fetch", 4, |_, a, ctx| {
+        // the page's own site only (its origin and sibling subdomains, same
+        // scheme), through the page's chain; returns [status, body, url, content-type]
         let target = arg_str(a, 0, ctx)?;
-        let result = with(|st| -> Result<(u16, String, String), String> {
+        let opt = |i: usize, ctx: &mut Context| -> JsResult<Option<String>> {
+            match a.get(i) {
+                Some(v) if !v.is_undefined() && !v.is_null() => Ok(Some(v.to_string(ctx)?.to_std_string_escaped())),
+                _ => Ok(None),
+            }
+        };
+        let (method, body, content_type) = (opt(1, ctx)?, opt(2, ctx)?, opt(3, ctx)?);
+        let result = with(|st| -> Result<(u16, String, String, String), String> {
             let net = st.net.as_ref().ok_or("network is off")?;
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
             let url = base.resolve(&target).ok_or("bad URL")?;
-            if url.scheme != net.origin.scheme || url.host != net.origin.host || url.port != net.origin.port {
-                return Err(format!("blocked: {} is not this page's origin", url.host));
-            }
             let site = crate::cookies::site_of(&net.origin.host);
-            let response = fetch_in(&url, &net.chain, net.resolver.as_ref(), net.timeout, &PageRequest { site: &site, form: None })?;
-            Ok((response.status, String::from_utf8_lossy(&response.body).into_owned(), url.to_string()))
+            if url.scheme != net.origin.scheme || crate::cookies::site_of(&url.host) != site {
+                return Err(format!("blocked: {} is not this page's site", url.host));
+            }
+            let request = PageRequest { site: &site, form: body.as_deref(), content_type: content_type.as_deref(), method: method.as_deref() };
+            let response = fetch_in(&url, &net.chain, net.resolver.as_ref(), net.timeout, &request)?;
+            let kind = response.header("content-type").unwrap_or("").to_string();
+            Ok((response.status, String::from_utf8_lossy(&response.body).into_owned(), response.final_url.clone(), kind))
         });
         match result {
-            Ok((status, body, url)) => Ok(JsArray::from_iter([JsValue::from(status as f64), s(body), s(url)], ctx).into()),
+            Ok((status, body, url, kind)) => Ok(JsArray::from_iter([JsValue::from(status as f64), s(body), s(url), s(kind)], ctx).into()),
             Err(e) => Err(boa_engine::JsNativeError::typ().with_message(format!("fetch failed: {e}")).into()),
         }
     });
@@ -789,6 +799,21 @@ mod tests {
         );
         let t = text(&s);
         assert!(t.contains("sepia-browser/0.1|cookie|v|1280|function"), "{t} {:?}", s.log());
+    }
+
+    #[test]
+    fn xhr_and_form_data_without_network() {
+        let s = run(
+            "<form id=f><input name=q value='rust lang'><input type=checkbox name=c></form><p id='o'></p>",
+            "const fd = new FormData(document.getElementById('f')); fd.append('x', '1');
+             const out = document.getElementById('o');
+             const x = new XMLHttpRequest(); x.open('POST', '/api'); 
+             x.onerror = () => { out.textContent = [...fd].map(p => p.join('=')).join('&') + '|error|' + x.readyState; };
+             x.onload = () => { out.textContent = 'loaded'; };
+             x.send(fd);",
+        );
+        let t = text(&s);
+        assert!(t.contains("q=rust lang&x=1|error|4"), "{t} {:?}", s.log());
     }
 
     #[test]

@@ -245,6 +245,8 @@ pub struct Style {
     pub clip_y: bool,
     /// clear: start below the floats before it
     pub clear: bool,
+    /// mask-image: the background is only a colour for an icon shape we cannot cut out
+    pub masked: bool,
     /// a transform that moves the box a whole box-length or more off its place
     pub moved_away: bool,
     /// grid-template-columns, resolved at layout (it needs the width)
@@ -306,6 +308,7 @@ impl Default for Style {
             clip_x: false,
             clip_y: false,
             clear: false,
+            masked: false,
             moved_away: false,
             grid_columns: None,
             grid_span: GridSpan::Auto,
@@ -752,6 +755,11 @@ pub fn compute(
             }
             apply(&mut style, &declaration.name, &value, containing_width);
         }
+    }
+    if style.masked {
+        // a solid square where an icon should be reads as a glitch; draw nothing
+        style.background = None;
+        style.gradient = None;
     }
     if style.position == Position::Absolute || style.position == Position::Fixed {
         // Out-of-flow boxes we cannot place: screen-reader-only text (1px,
@@ -1207,6 +1215,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             style.clip_x = matches!(x, "hidden" | "clip");
             style.clip_y = matches!(y, "hidden" | "clip");
         }
+        "mask-image" | "-webkit-mask-image" | "mask" | "-webkit-mask" => style.masked = value.contains("url("),
         "clear" => style.clear = matches!(value, "both" | "left" | "right" | "inline-start" | "inline-end"),
         "overflow-x" => style.clip_x = matches!(value, "hidden" | "clip"),
         "overflow-y" => style.clip_y = matches!(value, "hidden" | "clip"),

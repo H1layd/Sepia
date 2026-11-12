@@ -175,8 +175,9 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!("  {:<16} {}", "fonts", "@font-face files (TTF, OTF, WOFF; not WOFF2), up to 16, same path and");
     println!("  {:<16} {}", "", "headers as the page, 6 s budget; kept in memory only");
     println!("  {:<16} {}", "scripts", "<script src> fetched like stylesheets (any origin) and run in Boa; fetch()");
-    println!("  {:<16} {}", "", "reaches only the page's own origin, GET, same path and headers; no XHR,");
-    println!("  {:<16} {}", "", "WebSocket, beacons or workers; cookies and storage in memory only;");
+    println!("  {:<16} {}", "", "and XMLHttpRequest reach only the page's own site (its subdomains, same");
+    println!("  {:<16} {}", "", "scheme), any method, same path and headers plus Content-Type; script headers");
+    println!("  {:<16} {}", "", "are dropped; no WebSocket, beacons or workers; cookies and storage in memory;");
     println!("  {:<16} {}", "", "navigator/screen fixed (sepia-browser/0.1, en-US, 1280x800); 100 ms timers");
     println!("  {:<16} {}", "youtube", "addresses open in mpv, search runs in yt-dlp; both only through a proxy on");
     println!("  {:<16} {}", "", "127.0.0.1 that carries each CONNECT (ports 80/443) along the same path");
