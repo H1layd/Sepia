@@ -219,6 +219,9 @@ struct InlineItem {
     own_background: Option<Color>,
     /// `<img>`: a replaced box on the line instead of text.
     img: Option<ImgBox>,
+    /// the inline elements this piece sits in (their `data-sepia-id`s):
+    /// each gets the piece's rectangle as part of its geometry
+    owners: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -240,6 +243,9 @@ pub struct Layout<'a> {
     /// Measuring min/max-content for table columns: lines start at the left
     /// edge whatever their alignment, so the extent of the draws is the width.
     measuring: bool,
+    /// inside a min/max-content measurement (at any depth): positioned
+    /// boxes are out of flow and give their ancestors no size
+    intrinsic: bool,
     /// text-indent waiting for the next line flushed (the block's first)
     pending_indent: f32,
     /// bottom margin of the block laid out last, for collapsing with what follows
@@ -290,8 +296,8 @@ fn out_of_flow(style: &Style) -> bool {
 
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
-        crate::style::set_viewport(viewport_width, 800.0);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
+        crate::style::set_viewport(viewport_width, sheet.viewport_height);
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -322,6 +328,7 @@ impl<'a> Layout<'a> {
     /// apply, the body's margin (8px by default) collapses with its first and
     /// last child, and the root background becomes the canvas, as in CSS.
     pub fn build(mut self, root: &Node) -> Page {
+        let _matching_scope = crate::css::cache_layout_matches();
         let html = if root.tag == "html" { Some(root) } else { root.find_first("html") };
         let synthetic;
         let body: &Node = match root.find_first("body") {
@@ -349,7 +356,9 @@ impl<'a> Layout<'a> {
         };
         let height = self.layout_block(body, &ancestors, html_style.as_ref(), 0.0, 0.0, self.viewport_width);
         self.page.height = height.max(1.0);
-        self.page.background = canvas.0;
+        // a dark used scheme on the root darkens the canvas, as browsers do
+        let dark_root = html_style.as_ref().map_or(body_style.dark, |h| h.dark);
+        self.page.background = canvas.0.or_else(|| dark_root.then(|| Color::rgb(18, 18, 18)));
         if let Some(gradient) = canvas.1 {
             let rect = Rect { x: 0.0, y: 0.0, w: self.viewport_width, h: self.page.height };
             self.page.draws.insert(0, Draw::Fill { rect, radius: 0.0, color: None, gradient: Some(gradient) });
@@ -392,6 +401,7 @@ impl<'a> Layout<'a> {
                 image: false,
                 own_background: None,
                 img: None,
+                owners: Vec::new(),
             }];
             return self.layout_inline(&items, x, y, containing_width);
         }
@@ -431,6 +441,18 @@ impl<'a> Layout<'a> {
 
         // Replaced elements (images, inline SVG) drawn as blocks are a line
         // holding their box: they have no children to lay out.
+        // A blockified control must keep the size resolved by flex/grid.
+        // collect_inline would compute its style again and lose that width.
+        if self.blockify == Some(node as *const Node) && matches!(node.tag.as_str(), "input" | "select" | "textarea") {
+            let saved_flow = std::mem::replace(&mut self.flow_width, containing_width);
+            let atom = self.make_atom(node, &ancestors2, &style);
+            self.flow_width = saved_flow;
+            if let Some((page, _, _, height)) = atom {
+                self.append_page(page, x, y);
+                return height;
+            }
+            return 0.0;
+        }
         let replaced = matches!(node.tag.as_str(), "img" | "svg");
         if replaced || matches!(style.display, Display::Inline | Display::InlineBlock) {
             // Inline elements at block level are laid out as their own line.
@@ -477,7 +499,7 @@ impl<'a> Layout<'a> {
         let inner_y = box_y + b.top + pad.top;
 
         // shadow and background go under the children; their height is known at the end
-        let paints = !style.hidden;
+        let paints = !style.hidden && !style.transparent;
         let paints_background = paints && self.canvas_node != Some(node as *const Node);
         let zero = Rect { x: box_x, y: box_y, w: 0.0, h: 0.0 };
         let shadow_index = match (paints_background, style.shadow) {
@@ -508,7 +530,7 @@ impl<'a> Layout<'a> {
         let (first_link, first_box) = (self.page.links.len(), self.page.boxes.len());
         let mut cursor = inner_y;
         // list marker
-        if style.display == Display::ListItem && !style.hidden {
+        if style.display == Display::ListItem && !style.hidden && !style.transparent {
             if let Some(marker) = style.marker {
                 if !marker.is_empty() {
                     let baseline = cursor + self.fonts.ascent(style.font_size, style.bold);
@@ -591,6 +613,13 @@ impl<'a> Layout<'a> {
         if let Some(id) = node.attr("data-sepia-id").and_then(|v| v.parse::<usize>().ok()) {
             self.page.boxes.push((rect, id));
         }
+        // a block-level anchor (block, flex, grid: cards, tiles, wrappers) is
+        // clickable over its whole box, as in any browser
+        if node.tag == "a" && rect.h > 0.0 && !style.hidden {
+            if let Some(href) = node.attr("href").map(|h| link_target(node, h)).filter(|h| !h.is_empty()) {
+                self.page.links.push(link(rect, &href));
+            }
+        }
         for name in [node.attr("id"), (node.tag == "a").then(|| node.attr("name")).flatten()].into_iter().flatten() {
             if !name.is_empty() {
                 self.page.anchors.push((name.to_string(), box_y));
@@ -651,7 +680,6 @@ impl<'a> Layout<'a> {
                     items.clear();
                     if used > 0.0 {
                         cursor += used;
-                        previous_margin = None;
                     }
                 }
                 let mut with_node: Vec<&Node> = ancestors.to_vec();
@@ -771,6 +799,7 @@ impl<'a> Layout<'a> {
                     image: false,
                     own_background: None,
                     img: None,
+                    owners: Vec::new(),
                 });
             }
             return;
@@ -798,6 +827,7 @@ impl<'a> Layout<'a> {
                     image: false,
                     own_background: None,
                     img: Some(ImgBox { w, h, bitmap: None, alt: String::new(), atom: Some(Arc::new((page, baseline))) }),
+                    owners: Vec::new(),
                 });
             }
             return;
@@ -829,6 +859,7 @@ impl<'a> Layout<'a> {
                     image: false,
                     own_background: None,
                     img: Some(ImgBox { w, h, bitmap: Some(Arc::new(bitmap)), alt: String::new(), atom: None }),
+                    owners: Vec::new(),
                 });
                 return;
             }
@@ -841,6 +872,7 @@ impl<'a> Layout<'a> {
                     image: false,
                     own_background: None,
                     img: None,
+                    owners: Vec::new(),
                 });
                 return;
             }
@@ -859,6 +891,7 @@ impl<'a> Layout<'a> {
                         image: false,
                         own_background: None,
                         img: Some(ImgBox { w, h, bitmap, alt, atom: None }),
+                        owners: Vec::new(),
                     }),
                     // Nothing to size the box by: the alt text stands in, as plain text.
                     None if !alt.is_empty() => items.push(InlineItem {
@@ -869,6 +902,7 @@ impl<'a> Layout<'a> {
                         image: false,
                         own_background: None,
                         img: None,
+                        owners: Vec::new(),
                     }),
                     None => {}
                 }
@@ -889,6 +923,7 @@ impl<'a> Layout<'a> {
                     image: true,
                     own_background: None,
                     img: None,
+                    owners: Vec::new(),
                 });
                 let _ = width;
                 return;
@@ -903,6 +938,7 @@ impl<'a> Layout<'a> {
                     image: true,
                     own_background: None,
                     img: None,
+                    owners: Vec::new(),
                 });
                 return;
             }
@@ -917,6 +953,7 @@ impl<'a> Layout<'a> {
         let own_background = style.background;
         let mut child_ancestors: Vec<&Node> = ancestors.to_vec();
         child_ancestors.push(node);
+        let first_item = items.len();
         for child in &node.children {
             self.collect_inline_styled(
                 child,
@@ -926,6 +963,11 @@ impl<'a> Layout<'a> {
                 items,
                 own_background,
             );
+        }
+        if let Some(id) = node.attr("data-sepia-id").and_then(|v| v.parse::<usize>().ok()) {
+            for item in &mut items[first_item..] {
+                item.owners.push(id);
+            }
         }
     }
 
@@ -1083,7 +1125,7 @@ impl<'a> Layout<'a> {
         }
         if !line.is_empty() {
             self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
-                    (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
+            cursor_y = self.line_slot(cursor_y, x, width, line_guess).0;
         }
         self.pending_indent = 0.0;
         cursor_y - y
@@ -1171,6 +1213,10 @@ impl<'a> Layout<'a> {
         }
         for (text, item) in line.iter() {
             if let Some(img) = &item.img {
+                if item.style.transparent || (item.style.hidden && img.atom.is_none()) {
+                    pen_x += img.w;
+                    continue;
+                }
                 if let Some(atom) = &img.atom {
                     let (page, atom_baseline) = (&atom.0, atom.1);
                     let (dx, dy) = (pen_x, baseline - atom_baseline);
@@ -1191,6 +1237,9 @@ impl<'a> Layout<'a> {
                     if let Some(href) = &item.href {
                         self.page.links.push(link(Rect { x: dx, y: dy, w: img.w, h: img.h }, href));
                     }
+                    for id in &item.owners {
+                        self.page.boxes.push((Rect { x: dx, y: dy, w: img.w, h: img.h }, *id));
+                    }
                     self.page.text.extend(page.text.iter().cloned());
                     pen_x += img.w;
                     self.page.content_right = self.page.content_right.max(pen_x);
@@ -1200,6 +1249,9 @@ impl<'a> Layout<'a> {
                 self.page.draws.push(Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() });
                 if let Some(href) = &item.href {
                     self.page.links.push(link(rect, href));
+                }
+                for id in &item.owners {
+                    self.page.boxes.push((rect, *id));
                 }
                 if !img.alt.is_empty() {
                     self.page.text.push(img.alt.clone());
@@ -1213,7 +1265,10 @@ impl<'a> Layout<'a> {
                 continue;
             }
             let advance = self.text_width(text, &item.style);
-            if item.style.hidden {
+            for id in &item.owners {
+                self.page.boxes.push((Rect { x: pen_x, y: baseline - ascent, w: advance, h: ascent + descent }, *id));
+            }
+            if item.style.hidden || item.style.transparent {
                 pen_x += advance;
                 continue;
             }
@@ -1273,6 +1328,20 @@ fn px_attr(node: &Node, name: &str) -> Option<f32> {
 }
 
 impl Page {
+    /// The element under a page point: a link's `<a>`, else the smallest
+    /// element box around it. (node, raw href)
+    pub fn element_at(&self, px: f32, py: f32) -> Option<(usize, Option<String>)> {
+        let link = self.links.iter().find(|l| l.rect.contains(px, py));
+        let boxed = self
+            .boxes
+            .iter()
+            .filter(|(r, _)| r.contains(px, py))
+            .min_by(|a, b| (a.0.w * a.0.h).partial_cmp(&(b.0.w * b.0.h)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, id)| *id);
+        let node = link.and_then(|l| l.node).or(boxed)?;
+        Some((node, link.map(|l| l.href.clone())))
+    }
+
     /// Top of the element a `#fragment` names (`top` = page start).
     pub fn anchor(&self, fragment: &str) -> Option<f32> {
         let decoded = percent_decode(fragment);
@@ -1417,6 +1486,7 @@ impl<'a> Layout<'a> {
             viewport_width: self.viewport_width,
             images: self.images,
             measuring,
+            intrinsic: measuring || self.intrinsic,
             pending_indent: 0.0,
             last_margin_bottom: 0.0,
             trailing_margin: 0.0,
@@ -1552,6 +1622,7 @@ impl<'a> Layout<'a> {
             rect.y += y;
             (rect, id)
         }));
+        self.page.text.extend(sub.text);
         self.page.content_right = self.page.content_right.max(x + sub.content_right);
         self.page.anchors.extend(sub.anchors.into_iter().map(|(name, top)| (name, top + y)));
     }
@@ -1569,6 +1640,9 @@ impl<'a> Layout<'a> {
     /// `ancestors` ends with the parent; (static_x, static_y) is where it
     /// would have gone in the flow, used when no offset is given.
     fn place_out_of_flow(&mut self, node: &Node, ancestors: &[&Node], style: &Style, static_x: f32, static_y: f32) {
+        if self.intrinsic {
+            return;
+        }
         let fixed = style.position == crate::style::Position::Fixed;
         let (cb_x, cb_y, cb_w) = match self.containers.last() {
             Some(c) if !fixed => (c.x, c.y, c.w),
@@ -1678,7 +1752,28 @@ impl<'a> Layout<'a> {
             }
         }
         if rows.is_empty() {
-            return margin.vertical();
+            // no rows: CSS wraps the content in an anonymous row and cell, so the
+            // table is a shrink-to-fit box around it (figure { display: table })
+            let has_content = node.children.iter().any(|c| c.text.as_ref().map_or(true, |t| !t.trim().is_empty()));
+            if !has_content {
+                return margin.vertical();
+            }
+            let mut block = style.clone();
+            block.display = Display::Block;
+            let mut with_node: Vec<&Node> = ancestors.to_vec();
+            with_node.push(node);
+            let saved = std::mem::replace(&mut self.flow_width, containing_width.max(1.0));
+            let atom = self.make_atom(node, &with_node, &block);
+            self.flow_width = saved;
+            let Some((page, _, w, h)) = atom else { return margin.vertical() };
+            let dx = match outer_align {
+                Align::Center if !style.margin_auto.0 => (containing_width - w) / 2.0,
+                _ if style.margin_auto.0 && style.margin_auto.1 => (containing_width - w) / 2.0,
+                _ if style.margin_auto.0 => containing_width - w,
+                _ => 0.0,
+            };
+            self.paste(page, x + dx.max(0.0), y);
+            return h;
         }
 
         let mut cells: Vec<Cell> = Vec::new();
@@ -1939,6 +2034,9 @@ struct FlexItem<'n> {
     min_outer: f32,
     /// align-self, else the container's align-items
     align: crate::style::AlignItems,
+    /// a definite width the item gives itself (outer): a column item that is
+    /// not stretched keeps it instead of shrinking to its content
+    fixed_outer: Option<f32>,
 }
 
 /// `align-items: stretch`: grow the item's own box (its background and
@@ -2007,6 +2105,7 @@ impl<'a> Layout<'a> {
 
         let mut items: Vec<FlexItem> = Vec::new();
         for child in &node.children {
+            let mut fixed_outer = None;
             let (item_flex, margin_top, margin_bottom, right_chrome, min_outer) = match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
                 Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0, 0.0),
@@ -2021,11 +2120,15 @@ impl<'a> Layout<'a> {
                     }
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
                     let min_outer = s.min_width.map(|m| m + chrome + s.margin.horizontal()).unwrap_or(0.0);
+                    fixed_outer = s.width.map(|w| {
+                        let w = s.max_width.map_or(w, |m| w.min(m));
+                        w + chrome + s.margin.horizontal()
+                    });
                     (s.flex, s.margin.top, s.margin.bottom, s.padding.right + s.border.right + s.margin.right, min_outer)
                 }
             };
             let align = item_flex.align_self.unwrap_or(f.align);
-            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align });
+            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer });
         }
         if reverse {
             items.reverse();
@@ -2042,23 +2145,24 @@ impl<'a> Layout<'a> {
         for item in &mut items {
             let (wide, _) = self.item_page(item.node, ancestors, style, 100_000.0, true);
             let (narrow, _) = self.item_page(item.node, ancestors, style, 1.0, true);
-            let own = match item.node.text {
-                Some(_) => None,
+            let (own, basis_chrome, explicit_min) = match item.node.text {
+                Some(_) => (None, 0.0, false),
                 // a declared width is the content box; the item's outer size adds its margins
                 None => {
                     let s = compute(item.node, Some(style), self.sheet, ancestors, width);
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
-                    s.width.map(|w| w + chrome + s.margin.horizontal())
+                    (s.width.map(|w| w + chrome + s.margin.horizontal()),
+                     chrome + s.margin.horizontal(), s.min_width.is_some())
                 }
             };
             let max_content = self.extent(&wide) + item.right_chrome;
             item.min = (self.extent(&narrow) + item.right_chrome).min(max_content);
-            item.basis = item.flex.basis.or(own).unwrap_or(max_content);
+            item.basis = item.flex.basis.map(|b| b + basis_chrome).or(own).unwrap_or(max_content);
             if own.is_some() && item.flex.basis.is_none() {
                 item.min = item.min.min(item.basis);
             }
             // min-width is a floor for both
-            item.min = item.min.max(item.min_outer);
+            item.min = if explicit_min { item.min_outer } else { item.min.max(item.min_outer) };
             item.basis = item.basis.max(item.min_outer);
         }
 
@@ -2092,11 +2196,30 @@ impl<'a> Layout<'a> {
                     item.size = item.basis + if grow > 0.0 { free * item.flex.grow / grow } else { 0.0 };
                 }
             } else {
-                // shrink in proportion to shrink × basis, never below min-content
-                let weight: f32 = items[line.clone()].iter().map(|i| i.flex.shrink * i.basis).sum();
+                // Freeze items that reach their minimum, then redistribute the
+                // remaining deficit among the items that can still shrink.
                 for item in &mut items[line.clone()] {
-                    let cut = if weight > 0.0 { -free * item.flex.shrink * item.basis / weight } else { 0.0 };
-                    item.size = (item.basis - cut).max(item.min);
+                    item.size = item.basis.max(item.min);
+                }
+                loop {
+                    let deficit = items[line.clone()].iter().map(|i| i.size).sum::<f32>() + gaps - width;
+                    let weight: f32 = items[line.clone()].iter()
+                        .filter(|i| i.size > i.min)
+                        .map(|i| i.flex.shrink * i.basis).sum();
+                    if deficit <= 0.001 || weight <= 0.0 {
+                        break;
+                    }
+                    let mut froze = false;
+                    for item in &mut items[line.clone()] {
+                        if item.size > item.min && item.flex.shrink > 0.0 {
+                            let target = item.size - deficit * item.flex.shrink * item.basis / weight;
+                            froze |= target < item.min;
+                            item.size = target.max(item.min);
+                        }
+                    }
+                    if !froze {
+                        break;
+                    }
                 }
             }
             let used: f32 = items[line.clone()].iter().map(|i| i.size).sum::<f32>() + gaps;
@@ -2148,6 +2271,8 @@ impl<'a> Layout<'a> {
         for item in &items {
             let item_w = if item.align == AlignItems::Stretch {
                 width
+            } else if let Some(fixed) = item.fixed_outer {
+                fixed.min(width).max(1.0)
             } else {
                 let (wide, _) = self.item_page(item.node, ancestors, style, width, true);
                 (self.extent(&wide) + item.right_chrome).min(width).max(1.0)
@@ -2203,7 +2328,7 @@ impl<'a> Layout<'a> {
                 let kind = node.attr("type").unwrap_or("text").to_ascii_lowercase();
                 match kind.as_str() {
                     "hidden" => return None,
-                    "checkbox" | "radio" if style.hidden => {
+                    "checkbox" | "radio" if style.hidden || style.transparent => {
                         // opacity:0 checkboxes behind custom toggles and menus
                         return Some((Page::default(), 0.0, 0.0, 0.0));
                     }
@@ -2293,11 +2418,19 @@ impl<'a> Layout<'a> {
             available.max(1.0)
         } else {
             // shrink-to-fit: as wide as its content, no wider than the line
+            // measured without its max-width: a capped box would draw its own
+            // background up to the cap and read as content that wide
             let mut probe = self.sub_layout(true);
             probe.flow_width = available;
-            probe.layout_box(content, &content_ancestors, &style, 0.0, 0.0, 100_000.0);
+            let mut unclamped = style.clone();
+            unclamped.max_width = None;
+            probe.layout_box(content, &content_ancestors, &unclamped, 0.0, 0.0, 100_000.0);
             let right = style.padding.right + style.border.right + style.margin.right;
+            let chrome = if style.border_box { 0.0 } else { style.padding.horizontal() + style.border.left + style.border.right };
             let mut w = (self.extent(&probe.page) + right).min(available);
+            if let Some(max) = style.max_width {
+                w = w.min(max + chrome + style.margin.horizontal());
+            }
             if let Some(min) = style.min_width {
                 w = w.max(min + if style.border_box { 0.0 } else { style.padding.horizontal() + style.border.left + style.border.right } + style.margin.horizontal());
             }
@@ -2341,7 +2474,18 @@ impl<'a> Layout<'a> {
         use crate::style::{AlignItems, GridSpan};
         let col_gap = style.flex.column_gap;
         let row_gap = style.flex.row_gap;
-        let tracks = parse_tracks(style.grid_columns.as_deref().unwrap_or("1fr"), width, col_gap, style.font_size);
+        let mut tracks = parse_tracks(style.grid_columns.as_deref().unwrap_or("1fr"), width, col_gap, style.font_size);
+        let mut named = std::collections::HashMap::<&str, (usize, usize, usize, usize)>::new();
+        if let Some(areas) = &style.grid_areas {
+            let area_columns = areas.first().map_or(1, Vec::len);
+            if tracks.len() < area_columns { tracks.resize(area_columns, Track::Auto); }
+            for (r, row) in areas.iter().enumerate() {
+                for (c, name) in row.iter().enumerate().filter(|(_, name)| name.as_str() != ".") {
+                    let area = named.entry(name).or_insert((r, c, r + 1, c + 1));
+                    area.2 = area.2.max(r + 1); area.3 = area.3.max(c + 1);
+                }
+            }
+        }
         let columns = tracks.len().max(1);
 
         // items and their places
@@ -2350,15 +2494,17 @@ impl<'a> Layout<'a> {
             row: usize,
             col: usize,
             span: usize,
+            row_span: usize,
+            area: Option<String>,
             margin: (f32, f32),
             align: AlignItems,
         }
         let mut items: Vec<GridItem> = Vec::new();
         let (mut row, mut col) = (0usize, 0usize);
         for child in &node.children {
-            let (span, margin, align) = match &child.text {
+            let (span, margin, align, area) = match &child.text {
                 Some(t) if t.trim().is_empty() => continue,
-                Some(_) => (1, (0.0, 0.0), style.flex.align),
+                Some(_) => (1, (0.0, 0.0), style.flex.align, None),
                 None => {
                     let s = compute(child, Some(style), self.sheet, ancestors, width);
                     if s.display == Display::None {
@@ -2373,22 +2519,35 @@ impl<'a> Layout<'a> {
                         GridSpan::Span(n) => n.min(columns),
                         GridSpan::Full => columns,
                     };
-                    (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align))
+                    (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align), s.grid_area)
                 }
             };
-            if col + span > columns && col > 0 {
-                row += 1;
-                col = 0;
-            }
-            items.push(GridItem { node: child, row, col, span, margin, align });
-            col += span;
-            if col >= columns {
-                row += 1;
-                col = 0;
-            }
+            items.push(GridItem { node: child, row: 0, col: 0, span, row_span: 1, area, margin, align });
         }
         if items.is_empty() {
             return 0.0;
+        }
+
+        // Named placements reserve their cells before automatic placement,
+        // regardless of the order in which elements occur in the document.
+        let mut occupied = std::collections::HashSet::new();
+        for item in &mut items {
+            if let Some(&(r0, c0, r1, c1)) = item.area.as_deref().and_then(|name| named.get(name)) {
+                item.row = r0; item.col = c0; item.span = c1 - c0; item.row_span = r1 - r0;
+                for r in r0..r1 { for c in c0..c1 { occupied.insert((r, c)); } }
+            }
+        }
+        for item in &mut items {
+            if item.area.as_deref().is_some_and(|name| named.contains_key(name)) { continue; }
+            loop {
+                if col + item.span > columns { row += 1; col = 0; }
+                if (col..col + item.span).all(|c| !occupied.contains(&(row, c))) { break; }
+                col += 1;
+            }
+            item.row = row; item.col = col;
+            for c in col..col + item.span { occupied.insert((row, c)); }
+            col += item.span;
+            if col >= columns { row += 1; col = 0; }
         }
 
         // column widths: fixed tracks first, then auto (content), then fr shares
@@ -2449,21 +2608,27 @@ impl<'a> Layout<'a> {
         }
 
         // lay each item out in its cell; rows as tall as their tallest item
-        let rows = items.iter().map(|i| i.row).max().unwrap_or(0) + 1;
+        let rows = items.iter().map(|i| i.row + i.row_span).max().unwrap_or(1);
         let mut laid: Vec<(Page, f32)> = Vec::with_capacity(items.len());
         let mut row_h = vec![0.0f32; rows];
         for item in &items {
             let w = col_x[item.col + item.span] - col_x[item.col] - col_gap;
             let (page, h) = self.item_page(item.node, ancestors, style, w.max(1.0), false);
-            row_h[item.row] = row_h[item.row].max(h);
+            if item.row_span == 1 { row_h[item.row] = row_h[item.row].max(h); }
             laid.push((page, h));
+        }
+        for (item, (_, h)) in items.iter().zip(&laid).filter(|(item, _)| item.row_span > 1) {
+            let used = row_h[item.row..item.row + item.row_span].iter().sum::<f32>() + row_gap * (item.row_span - 1) as f32;
+            let extra = (h - used).max(0.0) / item.row_span as f32;
+            for row in &mut row_h[item.row..item.row + item.row_span] { *row += extra; }
         }
         let mut row_y = vec![0.0f32; rows + 1];
         for r in 0..rows {
             row_y[r + 1] = row_y[r] + row_h[r] + if r + 1 < rows { row_gap } else { 0.0 };
         }
         for (item, (mut page, h)) in items.iter().zip(laid) {
-            let slack = row_h[item.row] - h;
+            let area_height = row_h[item.row..item.row + item.row_span].iter().sum::<f32>() + row_gap * (item.row_span - 1) as f32;
+            let slack = area_height - h;
             let dy = match item.align {
                 AlignItems::Center => slack / 2.0,
                 AlignItems::End => slack,
@@ -2520,7 +2685,11 @@ fn parse_tracks(value: &str, width: f32, gap: f32, font_size: f32) -> Vec<Track>
         let mut out = Vec::new();
         let mut depth = 0;
         let mut current = String::new();
+        let mut line_name = false;
         for c in value.chars() {
+            if c == '[' { line_name = true; continue; }
+            if c == ']' { line_name = false; continue; }
+            if line_name { continue; }
             match c {
                 '(' => {
                     depth += 1;
@@ -2609,6 +2778,7 @@ impl InlineItem {
             image: self.image,
             own_background: self.own_background,
             img: self.img.clone(),
+            owners: self.owners.clone(),
         }
     }
 }
@@ -2658,13 +2828,34 @@ pub fn collapse_ws(text: &str) -> String {
     out
 }
 
+/// Scripts written without spaces, where any character boundary is a break opportunity.
+fn breaks_anywhere(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F | 0x3040..=0x30FF | 0x31F0..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
+        | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F)
+}
+
+/// Punctuation that must not begin a line (it closes what came before).
+fn is_closing_punct(ch: char) -> bool {
+    matches!(ch, '。' | '，' | '、' | '．' | '：' | '；' | '！' | '？' | '）' | '」' | '』' | '】' | '〉' | '》' | 'ー' | '々')
+}
+
 /// Split into words, each carrying whether the source had whitespace *after* it.
 fn split_words(text: &str, pre: bool) -> Vec<(String, bool)> {
     if pre {
-        return text
-            .split_inclusive('\n')
-            .map(|s| (s.to_string(), false))
-            .collect();
+        let mut out = Vec::new();
+        let mut run = String::new();
+        for ch in text.chars() {
+            if ch == '\n' {
+                if !run.is_empty() { out.push((std::mem::take(&mut run), false)); }
+                out.push(("\n".to_string(), false));
+            } else {
+                run.push(ch);
+                if ch.is_whitespace() { out.push((std::mem::take(&mut run), false)); }
+            }
+        }
+        if !run.is_empty() { out.push((run, false)); }
+        return out;
     }
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut current = String::new();
@@ -2685,6 +2876,24 @@ fn split_words(text: &str, pre: bool) -> Vec<(String, bool)> {
             } else {
                 leading_space = true;
             }
+        } else if breaks_anywhere(ch) {
+            // CJK: a line may break before and after each character
+            // (closing punctuation stays with the character before it)
+            if is_closing_punct(ch) {
+                match out.last_mut() {
+                    Some(last) if current.is_empty() && !last.1 && last.0 != "\n" => last.0.push(ch),
+                    _ => {
+                        current.push(ch);
+                        out.push((std::mem::take(&mut current), false));
+                    }
+                }
+                continue;
+            }
+            if !current.is_empty() {
+                out.push((std::mem::take(&mut current), false));
+            }
+            current.push(ch);
+            out.push((std::mem::take(&mut current), false));
         } else {
             current.push(ch);
         }
@@ -2711,6 +2920,12 @@ mod tests {
     fn collapses_whitespace() {
         assert_eq!(collapse_ws("a   b\n\tc"), "a b c");
         assert_eq!(collapse_ws("  "), " ");
+    }
+
+    #[test]
+    fn cjk_text_breaks_between_characters() {
+        let words: Vec<String> = split_words("该域名仅用于。ok", false).into_iter().map(|w| w.0).collect();
+        assert_eq!(words, vec!["该", "域", "名", "仅", "用", "于。", "ok"]);
     }
 
     #[test]
@@ -3088,6 +3303,133 @@ mod tests {
         let sheet = Stylesheet::default();
         let doc = parse_document(html);
         Layout::new(&fonts, &sheet, width).build(&doc)
+    }
+
+    #[test]
+    fn flex_control_frame_uses_the_allocated_width() {
+        let page = flex_page("<body style='margin:0'><div style='display:flex;width:400px;gap:10px'><input style='flex:1;min-width:0'><button style='flex:0 0 80px;box-sizing:border-box'>Go</button></div></body>", 400.0);
+        let frame = page.draws.iter().find_map(|d| match d {
+            Draw::Edges { rect, .. } if rect.x < 1.0 => Some(rect),
+            _ => None,
+        }).unwrap();
+        assert!((frame.w - 310.0).abs() < 0.5, "input frame: {frame:?}");
+    }
+
+    #[test]
+    fn textarea_wraps_preserved_lines_inside_its_frame() {
+        let page = flex_page("<textarea style='width:120px;height:100px'>alpha beta gamma delta epsilon</textarea>", 400.0);
+        let (_, first) = text_x(&page, "alpha");
+        let (_, last) = text_x(&page, "epsilon");
+        assert!(last > first, "textarea should soft-wrap");
+        let fonts = fonts();
+        assert!(page.draws.iter().filter_map(|d| match d {
+            Draw::Text { x, text, size, bold, italic, .. } => Some(x + fonts.advance(text, *size, *bold, *italic)),
+            _ => None,
+        }).all(|right| right <= 132.5));
+    }
+
+    #[test]
+    fn positioned_text_is_preserved_for_search() {
+        let page = flex_page("<div style='position:absolute;left:10px;top:10px'>positioned</div>", 400.0);
+        assert!(page.draws.iter().any(|d| matches!(d, Draw::Text { text, .. } if text == "positioned")));
+        assert!(page.text.iter().any(|text| text == "positioned"));
+    }
+
+    #[test]
+    fn relayout_rechecks_selectors_after_sibling_changes() {
+        let fonts = fonts();
+        let sheet = Stylesheet::parse("span { color: blue } span:first-child { color: red }");
+        let mut doc = parse_document("<html><body><div><span>Alpha</span><span>Beta</span></div></body></html>");
+        let color_of_beta = |page: &Page| page.draws.iter().find_map(|draw| match draw {
+            Draw::Text { text, color, .. } if text == "Beta" => Some(*color),
+            _ => None,
+        }).unwrap();
+        let before = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        assert_eq!(color_of_beta(&before), Color::rgb(0, 0, 255));
+        // Keep the second node and all ancestor addresses in place. Only a
+        // sibling changes, which affects :first-child on the unchanged node.
+        let body = &mut doc.children[0].children[0];
+        body.children[0].children[0] = Node::text_node(" ");
+        let after = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        assert_eq!(color_of_beta(&after), Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn grid_named_areas_override_document_order_and_reserve_auto_cells() {
+        let page = flex_page(
+            "<body style='margin:0'><div style='display:grid;grid-template-columns:100px 200px;gap:10px;grid-template-areas:\"header header\" \"sidebar content\"'>\
+             <div style='grid-area:content'>Main</div><div style='grid-area:sidebar'>Sidebar</div>\
+             <div style='grid-area:header'>Header</div><div>Automatic</div></div></body>", 400.0);
+        let (mx, my) = text_x(&page, "Main");
+        let (sx, sy) = text_x(&page, "Sidebar");
+        let (hx, hy) = text_x(&page, "Header");
+        let (ax, ay) = text_x(&page, "Automatic");
+        assert!((mx - 110.0).abs() < 0.5 && sx.abs() < 0.5 && hx.abs() < 0.5);
+        assert!((my - sy).abs() < 0.5 && hy < my && ay > my && ax.abs() < 0.5);
+    }
+
+    #[test]
+    fn grid_shorthand_and_named_line_labels_do_not_add_columns() {
+        let page = flex_page(
+            "<body style='margin:0'><div style='display:grid;grid-template:\"side content\" auto / [start] 90px [middle] 210px [end];column-gap:12px'>\
+             <div style='grid-area:content'>Content</div><div style='grid-area:side'>Side</div></div></body>", 400.0);
+        let (x, y) = text_x(&page, "Content");
+        let (sx, sy) = text_x(&page, "Side");
+        assert!((x - 102.0).abs() < 0.5 && sx.abs() < 0.5 && (y - sy).abs() < 0.5);
+    }
+
+    #[test]
+    fn grid_named_area_rowspan_contributes_to_all_rows() {
+        let page = flex_page(
+            "<body style='margin:0'><div style='display:grid;grid-template-columns:100px 200px;gap:10px;grid-template-areas:\"sidebar top\" \"sidebar bottom\"'>\
+             <div style='grid-area:top;height:20px'>Top</div><div style='grid-area:bottom;height:20px'>Bottom</div>\
+             <div style='grid-area:sidebar;height:100px'>Sidebar</div><div>After</div></div></body>", 400.0);
+        assert!(text_x(&page, "Bottom").1 > text_x(&page, "Top").1 + 20.0);
+        assert!(text_x(&page, "After").1 >= text_x(&page, "Top").1 + 100.0);
+    }
+
+    #[test]
+    fn opacity_resets_without_resetting_visibility_or_ancestor_opacity() {
+        let page = flex_page(
+            "<div style='opacity:0;opacity:1'>reset</div>\
+             <div style='visibility:hidden;opacity:1'>hidden</div>\
+             <div style='opacity:0'><span style='visibility:visible;opacity:1'>transparent</span></div>\
+             <div style='visibility:hidden'><span style='visibility:visible'>visible</span></div>", 400.0);
+        let text = page.text.join(" ");
+        assert!(text.contains("reset") && text.contains("visible"), "{text}");
+        assert!(!text.contains("hidden") && !text.contains("transparent"), "{text}");
+    }
+
+    #[test]
+    fn flex_basis_includes_box_chrome() {
+        for (sizing, expected) in [("content-box", 140.0), ("border-box", 120.0)] {
+            let page = flex_page(&format!(
+                "<body style='margin:0'><div style='display:flex;width:400px'>\
+                 <div style='box-sizing:{sizing};flex:0 0 100px;padding:0 10px;margin:0 10px'>A</div>\
+                 <div>B</div></div></body>"), 400.0);
+            let (x, _) = text_x(&page, "B");
+            assert!((x - expected).abs() < 0.5, "{sizing}: {x}");
+        }
+    }
+
+    #[test]
+    fn flex_explicit_zero_minimum_allows_shrinking() {
+        let page = flex_page(
+            "<body style='margin:0'><div style='display:flex;width:100px'>\
+             <div style='flex:0 1 200px;min-width:0'>averyveryveryverylongword</div>\
+             <div style='flex:0 0 20px'>B</div></div></body>", 300.0);
+        assert!((text_x(&page, "B").0 - 80.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn flex_shrink_redistributes_after_minimum_is_reached() {
+        let page = flex_page(
+            "<body style='margin:0'><div style='display:flex;width:200px'>\
+             <div style='width:200px;min-width:150px'>A</div>\
+             <div style='width:200px;min-width:0'>B</div>\
+             <div style='flex:0 0 0px;min-width:0'>C</div></div></body>", 400.0);
+        assert!((text_x(&page, "B").0 - 150.0).abs() < 0.5);
+        assert!((text_x(&page, "C").0 - 200.0).abs() < 0.5);
     }
 
     #[test]

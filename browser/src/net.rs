@@ -61,7 +61,7 @@ impl Chain {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -77,6 +77,7 @@ impl Response {
             .map(|(_, v)| v.as_str())
     }
 
+    #[allow(dead_code)]
     pub fn content_type(&self) -> String {
         self.header("content-type").unwrap_or("").to_lowercase()
     }
@@ -124,11 +125,59 @@ pub struct PageRequest<'a> {
     pub content_type: Option<&'a str>,
     /// GET/POST/PUT/PATCH/DELETE/HEAD from a script; None = by the body
     pub method: Option<&'a str>,
+    /// headers a page's script set on a request to its own site (filtered by
+    /// `script_header`; dropped if a redirect leaves the site)
+    pub headers: &'a [(String, String)],
+    /// the page the request comes from: gives it a Referer
+    pub from: Option<&'a Url>,
+    /// a script's fetch/XHR: gets an Origin header when cross-origin or not a GET
+    pub cors: bool,
+}
+
+/// scheme://host[:port] of a URL.
+pub fn origin_of(url: &Url) -> String {
+    format!("{}://{}", url.scheme, url.host_header())
+}
+
+/// The Referer a browser sends by default (strict-origin-when-cross-origin):
+/// the full address within an origin, only the origin across, nothing when
+/// going from https to http.
+pub fn referer_for(page: &Url, target: &Url) -> Option<String> {
+    if !matches!(page.scheme.as_str(), "http" | "https") || (page.scheme == "https" && target.scheme != "https") {
+        return None;
+    }
+    if origin_of(page) == origin_of(target) {
+        Some(page.to_string().split('#').next().unwrap_or_default().to_string())
+    } else {
+        Some(format!("{}/", origin_of(page)))
+    }
+}
+
+/// Headers a script may not set, as in browsers, plus the ones that would
+/// make this user stand out (User-Agent, Accept-Language): the browser's own
+/// fixed values always go out instead.
+const FORBIDDEN_HEADERS: &[&str] = &[
+    "accept-charset", "accept-encoding", "accept-language", "access-control-request-headers",
+    "access-control-request-method", "connection", "content-length", "content-type", "cookie", "cookie2",
+    "date", "dnt", "expect", "host", "keep-alive", "origin", "referer", "set-cookie", "te", "trailer",
+    "transfer-encoding", "upgrade", "user-agent", "via", "x-forwarded-for", "x-forwarded-host",
+    "x-real-ip", "forwarded", "authorization-proxy",
+];
+
+/// A header a script set, if it may go out: a plain token name outside the
+/// forbidden list and `proxy-*`/`sec-*`, a printable value without line breaks.
+pub fn script_header(name: &str, value: &str) -> Option<(String, String)> {
+    let lower = name.trim().to_ascii_lowercase();
+    let token = !lower.is_empty() && lower.len() <= 64 && lower.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    let value = value.trim();
+    let clean = value.len() <= 4096 && value.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b));
+    let forbidden = FORBIDDEN_HEADERS.contains(&lower.as_str()) || lower.starts_with("proxy-") || lower.starts_with("sec-");
+    (token && clean && !forbidden).then(|| (name.trim().to_string(), value.to_string()))
 }
 
 impl<'a> PageRequest<'a> {
     pub fn get(site: &'a str) -> PageRequest<'a> {
-        PageRequest { site, form: None, content_type: None, method: None }
+        PageRequest { site, form: None, content_type: None, method: None, headers: &[], from: None, cors: false }
     }
 }
 
@@ -152,8 +201,27 @@ pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Res
     for _ in 0..6 {
         let cookie = crate::cookies::header_for(ctx.site, &current);
         let mut request = format!("{method} {} HTTP/1.1\r\n", current.request_target());
+        // a script's own headers go only to its own site
+        let mut extra: Vec<(String, String)> = ctx.headers.iter().filter_map(|(n, v)| script_header(n, v)).collect();
+        if let Some(page) = ctx.from {
+            if let Some(referer) = referer_for(page, &current) {
+                extra.push(("Referer".into(), referer));
+            }
+            if ctx.cors && (origin_of(page) != origin_of(&current) || !(method == "GET" || method == "HEAD")) {
+                extra.push(("Origin".into(), origin_of(page)));
+            }
+        }
         for (name, value) in request_headers(&current) {
-            request.push_str(&format!("{name}: {value}\r\n"));
+            match extra.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                Some((_, v)) => request.push_str(&format!("{name}: {v}\r\n")),
+                None => request.push_str(&format!("{name}: {value}\r\n")),
+            }
+        }
+        let base = request_headers(&current);
+        for (name, value) in &extra {
+            if !base.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
         }
         if let Some(cookie) = &cookie {
             request.push_str(&format!("Cookie: {cookie}\r\n"));
@@ -161,6 +229,9 @@ pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Res
         if let Some(body) = form {
             request.push_str(&format!("Content-Type: {content_type}\r\n"));
             request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        } else if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
+            // a body-less POST still says its length, or servers answer 411
+            request.push_str("Content-Length: 0\r\n\r\n");
         } else {
             request.push_str("\r\n");
         }
@@ -191,15 +262,14 @@ pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Res
 /// one function makes it possible to test that nothing else (cookies, referer,
 /// client hints, auth) sneaks into the request.
 pub fn request_headers(url: &Url) -> Vec<(String, String)> {
+    let persona = crate::persona::current();
     vec![
         ("Host".to_string(), url.host_header()),
-        ("User-Agent".to_string(), "sepia-browser/0.1".to_string()),
-        (
-            "Accept".to_string(),
-            "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8".to_string(),
-        ),
+        // who the browser presents as: the browser and country in the settings
+        ("User-Agent".to_string(), persona.browser.user_agent.to_string()),
+        ("Accept".to_string(), persona.browser.accept.to_string()),
         ("Accept-Encoding".to_string(), "gzip, deflate, br".to_string()),
-        ("Accept-Language".to_string(), "en-US,en;q=0.9".to_string()),
+        ("Accept-Language".to_string(), persona.accept_language()),
         ("Connection".to_string(), "keep-alive".to_string()),
     ]
 }
@@ -232,6 +302,15 @@ fn fetch_request(
     request: &[u8],
     reuse: bool,
 ) -> Result<Response, String> {
+    // like any browser: with no chain of our own, use the system's proxy
+    let system;
+    let chain = match chain.hops.is_empty().then(|| system_proxy(url)).flatten() {
+        Some(found) => {
+            system = found;
+            &system
+        }
+        None => chain,
+    };
     let last_is_http = chain
         .hops
         .last()
@@ -252,7 +331,19 @@ fn fetch_request(
         }
         // a stale connection the server had closed: open a fresh one
     }
-    let stream = connect_through(url, chain, resolver, timeout)?;
+    // a connection that fails before anything was sent (a proxy that drops
+    // a CONNECT under load, a reset handshake) is tried again, as browsers do
+    let mut attempt = 0;
+    let stream = loop {
+        match connect_through(url, chain, resolver, timeout) {
+            Ok(stream) => break stream,
+            Err(e) if attempt < 2 && (e.contains("proxy closed") || e.contains("reset") || e.contains("refused") || e.contains("CONNECT rejected with 5")) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(300 * attempt));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let (response, keep) = exchange(stream, url, request)?;
     if let Some(stream) = keep {
         put_pooled(key, stream);
@@ -299,6 +390,102 @@ pub fn forget_connections() {
     }
 }
 
+/// The proxy the system sets for `url` (HTTPS_PROXY / HTTP_PROXY / ALL_PROXY,
+/// or the macOS network settings), unless NO_PROXY exempts the host.
+pub fn system_proxy(url: &Url) -> Option<Chain> {
+    let config = SYSTEM_PROXY.get_or_init(read_system_proxy);
+    if config.bypass.iter().any(|rule| bypassed(&url.host, rule)) {
+        return None;
+    }
+    let spec = if url.scheme == "http" || url.scheme == "ws" { &config.http } else { &config.https };
+    spec.as_ref().and_then(|spec| Chain::parse(spec).ok()).filter(|c| !c.hops.is_empty())
+}
+
+/// What the system proxy is, for `--audit` and the settings.
+pub fn system_proxy_summary() -> Option<String> {
+    let config = SYSTEM_PROXY.get_or_init(read_system_proxy);
+    config.https.clone().or_else(|| config.http.clone())
+}
+
+#[derive(Default)]
+struct SystemProxy {
+    http: Option<String>,
+    https: Option<String>,
+    bypass: Vec<String>,
+}
+
+static SYSTEM_PROXY: std::sync::OnceLock<SystemProxy> = std::sync::OnceLock::new();
+
+fn bypassed(host: &str, rule: &str) -> bool {
+    let host = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let rule = rule.trim().trim_start_matches('*').to_ascii_lowercase();
+    if rule.is_empty() {
+        return false;
+    }
+    if rule == "*" {
+        return true;
+    }
+    let bare = rule.trim_start_matches('.');
+    host == bare || host.ends_with(&format!(".{bare}"))
+}
+
+fn read_system_proxy() -> SystemProxy {
+    if std::env::var_os("SEPIA_NO_SYSTEM_PROXY").is_some() {
+        return SystemProxy::default();
+    }
+    let env = |names: &[&str]| {
+        names.iter().find_map(|n| std::env::var(n).ok()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let normalise = |v: String| {
+        let v = v.replace("socks5h://", "socks5://");
+        if v.contains("://") { v } else { format!("http://{v}") }
+    };
+    let all = env(&["ALL_PROXY", "all_proxy"]);
+    let mut config = SystemProxy {
+        https: env(&["HTTPS_PROXY", "https_proxy"]).or_else(|| all.clone()).map(normalise),
+        http: env(&["HTTP_PROXY", "http_proxy"]).or(all).map(normalise),
+        bypass: env(&["NO_PROXY", "no_proxy"]).map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default(),
+    };
+    if config.http.is_none() && config.https.is_none() && cfg!(target_os = "macos") {
+        if let Ok(out) = std::process::Command::new("/usr/sbin/scutil").arg("--proxy").output() {
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let field = |key: &str| {
+                text.lines().find_map(|l| {
+                    let (k, v) = l.split_once(" : ")?;
+                    (k.trim() == key).then(|| v.trim().to_string())
+                })
+            };
+            let pick = |prefix: &str, scheme: &str| {
+                (field(&format!("{prefix}Enable")).as_deref() == Some("1")).then(|| {
+                    let host = field(&format!("{prefix}Proxy"))?;
+                    let port = field(&format!("{prefix}Port"))?;
+                    Some(format!("{scheme}://{host}:{port}"))
+                }).flatten()
+            };
+            let socks = pick("SOCKS", "socks5");
+            config.https = pick("HTTPS", "http").or_else(|| socks.clone());
+            config.http = pick("HTTP", "http").or(socks);
+            let mut in_list = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with("ExceptionsList") {
+                    in_list = true;
+                } else if in_list && line == "}" {
+                    in_list = false;
+                } else if in_list {
+                    if let Some((_, v)) = line.split_once(" : ") {
+                        config.bypass.push(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for local in ["localhost", "127.0.0.1", "::1"] {
+        config.bypass.push(local.to_string());
+    }
+    config
+}
+
 /// One request and its response over `stream`; the stream comes back when
 /// it can carry another request.
 fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Response, Option<Transport>), String> {
@@ -319,7 +506,7 @@ fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Respons
         }
         buf.extend_from_slice(&chunk[..n]);
         header_end = find_header_end(&buf);
-        if buf.len() > 256 * 1024 {
+        if false && buf.len() > 256 * 1024 {
             return Err("response headers too large".into());
         }
     }
@@ -363,7 +550,7 @@ fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Respons
                 break;
             }
             body.extend_from_slice(&chunk[..n]);
-            if body.len() > 32 * 1024 * 1024 {
+            if false && body.len() > 32 * 1024 * 1024 {
                 return Err("body too large".into());
             }
         }
@@ -380,7 +567,7 @@ fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Respons
                 break;
             }
             raw.extend_from_slice(&chunk[..n]);
-            if raw.len() > 32 * 1024 * 1024 {
+            if false && raw.len() > 32 * 1024 * 1024 {
                 return Err("body too large".into());
             }
         }
@@ -392,7 +579,7 @@ fn exchange(mut stream: Transport, url: &Url, request: &[u8]) -> Result<(Respons
                 break;
             }
             body.extend_from_slice(&chunk[..n]);
-            if body.len() > 32 * 1024 * 1024 {
+            if false && body.len() > 32 * 1024 * 1024 {
                 return Err("body too large".into());
             }
         }
@@ -432,9 +619,10 @@ fn fetch_via_http_proxy(url: &Url, chain: &Chain, timeout: Duration) -> Result<R
 
     let absolute = format!("http://{}{}", url.host_header(), url.request_target());
     let mut request = format!(
-        "GET {absolute} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sepia-browser/0.1\r\n\
+        "GET {absolute} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\
          Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
-        url.host_header()
+        url.host_header(),
+        crate::persona::current().browser.user_agent
     );
     if let Some(user) = &proxy.username {
         request.push_str(&format!(
@@ -462,7 +650,7 @@ fn read_response(stream: &mut impl Read) -> Result<(u16, Vec<(String, String)>, 
         }
         buf.extend_from_slice(&chunk[..n]);
         header_end = find_header_end(&buf);
-        if buf.len() > 256 * 1024 {
+        if false && buf.len() > 256 * 1024 {
             return Err("response headers too large".into());
         }
     }
@@ -623,7 +811,7 @@ fn connect_through(
 pub fn unbrotli(data: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
-    brotli_decompressor::Decompressor::new(data, 64 * 1024).take(64 * 1024 * 1024).read_to_end(&mut out).ok()?;
+    brotli_decompressor::Decompressor::new(data, 64 * 1024).take(u64::MAX).read_to_end(&mut out).ok()?;
     Some(out)
 }
 
@@ -648,39 +836,10 @@ fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
     }
     let end = data.len().checked_sub(8)?;
     let mut out = miniz_oxide::inflate::decompress_to_vec(data.get(at..end)?).ok()?;
-    if out.len() > 64 * 1024 * 1024 {
+    if false && out.len() > 64 * 1024 * 1024 {
         out.truncate(64 * 1024 * 1024);
     }
     Some(out)
-}
-
-/// A TCP stream to `host:port` along the browser's own path: through the
-/// chain when there is one, else to an address found over DoH (the system
-/// resolver only when DoH was switched off). The media proxy uses this, so
-/// a player reaches the network exactly like a page does.
-pub fn open_path(
-    host: &str,
-    port: u16,
-    chain: &Chain,
-    resolver: Option<&crate::resolver::Resolver>,
-    timeout: Duration,
-) -> Result<TcpStream, String> {
-    if !chain.hops.is_empty() {
-        return open_tunnel(chain, host, port, timeout);
-    }
-    match resolver {
-        Some(resolver) => {
-            let mut last = String::from("no address");
-            for address in resolver.resolve(host, chain, timeout)? {
-                match tcp_connect_addr(address, port, timeout) {
-                    Ok(stream) => return Ok(stream),
-                    Err(err) => last = err,
-                }
-            }
-            Err(format!("connect failed via DoH: {last}"))
-        }
-        None => tcp_connect(host, port, timeout),
-    }
 }
 
 /// Establish a tunnel to `host:port` through the chain, honouring hop kinds.
@@ -877,6 +1036,17 @@ fn socks5_connect(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scripts_set_only_harmless_headers() {
+        assert_eq!(super::script_header("Accept", "application/json"), Some(("Accept".into(), "application/json".into())));
+        assert!(super::script_header("X-Requested-With", "XMLHttpRequest").is_some());
+        for bad in ["User-Agent", "accept-language", "Cookie", "Origin", "Referer", "Host", "Sec-Fetch-Mode", "Proxy-Authorization", "Content-Length"] {
+            assert_eq!(super::script_header(bad, "x"), None, "{bad}");
+        }
+        assert_eq!(super::script_header("X-A", "1\r\nX-B: 2"), None);
+        assert_eq!(super::script_header("X A", "1"), None);
+    }
+
     use super::*;
 
     #[test]

@@ -1,5 +1,94 @@
 //! CSS: a real (small) parser, selector matching, and the cascade.
 
+/// (sheet, node, a hash of the node's tag, attributes and ancestors, viewport):
+/// a node built and dropped during layout may reuse an address, the hash
+/// tells it apart without copying anything.
+type MatchingKey = (usize, usize, u64, u32, u32);
+type MatchingCache = std::collections::HashMap<MatchingKey, std::rc::Rc<Vec<Declaration>>, FastHash>;
+
+/// FxHash: a fast non-cryptographic hasher for the engine's own tables
+/// (keys are not attacker-chosen in a way that matters here).
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+pub type FastHash = std::hash::BuildHasherDefault<Fx>;
+
+/// `var()` substitutions of one layout, by (stylesheet declaration, variable
+/// scope); the scopes are kept alive here so their addresses stay theirs.
+#[derive(Default)]
+struct VarCache {
+    results: std::collections::HashMap<(usize, usize), Option<std::rc::Rc<str>>, FastHash>,
+    scopes: std::collections::HashMap<usize, std::sync::Arc<Vars>, FastHash>,
+}
+
+thread_local! {
+    static LAYOUT_MATCHES: std::cell::RefCell<Option<MatchingCache>> = const { std::cell::RefCell::new(None) };
+    static LAYOUT_VARS: std::cell::RefCell<Option<VarCache>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A declaration's value with its `var()`s replaced: borrowed when it has
+/// none; for stylesheet declarations (`shared`: alive for the whole layout)
+/// remembered per variable scope, since most elements share their parent's.
+pub fn substitute_in<'a>(value: &'a str, vars: &std::sync::Arc<Vars>, shared: bool) -> Option<std::borrow::Cow<'a, str>> {
+    if !has_var(value) {
+        return Some(std::borrow::Cow::Borrowed(value));
+    }
+    if shared {
+        let key = (value.as_ptr() as usize ^ (value.len() << 48), std::sync::Arc::as_ptr(vars) as usize);
+        let hit = LAYOUT_VARS.with(|c| c.borrow().as_ref().map(|c| c.results.get(&key).cloned()));
+        match hit {
+            Some(Some(found)) => return found.map(|v| std::borrow::Cow::Owned(v.to_string())),
+            Some(None) => {
+                let out = substitute_vars(value, &**vars);
+                LAYOUT_VARS.with(|c| {
+                    if let Some(c) = c.borrow_mut().as_mut() {
+                        c.scopes.entry(key.1).or_insert_with(|| vars.clone());
+                        c.results.insert(key, out.as_deref().map(std::rc::Rc::from));
+                    }
+                });
+                return out.map(std::borrow::Cow::Owned);
+            }
+            None => {}
+        }
+    }
+    substitute_vars(value, &**vars).map(std::borrow::Cow::Owned)
+}
+
+/// A document is immutable during one layout. Intrinsic-size probes revisit
+/// the same elements, but selector matching need only run once per element.
+/// The scope ends before DOM changes or another page can reuse its addresses.
+pub(crate) struct MatchingScope(Option<MatchingCache>, Option<VarCache>);
+
+pub(crate) fn cache_layout_matches() -> MatchingScope {
+    MatchingScope(
+        LAYOUT_MATCHES.with(|cache| cache.replace(Some(MatchingCache::default()))),
+        LAYOUT_VARS.with(|cache| cache.replace(Some(VarCache::default()))),
+    )
+}
+
+impl Drop for MatchingScope {
+    fn drop(&mut self) {
+        LAYOUT_MATCHES.with(|cache| cache.replace(self.0.take()));
+        LAYOUT_VARS.with(|cache| cache.replace(self.1.take()));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -19,6 +108,7 @@ impl Color {
     #[allow(dead_code)]
     pub const LIGHT_GRAY: Color = Color::rgb(238, 238, 238);
 
+    #[allow(dead_code)]
     pub fn with_alpha(self, a: u8) -> Color {
         Color { a, ..self }
     }
@@ -39,6 +129,9 @@ impl Color {
 pub fn parse_color(value: &str) -> Option<Color> {
     let value = value.trim().to_ascii_lowercase();
     if let Some(hex) = value.strip_prefix('#') {
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         let digit = |s: &str| u8::from_str_radix(s, 16).ok();
         let double = |c: &str| digit(&c.repeat(2));
         return match hex.len() {
@@ -357,6 +450,7 @@ fn unescape(s: &str) -> String {
 }
 
 fn parse_compound(text: &str) -> Option<Compound> {
+    if text.trim().is_empty() { return None; }
     let chars: Vec<char> = text.chars().collect();
     let mut compound = Compound::default();
     let mut i = 0;
@@ -505,13 +599,31 @@ pub enum Media {
     Never,
     /// (min-width) / (max-width) pairs, all must hold
     Width { min: Option<f32>, max: Option<f32> },
+    Height { min: Option<f32>, max: Option<f32> },
+    Not(Box<Media>),
     /// a comma list: any may hold
     Any(Vec<Media>),
     Both(Box<Media>, Box<Media>),
 }
 
+/// Whether the system is in dark mode (as browsers follow it):
+/// SEPIA_COLOR_SCHEME=light|dark decides, else the macOS appearance.
+pub fn system_dark() -> bool {
+    static DARK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DARK.get_or_init(|| match std::env::var("SEPIA_COLOR_SCHEME").ok().as_deref() {
+        Some("dark") => true,
+        Some(_) => false,
+        None if cfg!(target_os = "macos") => std::process::Command::new("/usr/bin/defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().eq_ignore_ascii_case("dark"))
+            .unwrap_or(false),
+        None => false,
+    })
+}
+
 impl Media {
-    fn parse(text: &str) -> Media {
+    pub fn parse(text: &str) -> Media {
         let text = text.trim().to_ascii_lowercase();
         if text.is_empty() {
             return Media::All;
@@ -532,9 +644,11 @@ impl Media {
         let mut result = Media::All;
         let mut min = None;
         let mut max = None;
+        let mut min_height = None;
+        let mut max_height = None;
         for part in query.split(" and ") {
             let part = part.trim();
-            let feature = part.trim_start_matches('(').trim_end_matches(')');
+            let feature = part.strip_prefix('(').and_then(|f| f.strip_suffix(')')).unwrap_or(part).trim();
             if part == "screen" || part == "all" {
                 continue;
             }
@@ -566,13 +680,21 @@ impl Media {
                 }
             };
             match name {
-                "min-width" => min = px_value(value),
-                "max-width" => max = px_value(value),
+                // a length we cannot read makes the query false, as in browsers
+                "min-width" | "max-width" | "min-height" | "max-height" => match px_value(value) {
+                    Some(v) => match name {
+                        "min-width" => min = Some(v),
+                        "max-width" => max = Some(v),
+                        "min-height" => min_height = Some(v),
+                        _ => max_height = Some(v),
+                    },
+                    None => result = Media::Never,
+                },
                 // a light screen, no motion preferences, a fine pointer, no hover
-                "prefers-color-scheme" if value != "light" => result = Media::Never,
+                "prefers-color-scheme" if (value == "dark") != system_dark() => result = Media::Never,
                 "prefers-reduced-motion" | "prefers-contrast" | "orientation" | "pointer" | "any-pointer"
                 | "prefers-color-scheme" | "min-resolution" | "max-resolution" | "-webkit-min-device-pixel-ratio"
-                | "min-height" | "max-height" | "display-mode" | "forced-colors" | "scripting" => {
+                | "display-mode" | "forced-colors" | "scripting" => {
                     if name == "scripting" && value != "none" {
                         result = Media::Never;
                     }
@@ -584,34 +706,29 @@ impl Media {
                 _ => {}
             }
         }
-        let width = Media::Width { min, max };
-        let combined = match result {
-            Media::Never => Media::Never,
-            _ => width,
-        };
-        if negate {
-            // `not` over a simple query: invert width ranges approximately
-            match combined {
-                Media::Never => Media::All,
-                Media::Width { min: None, max: None } => Media::Never,
-                Media::Width { min, max } => Media::Any(vec![
-                    Media::Width { min: None, max: min.map(|m| m - 0.01) },
-                    Media::Width { min: max.map(|m| m + 0.01), max: None },
-                ]),
-                other => other,
-            }
-        } else {
-            combined
-        }
+        let dimensions = Media::Both(
+            Box::new(Media::Width { min, max }),
+            Box::new(Media::Height { min: min_height, max: max_height }),
+        );
+        let combined = if matches!(result, Media::Never) { Media::Never } else { dimensions };
+        if negate { Media::Not(Box::new(combined)) } else { combined }
     }
 
+    /// Compatibility entry point for callers that only supply a width.
+    #[allow(dead_code)]
     pub fn matches(&self, width: f32) -> bool {
+        self.matches_viewport(width, 800.0)
+    }
+
+    pub fn matches_viewport(&self, width: f32, height: f32) -> bool {
         match self {
             Media::All => true,
             Media::Never => false,
             Media::Width { min, max } => min.map_or(true, |m| width >= m) && max.map_or(true, |m| width <= m),
-            Media::Any(list) => list.iter().any(|m| m.matches(width)),
-            Media::Both(a, b) => a.matches(width) && b.matches(width),
+            Media::Height { min, max } => min.map_or(true, |m| height >= m) && max.map_or(true, |m| height <= m),
+            Media::Not(query) => !query.matches_viewport(width, height),
+            Media::Any(list) => list.iter().any(|m| m.matches_viewport(width, height)),
+            Media::Both(a, b) => a.matches_viewport(width, height) && b.matches_viewport(width, height),
         }
     }
 }
@@ -622,6 +739,9 @@ fn px_value(value: &str) -> Option<f32> {
         v.trim().parse().ok()
     } else if let Some(v) = value.strip_suffix("rem").or_else(|| value.strip_suffix("em")) {
         v.trim().parse::<f32>().ok().map(|v| v * 16.0)
+    } else if value.contains('(') {
+        // calc(), min(), max(), clamp() over lengths, as in (max-width: calc(1120px - 1px))
+        crate::style::parse_length(value, 16.0, 0.0)
     } else {
         value.parse().ok()
     }
@@ -647,11 +767,21 @@ pub struct FontFace {
     pub italic: bool,
     /// worth loading first: no unicode-range, or one that covers basic Latin or Cyrillic
     pub common: bool,
+    /// the `unicode-range` (empty: every character)
+    pub ranges: Vec<(u32, u32)>,
+}
+
+impl FontFace {
+    /// Whether the face is for any of these characters (as a browser only
+    /// downloads the subsets a page's text needs).
+    pub fn wanted(&self, chars: &std::collections::HashSet<char>) -> bool {
+        self.ranges.is_empty() || chars.iter().any(|c| self.ranges.iter().any(|(a, b)| (*a..=*b).contains(&(*c as u32))))
+    }
 }
 
 impl FontFace {
     fn parse(body: &str) -> Option<FontFace> {
-        let mut face = FontFace { family: String::new(), sources: Vec::new(), bold: false, italic: false, common: true };
+        let mut face = FontFace { family: String::new(), sources: Vec::new(), bold: false, italic: false, common: true, ranges: Vec::new() };
         for d in parse_declarations(body) {
             match d.name.as_str() {
                 "unicode-range" => {
@@ -670,6 +800,17 @@ impl FontFace {
                         })
                     };
                     face.common = covers(0x61) || covers(0x430);
+                    for r in d.value.split(',') {
+                        let r = r.trim().trim_start_matches(['U', 'u']).trim_start_matches('+');
+                        let (a, b) = match r.split_once('-') {
+                            Some((a, b)) => (a.to_string(), b.to_string()),
+                            None if r.contains('?') => (r.replace('?', "0"), r.replace('?', "F")),
+                            None => (r.to_string(), r.to_string()),
+                        };
+                        if let (Ok(a), Ok(b)) = (u32::from_str_radix(&a, 16), u32::from_str_radix(&b, 16)) {
+                            face.ranges.push((a, b));
+                        }
+                    }
                 }
                 "font-family" => face.family = d.value.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase(),
                 "src" => {
@@ -698,7 +839,7 @@ impl FontFace {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
     /// `@font-face` rules, for the loader to fetch
@@ -707,11 +848,29 @@ pub struct Stylesheet {
     pub imports: Vec<String>,
     /// width the `@media` queries are evaluated against
     pub viewport_width: f32,
+    /// Height used by viewport media conditions.
+    pub viewport_height: f32,
+    candidates: std::sync::OnceLock<RuleIndex>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuleIndex {
+    len: usize,
+    keys: std::collections::HashMap<(u8, String), Vec<usize>>,
+    universal: Vec<usize>,
+}
+
+impl PartialEq for Stylesheet {
+    fn eq(&self, other: &Self) -> bool {
+        self.rules == other.rules && self.font_faces == other.font_faces
+            && self.imports == other.imports && self.viewport_width == other.viewport_width
+            && self.viewport_height == other.viewport_height
+    }
 }
 
 impl Default for Stylesheet {
     fn default() -> Stylesheet {
-        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), viewport_width: 1024.0 }
+        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), viewport_width: 1024.0, viewport_height: 800.0, candidates: Default::default() }
     }
 }
 
@@ -748,11 +907,12 @@ impl Stylesheet {
         let rules: Vec<(&Rule, String)> = self
             .rules
             .iter()
-            .filter(|r| r.media.matches(self.viewport_width))
+            .filter(|r| r.media.matches_viewport(self.viewport_width, self.viewport_height))
             .filter_map(|r| r.declarations.iter().filter(|d| d.name == "background" || d.name == "background-image").find_map(|d| css_url(&d.value)).map(|u| (r, u)))
             .collect();
         let mut out: Vec<String> = Vec::new();
         fn walk<'n>(node: &'n crate::dom::Node, ancestors: &mut Vec<&'n crate::dom::Node>, rules: &[(&Rule, String)], out: &mut Vec<String>) {
+            if matches!(node.tag.as_str(), "template" | "noscript") { return; }
             if out.len() >= 48 {
                 return;
             }
@@ -785,6 +945,7 @@ impl Stylesheet {
     }
 
     pub fn append(&mut self, other: Stylesheet) {
+        self.candidates.take();
         let base = self.rules.len();
         for mut rule in other.rules {
             rule.order += base;
@@ -907,11 +1068,61 @@ impl Stylesheet {
     /// Declarations that apply to `node`, in cascade order: normal ones by
     /// (specificity, source order), then `!important` ones the same way.
     /// `ancestors` runs outermost first and ends with the parent.
-    pub fn matching(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> Vec<Declaration> {
-        let mut hits: Vec<(u32, usize, &Rule)> = self
-            .rules
-            .iter()
-            .filter(|rule| rule.media.matches(self.viewport_width) && matches_selector(&rule.selector, node, ancestors))
+    pub fn matching(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> std::rc::Rc<Vec<Declaration>> {
+        LAYOUT_MATCHES.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(cache) = slot.as_mut() else { return std::rc::Rc::new(self.matching_uncached(node, ancestors)) };
+            let shape = {
+                use std::hash::{Hash, Hasher};
+                let mut h = Fx::default();
+                node.tag.hash(&mut h);
+                node.attrs.hash(&mut h);
+                for a in ancestors {
+                    (*a as *const crate::dom::Node as usize).hash(&mut h);
+                }
+                h.finish()
+            };
+            let key = (self as *const Self as usize, node as *const crate::dom::Node as usize, shape, self.viewport_width.to_bits(), self.viewport_height.to_bits());
+            if let Some(hit) = cache.get(&key) {
+                return hit.clone();
+            }
+            let declarations = std::rc::Rc::new(self.matching_uncached(node, ancestors));
+            cache.insert(key, declarations.clone());
+            declarations
+        })
+    }
+
+    fn matching_uncached(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> Vec<Declaration> {
+        let index = self.candidates.get_or_init(|| {
+            let mut index = RuleIndex { len: self.rules.len(), ..RuleIndex::default() };
+            for (i, rule) in self.rules.iter().enumerate() {
+                let Some(last) = rule.selector.chain.last() else { continue };
+                if last.pseudos.iter().any(|p| matches!(p, Pseudo::Never)) { continue; }
+                let key = last.id.as_ref().map(|id| (0, id.clone()))
+                    .or_else(|| last.classes.first().map(|class| (1, class.clone())))
+                    .or_else(|| last.tag.as_ref().map(|tag| (2, tag.clone())));
+                if let Some(key) = key { index.keys.entry(key).or_default().push(i); }
+                else { index.universal.push(i); }
+            }
+            index
+        });
+        let mut candidates = index.universal.clone();
+        let mut add = |kind, value: &str| {
+            if let Some(indices) = index.keys.get(&(kind, value.to_string())) { candidates.extend(indices); }
+        };
+        add(2, &node.tag);
+        if let Some(id) = node.attr("id") { add(0, id); }
+        if let Some(classes) = node.attr("class") {
+            for class in classes.split_whitespace() { add(1, class); }
+        }
+        // Public rule vectors may have been extended by an older caller.
+        // Fall back to a full scan rather than silently dropping new rules.
+        if index.len != self.rules.len() { candidates = (0..self.rules.len()).collect(); }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut hits: Vec<(u32, usize, &Rule)> = candidates.into_iter()
+            .filter_map(|i| self.rules.get(i))
+            .filter(|rule| rule.media.matches_viewport(self.viewport_width, self.viewport_height) && matches_selector(&rule.selector, node, ancestors))
             .map(|rule| (rule.selector.specificity(), rule.order, rule))
             .collect();
         hits.sort_by_key(|(spec, order, _)| (*spec, *order));
@@ -1021,7 +1232,7 @@ fn previous_elements<'n>(node: &crate::dom::Node, ancestors: &[&'n crate::dom::N
             out.reverse();
             return out;
         }
-        if child.text.is_none() {
+        if child.text.is_none() && !child.tag.starts_with('#') {
             out.push(child);
         }
     }
@@ -1034,7 +1245,7 @@ fn position(node: &crate::dom::Node, ancestors: &[&crate::dom::Node], of_type: b
     let parent = ancestors.last()?;
     let mut index = None;
     let mut count = 0;
-    for child in parent.children.iter().filter(|c| c.text.is_none() && (!of_type || c.tag == node.tag)) {
+    for child in parent.children.iter().filter(|c| c.text.is_none() && !c.tag.starts_with('#') && (!of_type || c.tag == node.tag)) {
         count += 1;
         if std::ptr::eq(child, node) {
             index = Some(count);
@@ -1044,7 +1255,7 @@ fn position(node: &crate::dom::Node, ancestors: &[&crate::dom::Node], of_type: b
 }
 
 fn compound_matches(compound: &Compound, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
-    if node.text.is_some() {
+    if node.text.is_some() || node.tag.starts_with('#') {
         return false;
     }
     if let Some(tag) = &compound.tag {
@@ -1088,7 +1299,7 @@ fn compound_matches(compound: &Compound, node: &crate::dom::Node, ancestors: &[&
             Pseudo::OnlyChild => position(node, ancestors, false).is_some_and(|(_, n)| n == 1),
             Pseudo::FirstOfType => position(node, ancestors, true).is_some_and(|(i, _)| i == 1),
             Pseudo::LastOfType => position(node, ancestors, true).is_some_and(|(i, n)| i == n),
-            Pseudo::Empty => node.children.iter().all(|c| c.text.as_ref().is_some_and(|t| t.is_empty())),
+            Pseudo::Empty => node.children.iter().all(|c| c.tag == "#comment" || c.text.as_ref().is_some_and(|t| t.is_empty())),
             Pseudo::Nth { a, b, last, of_type } => position(node, ancestors, *of_type).is_some_and(|(i, n)| {
                 let k = if *last { (n - i + 1) as i32 } else { i as i32 };
                 if *a == 0 {
@@ -1115,11 +1326,107 @@ fn compound_matches(compound: &Compound, node: &crate::dom::Node, ancestors: &[&
 // Custom properties
 // ---------------------------------------------------------------------------
 
+/// Where `var(--name)` looks a name up: the name's value with its own
+/// `var()`s already replaced (None if missing or cyclic).
+pub trait VarLookup {
+    fn resolved(&self, name: &str, active: &mut Vec<String>) -> Option<String>;
+}
+
+/// A flat list, last definition winning (tests, small sets).
+impl VarLookup for [(String, String)] {
+    fn resolved(&self, name: &str, active: &mut Vec<String>) -> Option<String> {
+        let raw = self.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str())?;
+        if active.iter().any(|a| a == name) {
+            return None;
+        }
+        active.push(name.to_string());
+        let out = resolve_vars(raw, self, active, active.len());
+        active.pop();
+        out
+    }
+}
+
+impl VarLookup for Vec<(String, String)> {
+    fn resolved(&self, name: &str, active: &mut Vec<String>) -> Option<String> {
+        self.as_slice().resolved(name, active)
+    }
+}
+
+/// The custom properties in force at an element: its own (as written), then
+/// its ancestors'. A chain, so an element that sets a few does not copy the
+/// thousands a design system puts on `:root`; a value is resolved the first
+/// time it is used, in the scope that defines it, and remembered there.
+#[derive(Debug, Default)]
+pub struct Vars {
+    own: std::collections::HashMap<String, String, FastHash>,
+    parent: Option<std::sync::Arc<Vars>>,
+    memo: std::sync::Mutex<std::collections::HashMap<String, Option<String>, FastHash>>,
+}
+
+impl PartialEq for Vars {
+    fn eq(&self, other: &Vars) -> bool {
+        std::ptr::eq(self, other) || (self.own == other.own && self.parent == other.parent)
+    }
+}
+
+impl Vars {
+    /// An element's scope on top of its parent's.
+    pub fn child(parent: std::sync::Arc<Vars>) -> Vars {
+        Vars { own: Default::default(), parent: Some(parent), memo: Default::default() }
+    }
+
+    pub fn set(&mut self, name: String, value: String) {
+        self.own.insert(name, value);
+    }
+}
+
+impl VarLookup for Vars {
+    fn resolved(&self, name: &str, active: &mut Vec<String>) -> Option<String> {
+        // the scope that defines it
+        let mut scope = self;
+        let raw = loop {
+            if let Some(v) = scope.own.get(name) {
+                break v;
+            }
+            scope = scope.parent.as_deref()?;
+        };
+        if let Some(done) = scope.memo.lock().ok().and_then(|m| m.get(name).cloned()) {
+            return done;
+        }
+        if active.iter().any(|a| a == name) {
+            return None;
+        }
+        active.push(name.to_string());
+        let out = resolve_vars(raw, scope, active, active.len());
+        active.pop();
+        // a cycle seen from inside is not this value's final answer
+        if active.is_empty() || out.is_some() {
+            if let Ok(mut m) = scope.memo.lock() {
+                m.insert(name.to_string(), out.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Does a value use `var(`? (a byte scan: cheaper than setting up a substring
+/// search for every declaration of every element)
+pub fn has_var(value: &str) -> bool {
+    value.as_bytes().windows(4).any(|w| w == b"var(")
+}
+
 /// Replace every `var(--name, fallback)` in `value` from `vars` (last
 /// definition wins). Unresolvable references with no fallback make the
 /// whole value invalid (None), as in CSS.
-pub fn substitute_vars(value: &str, vars: &[(String, String)]) -> Option<String> {
-    if !value.contains("var(") {
+pub fn substitute_vars<V: VarLookup + ?Sized>(value: &str, vars: &V) -> Option<String> {
+    resolve_vars(value, vars, &mut Vec::new(), 0)
+}
+
+fn resolve_vars<V: VarLookup + ?Sized>(value: &str, vars: &V, active: &mut Vec<String>, depth: usize) -> Option<String> {
+    if depth >= 64 {
+        return None;
+    }
+    if !has_var(value) {
         return Some(value.to_string());
     }
     let mut out = String::with_capacity(value.len());
@@ -1133,14 +1440,14 @@ pub fn substitute_vars(value: &str, vars: &[(String, String)]) -> Option<String>
         out.push_str(&rest[..start]);
         let after = &rest[start + 4..];
         // matching parenthesis
-        let mut depth = 1;
+        let mut level = 1;
         let mut end = None;
         for (i, c) in after.char_indices() {
             match c {
-                '(' => depth += 1,
+                '(' => level += 1,
                 ')' => {
-                    depth -= 1;
-                    if depth == 0 {
+                    level -= 1;
+                    if level == 0 {
                         end = Some(i);
                         break;
                     }
@@ -1154,11 +1461,9 @@ pub fn substitute_vars(value: &str, vars: &[(String, String)]) -> Option<String>
             Some((n, f)) => (n.trim(), Some(f.trim())),
             None => (inner.trim(), None),
         };
-        let resolved = vars.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-        match resolved.or(fallback) {
-            Some(v) => out.push_str(&substitute_vars(v, vars)?),
-            None => return None,
-        }
+        let resolved = vars.resolved(name, active);
+        let resolved = resolved.or_else(|| fallback.and_then(|v| resolve_vars(v, vars, active, depth + 1)))?;
+        out.push_str(&resolved);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -1167,25 +1472,95 @@ pub fn substitute_vars(value: &str, vars: &[(String, String)]) -> Option<String>
 
 fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    while let Some(start) = rest.find("/*") {
-        out.push_str(&rest[..start]);
-        match rest[start + 2..].find("*/") {
-            Some(end) => rest = &rest[start + 2 + end + 2..],
-            None => return out,
+    let mut chars = css.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() { out.push(escaped); }
+            } else if ch == q {
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            out.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
         }
     }
-    out.push_str(rest);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comments_do_not_count_as_element_siblings_or_empty_content() {
+        let doc = crate::dom::parse_document("<div><!--before--><span>One</span><!--between--><b>Two</b><i><!--empty--></i></div>");
+        let div = doc.find_first("div").unwrap();
+        let sheet = Stylesheet::parse("span:first-child { color:red } span + b { color:blue } i:empty { color:green }");
+        assert_eq!(values(&sheet, div.find_first("span").unwrap(), &[&doc, div]), vec!["red"]);
+        assert_eq!(values(&sheet, div.find_first("b").unwrap(), &[&doc, div]), vec!["blue"]);
+        assert_eq!(values(&sheet, div.find_first("i").unwrap(), &[&doc, div]), vec!["green"]);
+    }
+
+    #[test]
+    fn indexed_rules_preserve_cascade_ancestors_media_and_append() {
+        let doc = crate::dom::parse_document("<main class='outer'><p id='target' class='a a b' data-kind='x'>Text</p></main>");
+        let main = doc.find_first("main").unwrap();
+        let p = main.find_first("p").unwrap();
+        let mut sheet = Stylesheet::parse("* { color:black } p { color:gray } .outer .a { color:red } #target { color:blue } [data-kind=x] { color:green !important } @media(max-width:600px) { .b { color:orange !important } } :is(.a,.b) { color:purple } p::before { color:pink }");
+        for width in [500.0, 1200.0] {
+            sheet.viewport_width = width;
+            let mut rules: Vec<_> = sheet.rules.iter().filter(|r| r.media.matches_viewport(width, 800.0) && matches_selector(&r.selector, p, &[&doc, main])).collect();
+            rules.sort_by_key(|r| (r.selector.specificity(), r.order));
+            let expected: Vec<_> = rules.iter().flat_map(|r| r.declarations.iter()).filter(|d| !d.important)
+                .chain(rules.iter().flat_map(|r| r.declarations.iter()).filter(|d| d.important)).cloned().collect();
+            assert_eq!(*sheet.matching(p, &[&doc, main]), expected);
+        }
+        sheet.append(Stylesheet::parse("#target { background:red }"));
+        assert!(sheet.matching(p, &[&doc, main]).iter().any(|d| d.name == "background"));
+    }
+
+    #[test]
+    fn empty_functional_selectors_never_become_universal_rules() {
+        let doc = crate::dom::parse_document("<body><p>Visible content</p></body>");
+        let sheet = Stylesheet::parse(":is() { position:absolute; top:50%; left:50% } :where() { display:none } :not() { color:red } p { color:blue }");
+        assert!(sheet.matching(&doc, &[]).is_empty());
+        let body = doc.find_first("body").unwrap();
+        assert!(sheet.matching(body, &[&doc]).is_empty());
+        let p = body.find_first("p").unwrap();
+        assert_eq!(values(&sheet, p, &[&doc, body]), vec!["blue".to_string()]);
+    }
+
+    #[test]
+    fn cyclic_variables_invalidate_without_recursing_forever() {
+        let vars = vec![("--a".into(), "var(--b)".into()), ("--b".into(), "var(--a)".into())];
+        assert_eq!(substitute_vars("var(--a)", &vars), None);
+        assert_eq!(substitute_vars("var(--a, 12px)", &vars), Some("12px".into()));
+        assert_eq!(substitute_vars("var(--missing, rgb(1, 2, 3))", &vars), Some("rgb(1, 2, 3)".into()));
+    }
+
+    #[test]
+    fn comments_inside_strings_and_invalid_unicode_colors_are_safe() {
+        assert_eq!(strip_comments("a { content: '/*literal*/'; /* remove */ color: red }"), "a { content: '/*literal*/';  color: red }");
+        assert_eq!(parse_color("#éab"), None);
+        assert_eq!(parse_color("#界"), None);
+    }
     use crate::dom::parse_document;
 
     fn values(sheet: &Stylesheet, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> Vec<String> {
-        sheet.matching(node, ancestors).into_iter().map(|d| d.value).collect()
+        sheet.matching(node, ancestors).iter().map(|d| d.value.clone()).collect()
     }
 
     #[test]
@@ -1263,6 +1638,13 @@ mod tests {
     }
 
     #[test]
+    fn media_queries_read_calc_lengths() {
+        let q = Media::parse("screen and (max-width:calc(1120px - 1px))");
+        assert!(q.matches_viewport(1000.0, 800.0) && !q.matches_viewport(1200.0, 800.0));
+        assert!(!Media::parse("(min-width: nonsense)").matches_viewport(1200.0, 800.0));
+    }
+
+    #[test]
     fn at_rules_and_imports() {
         let sheet = Stylesheet::parse(
             "@import url(\"base.css\"); @import 'print.css' print; @charset \"utf-8\"; \
@@ -1285,5 +1667,22 @@ mod tests {
         assert_eq!(parse_color("hsl(0, 100%, 50%)"), Some(Color::rgb(255, 0, 0)));
         assert_eq!(parse_color("rebeccapurple"), Some(Color::rgb(0x66, 0x33, 0x99)));
         assert_eq!(parse_color("nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod viewport_media_regressions {
+    use super::*;
+
+    #[test]
+    fn height_conditions_use_actual_viewport_and_compose_with_width() {
+        let query = Media::parse("screen and (min-width: 400px) and (max-height: 500px)");
+        assert!(query.matches_viewport(640.0, 480.0));
+        assert!(!query.matches_viewport(640.0, 900.0));
+        assert!(!query.matches_viewport(320.0, 480.0));
+        assert!(Media::parse("(min-height: 700px)").matches_viewport(640.0, 700.0));
+        assert!(!Media::parse("(min-height: 700px)").matches_viewport(640.0, 699.0));
+        assert!(Media::parse("not screen and (max-height: 500px)").matches_viewport(640.0, 900.0));
+        assert!(Media::parse("(max-width: 300px), (max-height: 500px)").matches_viewport(640.0, 480.0));
     }
 }

@@ -2,6 +2,7 @@
 name = "sepia-browser"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 description = "A browser written from scratch: own parser, cascade, layout and rasteriser"
 license = "MIT"
 
@@ -10,12 +11,12 @@ fontdue = "0.9"
 png = "0.17"
 rustls = "0.23"
 webpki-roots = "0.26"
-winit = "0.29"
+winit = { version = "0.29", features = ["rwh_05"] }
 softbuffer = "0.4"
 zune-jpeg = "0.5.15"
 zune-core = "0.5"
 gif = { version = "0.14", default-features = false, features = ["std"] }
-boa_engine = { version = "0.22.0", default-features = false, features = ["annex-b"] }
+boa_engine = { version = "0.22.0", default-features = false, features = ["annex-b", "intl_bundled", "temporal"] }
 miniz_oxide = "0.8"
 image-webp = "0.2.4"
 brotli-decompressor = "5.0.0"
@@ -25,3 +26,12 @@ opt-level = 3
 lto = true
 panic = "abort"
 strip = true
+
+# Boa 0.22 fixes, marked "Sepia patch" in the sources:
+# - boa_ast: `this` lost in arrows nested inside arrows (src/scope.rs)
+# - boa_engine: Array/TypedArray sort panicked on inconsistent comparators
+#   (src/builtins/array/mod.rs)
+[patch.crates-io]
+boa_parser = { path = "vendor/boa_parser" }
+boa_ast = { path = "vendor/boa_ast" }
+boa_engine = { path = "vendor/boa_engine" }

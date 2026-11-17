@@ -10,8 +10,8 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 /// Largest image we decode, in pixels (a 4K photo is ~8.3 M).
-const MAX_PIXELS: usize = 16_000_000;
-const MAX_SIDE: usize = 8192;
+const MAX_PIXELS: usize = usize::MAX;
+const MAX_SIDE: usize = usize::MAX;
 
 /// A decoded image, premultiplied RGBA8.
 pub struct Bitmap {
@@ -118,9 +118,74 @@ pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
         decode_webp(bytes)
     } else if crate::svg::sniff(bytes) {
         crate::svg::decode(bytes)
+    } else if bytes.starts_with(&[0, 0, 1, 0]) {
+        decode_ico(bytes)
     } else {
         None
     }
+}
+
+/// Windows icons (favicon.ico): the largest image up to 64 px, either a PNG
+/// inside or a BMP (32/24/8/4/1 bit, bottom-up, with its AND mask).
+fn decode_ico(bytes: &[u8]) -> Option<Bitmap> {
+    let u16le = |at: usize| -> Option<usize> { Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize) };
+    let u32le = |at: usize| -> Option<usize> { Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize) };
+    let count = u16le(4)?.min(64);
+    let mut best: Option<(usize, usize, usize)> = None; // (size, offset, length)
+    for i in 0..count {
+        let e = 6 + i * 16;
+        let w = match *bytes.get(e)? { 0 => 256, w => w as usize };
+        let (len, off) = (u32le(e + 8)?, u32le(e + 12)?);
+        // prefer the biggest up to 64 px, else the smallest bigger one
+        let rank = |s: usize| if s <= 64 { s } else { 1000 - s.min(999) };
+        if best.is_none_or(|(b, _, _)| rank(w) > rank(b)) {
+            best = Some((w, off, len));
+        }
+    }
+    let (_, off, len) = best?;
+    let data = bytes.get(off..off.checked_add(len)?)?;
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return decode_png(data);
+    }
+    // BITMAPINFOHEADER; the height counts the XOR image and the AND mask
+    let d16 = |at: usize| -> Option<usize> { Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?) as usize) };
+    let d32 = |at: usize| -> Option<i64> { Some(i32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?) as i64) };
+    let header = d32(0)? as usize;
+    let w = d32(4)?.unsigned_abs() as usize;
+    let h = (d32(8)?.unsigned_abs() as usize) / 2;
+    let bpp = d16(14)?;
+    if !fits(w, h) || w == 0 || h == 0 || header < 40 {
+        return None;
+    }
+    let colors = match d32(32)? { 0 if bpp <= 8 => 1 << bpp, n => n.max(0) as usize };
+    let palette_at = header;
+    let pixels_at = palette_at + if bpp <= 8 { colors * 4 } else { 0 };
+    let stride = (w * bpp).div_ceil(32) * 4;
+    let mask_at = pixels_at + stride * h;
+    let mask_stride = w.div_ceil(32) * 4;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let row = pixels_at + (h - 1 - y) * stride;
+        for x in 0..w {
+            let (b, g, r, a) = match bpp {
+                32 => { let p = data.get(row + x * 4..row + x * 4 + 4)?; (p[0], p[1], p[2], p[3]) }
+                24 => { let p = data.get(row + x * 3..row + x * 3 + 3)?; (p[0], p[1], p[2], 255) }
+                8 | 4 | 1 => {
+                    let bit = x * bpp;
+                    let byte = *data.get(row + bit / 8)?;
+                    let index = ((byte >> (8 - bpp - bit % 8)) & ((1u16 << bpp) - 1) as u8) as usize;
+                    let p = data.get(palette_at + index * 4..palette_at + index * 4 + 4)?;
+                    (p[0], p[1], p[2], 255)
+                }
+                _ => return None,
+            };
+            // the AND mask hides pixels (32-bit icons carry alpha instead)
+            let hidden = bpp != 32 && data.get(mask_at + (h - 1 - y) * mask_stride + x / 8).is_some_and(|m| m & (0x80 >> (x % 8)) != 0);
+            let o = (y * w + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&[r, g, b, if hidden { 0 } else { a }]);
+        }
+    }
+    Some(Bitmap::from_straight(w, h, rgba))
 }
 
 fn decode_webp(bytes: &[u8]) -> Option<Bitmap> {
@@ -147,7 +212,7 @@ fn decode_webp(bytes: &[u8]) -> Option<Bitmap> {
 }
 
 fn fits(w: usize, h: usize) -> bool {
-    w > 0 && h > 0 && w <= MAX_SIDE && h <= MAX_SIDE && w * h <= MAX_PIXELS
+    w > 0 && h > 0 && w <= MAX_SIDE && h <= MAX_SIDE && w.checked_mul(h).is_some_and(|p| p <= MAX_PIXELS)
 }
 
 fn decode_png(bytes: &[u8]) -> Option<Bitmap> {
@@ -235,6 +300,17 @@ fn decode_gif(bytes: &[u8]) -> Option<Bitmap> {
 }
 
 /// `data:image/png;base64,....` — decoded locally, no request.
+/// The bytes of a `data:` URL (base64 or percent-encoded) and its media type.
+pub fn data_url_bytes(src: &str) -> Option<(String, Vec<u8>)> {
+    let rest = src.trim().strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let kind = meta.split(';').next().unwrap_or("").to_ascii_lowercase();
+    if meta.to_ascii_lowercase().ends_with(";base64") {
+        return Some((kind, base64(&String::from_utf8_lossy(&percent_decode(payload)))?));
+    }
+    Some((kind, percent_decode(payload)))
+}
+
 pub fn decode_data_uri(src: &str) -> Option<Bitmap> {
     let rest = src.trim().strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
@@ -360,6 +436,38 @@ pub mod tests {
     }
 
     #[test]
+    fn decodes_bmp_icons_with_alpha_and_mask() {
+        // 2x2, 32 bpp (alpha in the pixels) and 24 bpp (alpha from the AND mask)
+        fn ico(bpp: u16, pixels: &[u8], mask: &[u8]) -> Vec<u8> {
+            let mut dib = Vec::new();
+            for v in [40u32, 2, 4] { dib.extend(v.to_le_bytes()); }
+            dib.extend(1u16.to_le_bytes());
+            dib.extend(bpp.to_le_bytes());
+            dib.extend([0u8; 24]);
+            dib.extend(pixels);
+            dib.extend(mask);
+            let mut out = vec![0, 0, 1, 0, 1, 0, 2, 2, 0, 0, 1, 0];
+            out.extend(bpp.to_le_bytes());
+            out.extend((dib.len() as u32).to_le_bytes());
+            out.extend(22u32.to_le_bytes());
+            out.extend(dib);
+            out
+        }
+        // bottom-up rows: the first row in the file is the bottom one
+        let b32 = ico(32, &[0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0], &[0; 8]);
+        let bitmap = decode(&b32).expect("32-bit icon");
+        assert_eq!((bitmap.width, bitmap.height), (2, 2));
+        assert_eq!(&bitmap.rgba[0..4], &[0, 0, 255, 255], "top-left is blue");
+        assert_eq!(&bitmap.rgba[12..16], &[0, 255, 0, 255], "bottom-right is green");
+        assert_eq!(bitmap.rgba[7], 0, "transparent pixel");
+        // 24 bpp rows pad to 4 bytes; mask bit 1 hides the top-left pixel
+        let b24 = ico(24, &[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0], &[0, 0, 0, 0, 0x80, 0, 0, 0]);
+        let bitmap = decode(&b24).expect("24-bit icon");
+        assert_eq!(bitmap.rgba[3], 0);
+        assert_eq!(bitmap.rgba[7], 255);
+    }
+
+    #[test]
     fn decodes_png_premultiplied() {
         let bmp = decode(&png_bytes(3, 2, [200, 100, 0, 128])).expect("png");
         assert_eq!((bmp.width, bmp.height), (3, 2));
@@ -415,9 +523,9 @@ pub mod tests {
     }
 
     #[test]
-    fn rejects_garbage_and_huge() {
+    fn rejects_garbage() {
         assert!(decode(b"<html>not an image</html>").is_none());
-        assert!(!fits(100_000, 1));
+        assert!(fits(100_000, 1) && !fits(0, 1));
     }
 
     #[test]

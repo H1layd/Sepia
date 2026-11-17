@@ -195,6 +195,7 @@ impl WebFonts {
         files.sort_by_key(|f| std::cmp::Reverse("aeiouxyz".chars().filter(|c| f.has_glyph(*c)).count()));
     }
 
+    #[allow(dead_code)]
     pub fn has(&self, family: &str) -> bool {
         self.families.read().unwrap_or_else(|e| e.into_inner()).contains_key(family)
     }
@@ -217,7 +218,7 @@ impl WebFonts {
     }
 }
 
-/// Parse a font file (TTF, OTF, TTC or WOFF) once per `key` (its URL).
+/// Parse a font file (TTF, OTF, TTC, WOFF or WOFF2) once per `key` (its URL).
 pub fn load_web_font(key: &str, bytes: &[u8]) -> Option<&'static Font> {
     let cache = LOADED.get_or_init(Default::default);
     if let Some(done) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(key) {

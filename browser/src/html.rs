@@ -50,15 +50,22 @@ pub fn tokenize(input: &str) -> Vec<Token> {
             i = (end + 3).min(bytes.len());
             continue;
         }
-        if rest_lower.starts_with("<!") {
+        // <!doctype …>; any other <!…> or <?…> is a "bogus comment" up to the
+        // next '>', as browsers parse it (lit-html marks text bindings <?lit$…$>)
+        if rest_lower.starts_with("<!") || rest_lower.starts_with("<?") {
             flush_text(&mut text, &mut tokens);
-            let mut end = i + 2;
+            let skip = if rest_lower.starts_with("<?") { 1 } else { 2 };
+            let mut end = i + skip;
             let mut content = String::new();
             while end < bytes.len() && bytes[end] != '>' {
                 content.push(bytes[end]);
                 end += 1;
             }
-            tokens.push(Token::Doctype(content));
+            if content.to_ascii_lowercase().starts_with("doctype") {
+                tokens.push(Token::Doctype(content));
+            } else {
+                tokens.push(Token::Comment(content));
+            }
             i = (end + 1).min(bytes.len());
             continue;
         }
@@ -98,8 +105,8 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                 if bytes[j] == '>' {
                     break;
                 }
-                if bytes[j] == '/' && j + 1 < bytes.len() && bytes[j + 1] == '>' {
-                    self_closing = true;
+                if bytes[j] == '/' {
+                    self_closing = j + 1 < bytes.len() && bytes[j + 1] == '>';
                     j += 1;
                     continue;
                 }
@@ -113,9 +120,15 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                     attr_name.push(bytes[j]);
                     j += 1;
                 }
+                while j < bytes.len() && bytes[j].is_whitespace() {
+                    j += 1;
+                }
                 let mut value = String::new();
                 if j < bytes.len() && bytes[j] == '=' {
                     j += 1;
+                    while j < bytes.len() && bytes[j].is_whitespace() {
+                        j += 1;
+                    }
                     if j < bytes.len() && (bytes[j] == '"' || bytes[j] == '\'') {
                         let quote = bytes[j];
                         j += 1;
@@ -123,7 +136,7 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                             value.push(bytes[j]);
                             j += 1;
                         }
-                        j += 1;
+                        if j < bytes.len() { j += 1; }
                     } else {
                         while j < bytes.len() && !bytes[j].is_whitespace() && bytes[j] != '>' {
                             value.push(bytes[j]);
@@ -132,7 +145,10 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                     }
                 }
                 if !attr_name.is_empty() {
-                    attrs.push((attr_name.to_lowercase(), decode_entities(&value)));
+                    let key = attr_name.to_lowercase();
+                    if !attrs.iter().any(|(name, _)| *name == key) {
+                        attrs.push((key, decode_entities(&value)));
+                    }
                 }
             }
             tokens.push(Token::StartTag {
@@ -142,19 +158,21 @@ pub fn tokenize(input: &str) -> Vec<Token> {
             });
             i = (j + 1).min(bytes.len());
 
-            if RAW_TEXT.contains(&name.as_str()) && name != "textarea" {
+            if RAW_TEXT.contains(&name.as_str()) {
                 let close = format!("</{name}");
                 let mut end = i;
-                let mut content = String::new();
-                let lowered: Vec<char> = bytes[i..].iter().map(|c| c.to_ascii_lowercase()).collect();
-                while end + close.len() <= bytes.len() {
-                    let window: String = lowered[end - i..end - i + close.len()].iter().collect();
-                    if window == close {
+                let close_chars: Vec<char> = close.chars().collect();
+                while end < bytes.len() {
+                    let tail = end + close_chars.len();
+                    if tail <= bytes.len()
+                        && bytes[end..tail].iter().zip(&close_chars).all(|(a, b)| a.eq_ignore_ascii_case(b))
+                        && (tail == bytes.len() || bytes[tail].is_whitespace() || matches!(bytes[tail], '>' | '/')) {
                         break;
                     }
-                    content.push(bytes[end]);
                     end += 1;
                 }
+                let content: String = bytes[i..end].iter().collect();
+                let content = if matches!(name.as_str(), "title" | "textarea") { decode_entities(&content) } else { content };
                 if !content.is_empty() {
                     tokens.push(Token::Text(content));
                 }
@@ -285,6 +303,32 @@ mod tests {
         }
         assert_eq!(tokens[2], Token::EndTag { name: "script".into() });
         assert_eq!(tokens[3], Token::Text("after".into()));
+    }
+
+    #[test]
+    fn spaced_attributes_and_stray_slashes_make_progress() {
+        let tokens = tokenize("<input / name = 'q' value = rust NAME=ignored>");
+        let Token::StartTag { attrs, .. } = &tokens[0] else { panic!("missing input") };
+        assert_eq!(attrs, &vec![("name".into(), "q".into()), ("value".into(), "rust".into())]);
+        assert_eq!(tokenize("<div /" ).len(), 1);
+        assert_eq!(tokenize("<input value='unfinished").len(), 1);
+    }
+
+    #[test]
+    fn raw_text_requires_a_complete_end_tag_and_keeps_eof() {
+        let tokens = tokenize("<script>let s='</scripture>';run()</SCRIPT><p>after</p>");
+        assert_eq!(tokens[1], Token::Text("let s='</scripture>';run()".into()));
+        let tokens = tokenize("<script>unfinished()");
+        assert_eq!(tokens[1], Token::Text("unfinished()".into()));
+        let tokens = tokenize("<style>x");
+        assert_eq!(tokens[1], Token::Text("x".into()));
+    }
+
+    #[test]
+    fn textarea_and_title_are_rcdata_not_markup() {
+        let tokens = tokenize("<textarea>&lt;b&gt;<span>literal</span></textarea><title>A &amp; B</title>");
+        assert_eq!(tokens[1], Token::Text("<b><span>literal</span>".into()));
+        assert_eq!(tokens[4], Token::Text("A & B".into()));
     }
 
     #[test]

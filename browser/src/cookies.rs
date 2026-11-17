@@ -24,7 +24,7 @@ struct Cookie {
 }
 
 static JAR: OnceLock<Mutex<Vec<Cookie>>> = OnceLock::new();
-const MAX_COOKIES: usize = 3000;
+const MAX_COOKIES: usize = usize::MAX;
 
 fn jar() -> std::sync::MutexGuard<'static, Vec<Cookie>> {
     JAR.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())

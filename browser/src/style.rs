@@ -1,9 +1,8 @@
 //! Computed style: user-agent defaults, inheritance, the cascade, shorthand boxes.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::css::{parse_color, parse_declarations, substitute_vars, Color, Declaration, Stylesheet};
+use crate::css::{parse_color, parse_declarations, Color, Declaration, Stylesheet};
 use crate::dom::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +252,10 @@ pub struct Style {
     pub nowrap: bool,
     /// visibility: hidden (inherited)
     pub hidden: bool,
+    /// Local opacity, kept separate from inherited visibility.
+    pub opacity: f32,
+    /// This box or an ancestor has zero opacity (descendants cannot undo it).
+    pub transparent: bool,
     pub position: Position,
     pub left: Option<f32>,
     pub top: Option<f32>,
@@ -276,10 +279,14 @@ pub struct Style {
     /// grid-template-columns, resolved at layout (it needs the width)
     pub grid_columns: Option<String>,
     pub grid_span: GridSpan,
+    pub grid_areas: Option<Vec<Vec<String>>>,
+    pub grid_area: Option<String>,
     /// custom properties in scope (inherited), last definition wins
-    pub vars: Arc<Vec<(String, String)>>,
+    pub vars: Arc<crate::css::Vars>,
     /// font-family asks for a monospace face (inherited)
     pub monospace: bool,
+    /// the used color scheme is dark (color-scheme allows it and the system is dark)
+    pub dark: bool,
     /// the font-family list, lower case (inherited); fonts resolve it
     pub family: Option<Arc<str>>,
 }
@@ -324,6 +331,8 @@ impl Default for Style {
             text_transform: TextTransform::None,
             nowrap: false,
             hidden: false,
+            opacity: 1.0,
+            transparent: false,
             position: Position::Static,
             left: None,
             top: None,
@@ -340,8 +349,11 @@ impl Default for Style {
             moved_away: false,
             grid_columns: None,
             grid_span: GridSpan::Auto,
-            vars: Arc::new(Vec::new()),
+            grid_areas: None,
+            grid_area: None,
+            vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
+            dark: false,
             family: None,
         }
     }
@@ -427,6 +439,7 @@ pub fn default_style(tag: &str) -> Style {
         "pre" => {
             style.display = Display::Block;
             style.pre = true;
+            style.nowrap = true;
             style.monospace = true;
             style.family = Some(Arc::from("monospace"));
             style.font_size = 14.0;
@@ -460,7 +473,7 @@ pub fn default_style(tag: &str) -> Style {
             }
         }
         "img" => style.display = Display::Inline,
-        "head" | "style" | "script" | "title" | "meta" | "link" | "base" | "noscript" => {
+        "head" | "style" | "script" | "title" | "meta" | "link" | "base" | "noscript" | "#comment" => {
             style.display = Display::None;
         }
         _ => {}
@@ -468,23 +481,62 @@ pub fn default_style(tag: &str) -> Style {
     style
 }
 
-/// Lengths: px, em, rem, % (of the containing width), and bare numbers as px.
-/// Viewport size in CSS px, for vw / vh (set by the layout).
-static VIEWPORT_W: AtomicU32 = AtomicU32::new(0x4480_0000); // 1024.0
+// Viewport size in CSS px, for vw / vh (set by the layout).
 thread_local! {
+    // Page workers lay out different tabs concurrently. One tab's viewport
+    // must never change vw/vh used by another worker halfway through layout.
+    static VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((1024.0, 800.0)) };
     /// font-size of <html>: what rem is measured in (set as <html> is styled)
     static ROOT_FONT: std::cell::Cell<f32> = const { std::cell::Cell::new(16.0) };
+    /// what a percentage height is of: the parent's definite height (the
+    /// viewport for the root); None makes `height: 50%` auto, as in CSS
+    static PERCENT_HEIGHT_BASE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// `light-dark(a, b)`: the first in a light scheme, the second in a dark one.
+fn light_dark(value: &str, dark: bool) -> String {
+    let mut out = value.to_string();
+    while let Some(start) = out.find("light-dark(") {
+        let open = start + "light-dark(".len();
+        let mut depth = 1;
+        let mut end = None;
+        for (i, ch) in out[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let args = crate::css::split_top_level(&out[open..end], ',');
+        let pick = args.get(if dark { 1 } else { 0 }).or(args.first()).map(|a| a.trim().to_string()).unwrap_or_default();
+        out.replace_range(start..=end, &pick);
+    }
+    out
+}
+
+/// A height-like length: percentages need a definite base, else none.
+fn height_length(value: &str, font_size: f32) -> Option<f32> {
+    if value.contains('%') {
+        let base = PERCENT_HEIGHT_BASE.with(|b| b.get())?;
+        parse_length(value, font_size, base)
+    } else {
+        parse_length(value, font_size, 0.0)
+    }
 }
 
 pub fn root_font_size() -> f32 {
     ROOT_FONT.with(|r| r.get())
 }
 
-static VIEWPORT_H: AtomicU32 = AtomicU32::new(0x4448_0000); // 800.0
-
 pub fn set_viewport(width: f32, height: f32) {
-    VIEWPORT_W.store(width.to_bits(), Ordering::Relaxed);
-    VIEWPORT_H.store(height.to_bits(), Ordering::Relaxed);
+    VIEWPORT.with(|v| v.set((width, height)));
 }
 
 fn parse_bg_size(value: &str, font_size: f32) -> BgSize {
@@ -538,7 +590,7 @@ fn parse_bg_pos(value: &str, font_size: f32) -> Option<(BgPos, BgPos)> {
 
 /// Height of the first screen (what `position: fixed; bottom` is measured from).
 pub fn viewport_height() -> f32 {
-    f32::from_bits(VIEWPORT_H.load(Ordering::Relaxed))
+    VIEWPORT.with(|v| v.get().1)
 }
 
 /// Lengths: px, em, rem, %, vw/vh/vmin/vmax, pt, ch/ex, bare numbers as px,
@@ -562,8 +614,7 @@ pub fn parse_length(value: &str, font_size: f32, percent_base: f32) -> Option<f3
             };
         }
     }
-    let vw = f32::from_bits(VIEWPORT_W.load(Ordering::Relaxed));
-    let vh = f32::from_bits(VIEWPORT_H.load(Ordering::Relaxed));
+    let (vw, vh) = VIEWPORT.with(|v| v.get());
     let unit = |suffix: &str| value.strip_suffix(suffix).and_then(|n| n.trim().parse::<f32>().ok());
     if let Some(n) = unit("vw") {
         return Some(n * vw / 100.0);
@@ -755,8 +806,10 @@ pub fn inherited(parent: &Style) -> Style {
     style.text_transform = parent.text_transform;
     style.nowrap = parent.nowrap;
     style.hidden = parent.hidden;
+    style.transparent = parent.transparent;
     style.vars = parent.vars.clone();
     style.monospace = parent.monospace;
+    style.dark = parent.dark;
     style.family = parent.family.clone();
     style.pre = parent.pre;
     style
@@ -792,6 +845,7 @@ pub fn compute(
         style.text_transform = inherit.text_transform;
         style.nowrap = inherit.nowrap;
         style.hidden = inherit.hidden;
+        style.transparent = inherit.transparent;
         style.vars = inherit.vars.clone();
         style.monospace = style.monospace || inherit.monospace;
         if style.family.is_none() {
@@ -808,27 +862,28 @@ pub fn compute(
 
     presentational_hints(node, &mut style, containing_width);
 
-    let mut declarations: Vec<Declaration> = sheet.matching(node, ancestors);
-    if let Some(inline) = node.attr("style") {
-        declarations.extend(parse_declarations(inline));
-    }
+    let matched = sheet.matching(node, ancestors);
+    let inline: Vec<Declaration> = node.attr("style").map(parse_declarations).unwrap_or_default();
+    // (declaration, from a stylesheet: its text lives as long as the layout)
+    let declarations: Vec<(&Declaration, bool)> = matched.iter().map(|d| (d, true)).chain(inline.iter().map(|d| (d, false))).collect();
     // custom properties first (they inherit), then everything else with var() resolved
     let mut own_vars: Vec<(String, String)> = Vec::new();
-    for declaration in declarations.iter().filter(|d| d.name.starts_with("--")) {
+    for (declaration, _) in declarations.iter().filter(|(d, _)| d.name.starts_with("--")) {
         own_vars.push((declaration.name.clone(), declaration.value.clone()));
     }
     if !own_vars.is_empty() {
-        let mut all = (*style.vars).clone();
+        // kept as written: a value is resolved when first used (css::Vars)
+        let mut scope = crate::css::Vars::child(style.vars.clone());
         for (name, value) in own_vars {
-            // a custom property may itself use var()
-            let value = substitute_vars(&value, &all).unwrap_or(value);
-            all.retain(|(k, _)| *k != name);
-            all.push((name, value));
+            scope.set(name, value);
         }
-        style.vars = Arc::new(all);
+        style.vars = Arc::new(scope);
     }
-    for declaration in declarations.iter().filter(|d| !d.name.starts_with("--")) {
-        if let Some(value) = substitute_vars(&declaration.value, &style.vars) {
+    let mut explicit_color = false;
+    let base = if node.tag == "html" { Some(viewport_height()) } else { parent.and_then(|p| p.height) };
+    PERCENT_HEIGHT_BASE.with(|b| b.set(base));
+    for (declaration, shared) in declarations.iter().filter(|(d, _)| !d.name.starts_with("--")) {
+        if let Some(value) = crate::css::substitute_in(&declaration.value, &style.vars, *shared) {
             let keyword = value.trim().to_ascii_lowercase();
             if keyword == "inherit" {
                 if let Some(p) = parent {
@@ -846,14 +901,28 @@ pub fn compute(
                 }
                 continue;
             }
+            if declaration.name == "color-scheme" {
+                let words: Vec<&str> = keyword.split_whitespace().collect();
+                style.dark = words.contains(&"dark") && (crate::css::system_dark() || !words.contains(&"light"));
+                continue;
+            }
+            if declaration.name == "color" {
+                explicit_color = true;
+            }
+            let value: std::borrow::Cow<str> = if value.contains("light-dark(") { light_dark(&value, style.dark).into() } else { value };
             apply(&mut style, &declaration.name, &value, containing_width);
         }
+    }
+    // a scheme switched to dark here gives the dark default text colour
+    if style.dark && !explicit_color && parent.map_or(true, |p| !p.dark) {
+        style.color = crate::css::Color::rgb(255, 255, 255);
     }
     // a <table> made display:block still holds rows: CSS wraps them in an
     // anonymous table, so it lays out as one
     if node.tag == "table" && matches!(style.display, Display::Block | Display::ListItem) {
         style.display = Display::Table;
     }
+    style.transparent |= style.opacity == 0.0;
     if node.tag == "html" {
         ROOT_FONT.with(|r| r.set(style.font_size.clamp(4.0, 200.0)));
     }
@@ -972,6 +1041,8 @@ fn inherit_property(style: &mut Style, parent: &Style, name: &str) {
         }
         "line-height" => style.line_height = parent.line_height,
         "color" => style.color = parent.color,
+        "visibility" => style.hidden = parent.hidden,
+        "opacity" => style.opacity = parent.opacity,
         "text-align" => style.align = parent.align,
         // `*, *::before { box-sizing: inherit }` under `html { border-box }`
         "box-sizing" => style.border_box = parent.border_box,
@@ -1168,6 +1239,41 @@ fn parse_valign(value: &str) -> Option<VAlign> {
     }
 }
 
+fn parse_grid_areas(value: &str) -> Option<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if !matches!(ch, '\'' | '"') { continue; }
+        let mut row = String::new();
+        let mut closed = false;
+        for c in chars.by_ref() {
+            if c == ch { closed = true; break; }
+            row.push(c);
+        }
+        if !closed { return None; }
+        let row: Vec<String> = row.split_whitespace().map(|name| {
+            if name.chars().all(|c| c == '.') { ".".to_string() } else { name.to_string() }
+        }).collect();
+        if row.is_empty() || row.len() > 64 || rows.len() >= 128 { return None; }
+        if rows.first().is_some_and(|first: &Vec<String>| first.len() != row.len()) { return None; }
+        rows.push(row);
+    }
+    if rows.is_empty() { return None; }
+    let mut bounds = std::collections::HashMap::<&str, (usize, usize, usize, usize)>::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, name) in row.iter().enumerate().filter(|(_, name)| name.as_str() != ".") {
+            if !name.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-')) { return None; }
+            let area = bounds.entry(name).or_insert((r, c, r, c));
+            area.0 = area.0.min(r); area.1 = area.1.min(c);
+            area.2 = area.2.max(r); area.3 = area.3.max(c);
+        }
+    }
+    for (name, (r0, c0, r1, c1)) in bounds {
+        if rows[r0..=r1].iter().any(|row| row[c0..=c1].iter().any(|cell| cell != name)) { return None; }
+    }
+    Some(rows)
+}
+
 fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
     let value = value.trim();
     let font_size = style.font_size;
@@ -1307,7 +1413,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             };
         }
         "box-shadow" => style.shadow = parse_shadow(value, font_size),
-        "min-height" => style.min_height = parse_length(value, font_size, containing_width),
+        "min-height" => style.min_height = height_length(value, font_size),
         "min-width" => style.min_width = parse_length(value, font_size, containing_width),
         "box-sizing" => style.border_box = value == "border-box",
         "text-transform" => {
@@ -1321,8 +1427,11 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "visibility" => style.hidden = value == "hidden" || value == "collapse",
         // fully transparent things (checkbox hacks, fade-in content before JS) are not drawn
         "opacity" => {
-            if value.trim_end_matches('%').parse::<f32>().is_ok_and(|o| o <= 0.0) {
-                style.hidden = true;
+            if let Ok(opacity) = value.trim_end_matches('%').parse::<f32>() {
+                if opacity.is_finite() {
+                    let scale = if value.ends_with('%') { 100.0 } else { 1.0 };
+                    style.opacity = (opacity / scale).clamp(0.0, 1.0);
+                }
             }
         }
         "position" => {
@@ -1383,6 +1492,42 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         }
         "top" => style.top = parse_length(value, font_size, containing_width),
         "grid-template-columns" => style.grid_columns = (value != "none").then(|| value.to_string()),
+        "grid-template-areas" => {
+            if value == "none" { style.grid_areas = None; }
+            else if let Some(areas) = parse_grid_areas(value) { style.grid_areas = Some(areas); }
+        }
+        "grid-template" | "grid" => {
+            if value == "none" {
+                style.grid_areas = None;
+                style.grid_columns = None;
+            } else if let Some(areas) = parse_grid_areas(value) {
+                // A slash outside area strings separates rows from columns.
+                let mut quote = None;
+                let mut slash = None;
+                for (i, ch) in value.char_indices() {
+                    match (quote, ch) {
+                        (Some(q), c) if c == q => quote = None,
+                        (None, '\'' | '"') => quote = Some(ch),
+                        (None, '/') => { slash = Some(i); break; }
+                        _ => {}
+                    }
+                }
+                style.grid_columns = slash.map(|i| value[i + 1..].trim().to_string());
+                style.grid_areas = Some(areas);
+            } else if let Some((_, columns)) = value.split_once('/') {
+                // rows / columns, no areas: the columns are what we lay out by
+                if !columns.contains("auto-flow") {
+                    style.grid_columns = Some(columns.trim().to_string());
+                }
+            }
+        }
+        "grid-area" => {
+            if value == "auto" { style.grid_area = None; }
+            else if !value.is_empty() && value.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-'))
+                && !value.chars().next().unwrap().is_ascii_digit() {
+                style.grid_area = Some(value.to_string());
+            }
+        }
         "grid-column" => {
             let v = value.replace(' ', "");
             style.grid_span = if v == "1/-1" || v.ends_with("/-1") && v.starts_with('1') {
@@ -1617,7 +1762,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "width" => style.width = parse_length(value, font_size, containing_width),
-        "height" => style.height = parse_length(value, font_size, containing_width),
+        "height" => style.height = height_length(value, font_size),
         "line-height" => {
             style.line_height = if value == "normal" {
                 LineHeight::Normal
@@ -1667,6 +1812,30 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn grid_areas_require_rectangles_and_equal_row_lengths() {
+        assert!(parse_grid_areas("\"a a\" \"b c\"").is_some());
+        assert!(parse_grid_areas("\"a a\" \"a b\"").is_none());
+        assert!(parse_grid_areas("\"a b\" \"a\"").is_none());
+        assert!(parse_grid_areas("\". ..\"").is_some());
+    }
+
+    #[test]
+    fn concurrent_page_workers_have_independent_viewports() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [(500.0, 400.0), (1600.0, 900.0)].into_iter().map(|(w, h)| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                set_viewport(w, h);
+                barrier.wait();
+                assert_eq!(parse_length("100vw", 16.0, 0.0), Some(w));
+                assert_eq!(parse_length("100vh", 16.0, 0.0), Some(h));
+                assert_eq!(viewport_height(), h);
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
+    }
 
     #[test]
     fn rem_is_not_read_as_em_and_follows_the_root() {

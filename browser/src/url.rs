@@ -88,6 +88,7 @@ impl Url {
         format!("{}://{}{}", self.scheme, authority, self.request_target())
     }
 
+    #[allow(dead_code)]
     pub fn origin(&self) -> String {
         format!("{}://{}:{}", self.scheme, self.host, self.port)
     }

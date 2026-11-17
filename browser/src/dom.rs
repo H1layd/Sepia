@@ -24,6 +24,10 @@ impl Node {
         }
     }
 
+    pub fn comment_node(value: &str) -> Node {
+        Node { tag: "#comment".into(), attrs: vec![("__sepia_comment".into(), value.into())], children: Vec::new(), text: None }
+    }
+
     pub fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
@@ -91,6 +95,22 @@ pub fn parse_document(source: &str) -> Node {
     for token in tokens {
         match token {
             Token::StartTag { name, attrs, self_closing } => {
+                // A block start closes an open paragraph, including its inline
+                // descendants. Without this recovery later sections become
+                // children of links/emphasis and inherit the wrong geometry.
+                if matches!(name.as_str(), "address" | "article" | "aside" | "blockquote"
+                    | "details" | "div" | "dl" | "fieldset" | "figcaption" | "figure"
+                    | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    | "header" | "hgroup" | "hr" | "main" | "menu" | "nav" | "ol"
+                    | "p" | "pre" | "section" | "table" | "ul") {
+                    let in_scope = stack.iter().rposition(|n| matches!(n.tag.as_str(), "p" | "table" | "td" | "th" | "button" | "html"));
+                    if let Some(at) = in_scope.filter(|&at| stack[at].tag == "p") {
+                        while stack.len() > at {
+                            let node = stack.pop().unwrap();
+                            append(&mut stack, &mut root, node);
+                        }
+                    }
+                }
                 if let Some(top) = stack.last() {
                     if implicit_close(&top.tag, &name) {
                         if let Some(node) = stack.pop() {
@@ -121,7 +141,8 @@ pub fn parse_document(source: &str) -> Node {
                     append(&mut stack, &mut root, Node::text_node(&text));
                 }
             }
-            Token::Comment(_) | Token::Doctype(_) => {}
+            Token::Comment(data) => append(&mut stack, &mut root, Node::comment_node(&data)),
+            Token::Doctype(_) => {}
         }
     }
     while let Some(node) = stack.pop() {
@@ -154,6 +175,17 @@ mod tests {
         let paragraphs: Vec<&Node> = doc.children.iter().filter(|n| n.tag == "p").collect();
         assert_eq!(paragraphs.len(), 2);
         assert_eq!(paragraphs[0].text_content(), "one");
+    }
+
+    #[test]
+    fn block_starts_close_paragraphs_through_inline_descendants() {
+        let doc = parse_document("<p><em>intro<div>section</div><p>end");
+        assert_eq!(doc.children.len(), 3);
+        assert_eq!(doc.children[0].tag, "p");
+        assert_eq!(doc.children[0].text_content(), "intro");
+        assert_eq!(doc.children[1].tag, "div");
+        assert_eq!(doc.children[1].text_content(), "section");
+        assert_eq!(doc.children[2].text_content(), "end");
     }
 
     #[test]
