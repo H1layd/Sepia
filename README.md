@@ -1,201 +1,289 @@
 # Sepia
 
-**Anonymity system with its own browser engine.** A proxy chain that fails closed,
-DNS that never leaks, and a browser written from scratch: URL parser, HTTP client,
-HTML, CSS, layout, rasteriser, window. No Chromium under it, no JavaScript inside it.
+Анонимизация трафика и собственный браузерный движок. Цепочка прокси, DNS без
+утечек, killswitch, который закрывается при сбое, и браузер, написанный здесь же:
+разбор URL, HTTP-клиент, HTML, CSS, вёрстка, растеризатор, окно. Без Chromium
+внутри; JavaScript исполняется в Boa поверх собственного DOM.
 
 ```
-   app ──► pf / nftables / WinINET ──► SOCKS5 · HTTP ──► hop1 → hop2 → … → exit
-                                        │
-                                        └── DoH resolver (names never hit the ISP)
+ приложение
+    │
+    ├─ перехват: pf nftables WinINET ─┐
+    ├─ SOCKS5 10800  HTTP 18080 ──────┤
+    │                                 ▼
+    │                       цепочка: хоп1 → хоп2 → … → выход
+    │                                 │
+    └─ DNS: только DoH ───────────────┘
 ```
 
-Sepia (сепия) is the warm brown of old paper — a browser that shows you the page,
-not a hundred trackers underneath it.
+## Кто что делает
 
----
+Браузер и его движок (HTML, CSS, раскладка, растр, JS на Boa, окно, совместимость
+с сайтами) ведёт Клод. Слой анонимности — цепочка, DoH, killswitch, политики
+хранилища, куки, JS, отпечаток, аудит — ввожу я поверх готового браузера.
+Этапы и точки стыковки: `docs/HANDOFF-claude.md`; дизайн слоя приватности:
+`docs/PRIVACY-LAYER.md`; границы защиты — `docs/THREAT-MODEL.md` (от обычной
+слежки защищает, от целевого противника — нет). Пока идёт этап совместимости, браузер работает в режиме
+`privacy.level = normal`: он должен открывать сайты, а не быть святым.
 
-## What is in here
+## Состав
 
-| Часть | Язык | Что делает |
+| Часть | Язык | Назначение |
 |---|---|---|
-| `sepia` CLI | Python 3.9+, stdlib | цепочка, killswitch (pf / nftables / Windows Firewall), системный прокси, DoH, верификация утечек |
-| `sepia-core` | Rust (tokio, rustls) | data plane: SOCKS5/HTTP через цепочку, DoH-резолвер, кэш, блок-лист, `/status`; статический бинарник ~3 МБ |
-| `sepia-browser` | Rust, с нуля | браузер: свой HTTP/1.1+TLS, HTML-парсер, CSS-каскад, вёрстка, растеризатор, шрифты с фолбэком, картинки, окно, Tor/I2P/Gemini/Gopher |
-| `sepiaprobe` | C++17, без зависимостей | собирает ClientHello, считает JA3, отправляет его через цепочку и показывает, что ответил сервер |
+| `sepia` | Python 3.9+, только станд. библиотека | цепочка, killswitch, системный прокси, DoH, проверка утечек |
+| `sepia-core` | Rust (tokio, rustls) | плоскость данных: SOCKS5 и HTTP через цепочку, DoH-резолвер с кэшем и блок-листом, `/status`; статический бинарник ~3 МБ |
+| `sepia-browser` | Rust, с нуля | браузер: HTTP/1.1+TLS, HTML, CSS, вёрстка, растр, шрифты с фолбэком, картинки, окно, Tor/I2P/Gemini/Gopher |
+| `sepiaprobe` | C++17, без зависимостей | сборка ClientHello, подсчёт JA3, отправка приветствия через цепочку |
+
+## Маршруты: как уходит трафик
+
+Выбирается одной командой, профили не смешиваются:
+
+```bash
+sepia route set direct     # без хопов, DoH остаётся; не анонимно
+sepia route set chain      # наша цепочка, все хопы по порядку
+sepia route set bypass     # только первый хоп: быстрый обход блокировок
+sepia route set tor        # Tor как хоп: SOCKS5 127.0.0.1:9050 (9150 у Tor Browser)
+sepia route set i2p        # I2P как хоп: HTTP-прокси роутера, 4444
+sepia route set proxy --addr 127.0.0.1:1080           # прокси пользователя, SOCKS5
+sepia route set proxy --addr 127.0.0.1:8080 --http     # то же, но HTTP-прокси
+sepia route                # что выбрано, жив ли первый хоп, подсказки
+```
+
+| Режим | Хопы | Зачем |
+|---|---|---|
+| `direct` | нет | проверить браузер, сравнить скорость, «без анонимности» |
+| `chain` | все `chain.hops` | наша схема: анонимность от сайта и последующих хопов |
+| `bypass` | первый хоп | обход блокировок с минимальной задержкой (+1 RTT) |
+| `tor` | SOCKS5 Tor | сильная анонимность там, где нужна толпа |
+| `i2p` | HTTP I2P | внутри сети I2P и для `.i2p` |
+| `proxy` | один прокси | свой VPS, корпоративный прокси, `ssh -D` |
+
+`sepia up` берёт хопы из выбранного маршрута; killswitch откажется включаться,
+если у маршрута нет ни одного хопа (иначе машина уйдёт в темноту).
 
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/t7/Sepia && cd Sepia
+git clone <репозиторий> sepia && cd sepia
 
-# CLI (нужен python3.9+)
-./sepia.sh init
-./sepia.sh config validate
+./sepia.sh init                  # ~/.sepia/config.json
+./sepia.sh config validate       # что умеет платформа
 
-# собрать нативные части (нужен rust и c++)
-bash scripts/build.sh
-
-# браузер с нуля
-cargo build --release --manifest-path browser/Cargo.toml
-./sepia.sh browser --native https://news.ycombinator.com
+bash scripts/build.sh            # собрать Rust-ядро, браузер, C++-пробник, прогнать тесты
 ```
 
-Поднимаем всю систему:
+Дальше — цепочка из хопов в `~/.sepia/config.json`, проверка и запуск:
 
 ```bash
-# 1. прописать хопы в ~/.sepia/config.json
-# 2. проверить цепочку до локаута
-./sepia.sh chain
+./sepia.sh chain                 # каждый хоп + адрес выхода, пока сеть открыта
+./sepia.sh dns example.com       # резолв через DoH по цепочке
 
-# 3. поднять цепочку + killswitch (+ системный прокси)
-sudo ./sepia.sh up --system-proxy
+sudo ./sepia.sh up --system-proxy   # правила, killswitch, системный прокси
+./sepia.sh verify                   # адрес выхода, DNS, заголовки, JA3, enforcement
+./sepia.sh selftest                 # прямой запрос обязан умереть, через прокси — работать
 
-# 4. доказать, что утечек нет
-./sepia.sh verify
-./sepia.sh selftest
+./sepia.sh browser --native https://example.com   # браузер на этой цепочке
 
-# 5. анонимный браузер на этой цепочке
-./sepia.sh browser --native https://example.com
-
-# 6. вернуть сеть
-sudo ./sepia.sh down      # или: sudo ./sepia.sh panic
+sudo ./sepia.sh down             # вернуть сеть и настройки
+sudo ./sepia.sh panic            # аварийный сброс, если что-то пошло не так
 ```
 
-## Браузер с нуля
+Без root тоже можно: `./sepia.sh up --no-firewall` поднимает только цепочку,
+прокси и DNS, а прозрачный перехват и killswitch остаются выключенными.
 
-![окно Sepia](docs/browser-window.png)
+## Браузер
 
-Свой движок, не webview:
+Свой движок, не обёртка над чужим:
 
-* **сеть** — HTTP/1.1, chunked, редиректы, TLS (`rustls`), SOCKS5- и HTTP-хопы, DoH для прямых соединений;
-* **HTML** — токенизатор (теги, атрибуты, комментарии, raw-text `script/style`, сущности), нестрогое дерево с неявными закрытиями;
-* **CSS** — правила, селекторы (тег/класс/id/потомок), специфичность, каскад, наследование, `margin/padding/border`, `flex` (row/column, justify, align, gap, grow, wrap), табличная модель с колонками;
-* **вёрстка** — блочный поток, инлайн-строки с переносом по метрикам глифов, списки, выравнивание;
-* **текст** — фолбэк шрифтов по codepoint, цветные эмодзи, CJK/кириллица/греческий/иврит;
-* **картинки** — PNG, JPEG, GIF (первый кадр), `data:`; декодирование в памяти, без сети и диска;
-* **окно** — адресная строка, вкладки, история, скролл, клики по ссылкам, экран ошибок, индикатор транспорта.
+* **сеть** — HTTP/1.1, `Content-Length`, chunked, редиректы, TLS через rustls,
+  хопы SOCKS5 и HTTP, DoH для прямых соединений;
+* **HTML** — токенизатор (теги, атрибуты, комментарии, `script`/`style` как
+  raw text, сущности), нестрогое дерево с неявными закрытиями;
+* **CSS** — правила, селекторы (тег, класс, id, потомок), специфичность,
+  каскад, наследование, `margin`/`padding`/`border`, flex-подмножество
+  (row/column, justify, align, gap, grow, wrap), табличная модель с колонками,
+  внешние стили и `@import`, `@font-face`;
+* **скрипты** — интерпретатор Boa: `<script>`, `fetch()` и XMLHttpRequest
+  в пределах разрешённого сайта, таймеры; без WebSocket, worker и beacons;
+* **формы** — поля, кнопки, POST `application/x-www-form-urlencoded`;
+* **вёрстка** — блочный поток, инлайн-строки с переносом по метрикам глифов,
+  списки, выравнивание, схлопывание отступов;
+* **текст** — фолбэк шрифтов по codepoint, цветные эмодзи, кириллица, CJK,
+  греческий, иврит; TTF, OTF, TTC, WOFF, WOFF2 (собственный распаковщик);
+* **картинки** — PNG, JPEG, GIF, WebP, SVG; декодирование в памяти, без записи
+  на диск; трекинговые 1×1 не запрашиваются;
+* **окно** — адресная строка с поиском, вкладки, история, прокрутка, закладки,
+  скачивание, поиск по странице, экран ошибки, индикатор транспорта;
+* **собственный движок для всех сайтов** — автоматического переключения на
+  WebKit или WebView нет. Тяжёлые сайты пока могут показывать неполный результат.
 
-![фолбэк шрифтов](docs/fonts-fallback.png)
-![картинки](docs/images.png)
-![таблицы](docs/browser-hackernews-tables.png)
-![flex](docs/flex.png)
+**YouTube.** Загружается настоящий HTML сайта через тот же загрузчик, что и у
+остальных страниц. Подмена каталога страницами из yt-dlp и автоматический запуск
+внешнего плеера отключены. Работа каталога и поиска ещё требует совместимости
+с веб-компонентами; воспроизведение видео не входит в текущую приёмку.
 
-## Анонимность как свойство конструкции
+**Скачивание.** `⌘S` сохраняет страницу, `⌥`-клик по ссылке качает её цель,
+а ссылка на файл (`.zip`, `.pdf`, `.dmg`, `.mp4`…) скачивается сразу, без
+перехода. Файлы идут в `~/Downloads` с именами `sepia-…` и без перезаписи.
 
-Браузер просто не имеет поверхности для фингерпринтинга:
+Движок поддерживает подмножества float, grid и абсолютного позиционирования.
+Пока нет полной совместимости этих моделей, CSS-анимаций,
+псевдоклассов `:hover`/`:active`, шейпинга арабского и деванагари, полноценного
+JS (обещания, `async`/`await`-инфраструктура, модули ограничены; сложные SPA
+показывают частичный результат).
 
-* **нет JavaScript** — нет canvas, WebGL, audio, шрифтовых проб, таймеров, `navigator`, WebRTC;
-* **нет куки** — не отправляются, не хранятся, не воспроизводятся;
-* **нет диска** — ни кэша, ни профиля, ни истории; единственная запись — `--dump` PNG;
-* **минимальные заголовки** — ровно шесть: `Host`, `User-Agent`, `Accept`, `Accept-Encoding`, `Accept-Language`, `Connection`. Без `Referer`, `Cookie`, `Sec-CH-*`, `DNT`;
-* **DNS не утекает** — DoH внутри браузера, для цепочки имя резолвит первый хоп.
+## Анонимность
 
-```console
-$ ./sepia.sh browser --native --audit
+Что гарантируется сейчас, и чем это отличается от «просто прокси»:
 
-absent by construction
-  javascript       no JS engine at all: no canvas, no WebGL, no fonts API, no timers
-  cookies          not implemented: nothing is sent, stored or replayed
-  webrtc           not implemented: no UDP, no ICE, no local address exposure
-  cache / profile  no disk state: nothing written unless you --dump a PNG
-network path
-  dns              DoH via https://cloudflare-dns.com/dns-query
-  transport        chain 127.0.0.1:9050
-live check
-  ip=… loc=…
+* **скрипты изолированы.** JavaScript исполняется внутри процесса в Boa, но у
+  страницы нет ни сокетов, ни файлов: `fetch` ходит только на свой origin,
+  XMLHttpRequest использует тот же ограниченный загрузчик; WebSocket, beacons
+  и worker недоступны. `navigator`, `screen` и язык
+  зафиксированы (`sepia-browser/0.1`, `en-US`, 1280×800), поэтому JS-отпечаток
+  детерминированный, а не «как повезёт».
+* **куки только в памяти.** Партиционированы по сайту из адресной строки: трекер,
+  встроенный в два сайта, получает два несвязанных банка. Живут не больше суток,
+  стираются кнопкой сброса и при выходе; на диск не попадают.
+* **никакой записи на диск.** Нет кэша, профиля и истории; единственная запись —
+  PNG, если явно передан `--dump`.
+* **`Referer` не отправляется.** Кросс-сайтовый переход не выдаёт, откуда вы
+  пришли. Соединение переиспользуется только в пределах одного сайта.
+* **минимум заголовков.** `Host`, `User-Agent`, `Accept`, `Accept-Encoding`,
+  `Accept-Language`, `Connection` и, если сайт сам их поставил, его собственные
+  куки. Без `Authorization`, `Sec-CH-*`, `DNT`.
+* **трекинговые картинки не запрашиваются.** Пиксели 1×1 отбрасываются до
+  соединения.
+* **DNS не утекает.** Для прямых соединений имя разрешается через DoH внутри
+  браузера; при работе через цепочку имя разрешает первый хоп.
+* **`.onion` и `.i2p` без транспорта не открываются**: браузер отказывается идти
+  напрямую и говорит, чего не хватает.
+
+Уровни приватности (`normal` / `strict` / `paranoid`) и их матрица описаны в
+`docs/PRIVACY-LAYER.md`; вводятся они после того, как браузер начнёт открывать
+целевые сайты.
+
+Посмотреть фактическую поверхность, а не обещания:
+
+```bash
+./sepia.sh browser --native --audit
 ```
 
-![дашборд анонимности](docs/anon-dashboard.png)
+Команда печатает, какие заголовки уходят, какие запросы порождает страница
+(картинки, стили, шрифты, скрипты), что хранится в памяти, и куда идёт DNS.
+
+Встроенный WebKit удалён: страницы проходят через собственный движок и общий
+сетевой путь Sepia. Старый флаг `--no-embed` принимается для совместимости команд
+и больше не меняет выбор движка.
+
+Коротко: цепочка и killswitch прячут вас от провайдера, сайта и рекламных
+сетей; от глобального наблюдателя защищает Tor, а не эта схема. Подробно, с
+таблицей «защищает / не защищает» — `docs/THREAT-MODEL.md`.
+
+Чего схема не решает: глобальную корреляцию трафика (нужна луковичная
+маршрутизация), первый хоп (он всегда знает ваш адрес), отпечаток TLS (у
+браузера он от rustls, а не от Chrome) и операционную безопасность — логины,
+куки на чужих сайтах и язык сводят анонимность на нет быстрее любого прокси.
+Исполнение JS — это сознательный компромисс: без него половина веба не
+открывается, но и поверхность становится шире, чем у сборки без скриптов.
 
 ## Tor, I2P, Gemini, Gopher
 
 ```bash
 ./sepia.sh browser --native --via tor https://check.torproject.org/
-./sepia.sh browser --native --via tor http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/
+./sepia.sh browser --native --via tor http://<адрес>.onion/
 ./sepia.sh browser --native --via i2p http://stats.i2p/
 ./sepia.sh browser --native gemini://mozz.us/
 ./sepia.sh browser --native gopher://floodgap.com/1/
 ```
 
-* `.onion` идёт через Tor SOCKS (remote DNS), `.i2p` — через HTTP-прокси роутера абсолютным URI;
-* без нужного транспорта браузер не «ходит напрямую», а говорит, чего не хватает;
-* Gemini и Gopher — свои клиенты: gemtext → HTML (заголовки, списки, `=>`-ссылки, блоки), меню Gopher с кликабельными селекторами.
+* `.onion` — через Tor SOCKS, имя разрешает сам Tor;
+* `.i2p` — через HTTP-прокси роутера абсолютным URI;
+* Gemini — свой клиент: TLS, запрос одной строкой, gemtext в HTML;
+  для самоподписанных капсул есть `--insecure`;
+* Gopher — свой клиент: меню по типам, кликабельные селекторы, текстовые файлы.
 
-![Gemini](docs/gemini-capsule.png)
-![Gopher](docs/gopher-menu.png)
+## Команды
 
-## CLI
+| Команда | Смысл |
+|---|---|
+| `init` | создать конфиг (0600) |
+| `config show` / `validate` / `path` | конфиг и возможности платформы |
+| `chain` | проверить каждый хоп и адрес выхода |
+| `dns <имя>` | резолв через DoH по цепочке |
+| `up [--engine rust] [--system-proxy] [--no-firewall] [--no-transparent] [--dry-run] [--force]` | поднять цепочку и правила |
+| `down` | вернуть сеть |
+| `panic [--wipe-logs] [--all]` | аварийный сброс всего, что трогал Sepia |
+| `status` | счётчики, маршруты, состояние DNS |
+| `verify [--json]` | проверка утечек: адрес выхода, DNS, заголовки, JA3, enforcement |
+| `audit` | отпечаток TLS, hostname, IPv6, резолверы, слушающие сокеты |
+| `selftest` | принудительная проверка killswitch |
+| `probe [--sni host] [--send] [--through local]` | JA3 через C++-пробник |
+| `browser [url …]` | анонимный браузер: `--native`, `--selftest`, `--via tor\|i2p`, `--dump`, `--text` |
 
-```bash
-./sepia.sh init | config show|validate|path
-./sepia.sh chain                 # проверить каждый хоп + exit IP
-./sepia.sh dns example.com       # резолв через DoH по цепочке
-sudo ./sepia.sh up [--engine rust] [--system-proxy] [--no-transparent] [--dry-run]
-sudo ./sepia.sh down
-sudo ./sepia.sh panic [--wipe-logs] [--all]
-./sepia.sh status                # счётчики, маршруты, DNS-кэш
-./sepia.sh verify [--json]       # exit IP, DNS-позиция, заголовки, JA3, enforcement
-./sepia.sh audit                 # JA3, hostname, IPv6, резолверы, сокеты
-./sepia.sh selftest              # killswitch обязан держать
-./sepia.sh probe [--sni host] [--send] [--through local]   # JA3 через C++
-./sepia.sh browser [--native] [--selftest] [--via tor|i2p]
-```
+Клавиши и жесты: `⌘L` — адрес, `Enter` — открыть или найти (DuckDuckGo Lite), кнопки
+назад/вперёд/обновить в доке, `⌘T`/`⌘W` — вкладка,
+`⌘D` — в закладки, `⌘S` — сохранить страницу, `⌥`-клик по ссылке — скачать её,
+`⌘F` и `⌘G` — поиск по странице, `⌘R` — обновить, `⌘+`/`⌘-`, свайпы назад/вперёд,
+потянуть страницу вниз — обновить. Стартовая страница показывает маршрут,
+состояние DNS и закладки.
 
-`up` проверяет цепочку **до** применения правил и откатывается сам, если после
-локаута путь сломался (петля редиректа, локальный хоп без `bypass_uids`).
+`up` проверяет цепочку до применения правил. Если после блокировки сеть
+перестала работать (петля редиректа, локальный хоп без `bypass_uids`), правила,
+системный прокси и демон откатываются автоматически.
 
-## Платформы
+## Файрвол по платформам
 
 | | killswitch | прозрачный перехват |
 |---|---|---|
-| **Linux** | `nftables`, `policy drop` + `SO_MARK` для egress | полный, включая HTTPS (`SO_ORIGINAL_DST`) |
-| **macOS** | `pf`, снимок правил и восстановление | только HTTP (Darwin не отдаёт original dst); остальное — системный прокси + SOCKS, fail-closed |
-| **Windows** | Windows Firewall «блок дополнения до `0.0.0.0/0` кроме хопов» | нет (без TUN/WinDivert); WinINET/WinHTTP + DNS на `127.0.0.1` |
-
-## Чего нет — честно
-
-* JavaScript: страницы на JS рендерят только статическую оболочку.
-* `float`-обтекание, полный `grid`, анимации, формы-сабмит, `:hover`/`:active`, `position: absolute/fixed`.
-* Шейпинг сложных шрифтов (ligatures, bidi): кириллица/греческий/иврит есть, арабский и деванагари — нет.
-* Против глобального наблюдателя нужна луковичная маршрутизация, а не цепочка хопов.
-* Первый хоп всегда знает ваш адрес. TLS-отпечаток браузера — отпечаток rustls, а не Chrome.
+| Linux | nftables, `policy drop`, `SO_MARK` для собственного выхода | полный, включая HTTPS через `SO_ORIGINAL_DST` |
+| macOS | pf, снимок и восстановление правил | только HTTP (Darwin не отдаёт исходный адрес); остальное — системный прокси и SOCKS, при сбое трафик умирает |
+| Windows | правила «блок дополнения до 0.0.0.0/0 кроме хостов цепочки» | нет (нужен TUN или WinDivert); WinINET, WinHTTP, DNS на 127.0.0.1 |
 
 ## Тесты
 
 ```bash
-python3 -m unittest discover -s tests       # 36  (CLI, DNS, протоколы, браузер-персоны)
-cargo test --release --manifest-path core/Cargo.toml    # 19  (data plane)
-cargo test --release --manifest-path browser/Cargo.toml # 83  (движок браузера)
-bash tests/core_e2e.sh                      # 14  (цепочка, DoH, блок-лист, control)
+python3 -m unittest discover -s tests                     # 36
+cargo test --release --manifest-path core/Cargo.toml      # 19
+cargo test --release --manifest-path browser/Cargo.toml   # 132 (6 GUI-тестов требуют экрана)
+bash tests/core_e2e.sh                                    # 14
+```
 
-# Linux-контейнер с NET_ADMIN: nftables, killswitch, прозрачный HTTPS
+Отдельно проверка на Linux в контейнере с `NET_ADMIN`: загрузка nftables,
+killswitch, прозрачный HTTP и HTTPS, перехват DNS, восстановление сети:
+
+```bash
 docker build -t sepia-test -f tests/Dockerfile .
-docker run --rm --cap-add=NET_ADMIN -v "$PWD":/src -w /src sepia-test bash /src/tests/linux_e2e.sh   # 16
+docker run --rm --cap-add=NET_ADMIN -v "$PWD":/src -w /src \
+  sepia-test bash /src/tests/linux_e2e.sh                 # 16
 ```
 
 ## Структура
 
 ```
 sepia/
-├── sepia.sh                     # запуск CLI без установки
-├── pyproject.toml               # pip install .  → команда sepia
-├── sepia/                       # Python CLI
-│   ├── cli.py  config.py  service.py
-│   ├── proxy.py  socks5.py  chain.py  dnsd.py  dnsmsg.py  httpc.py
-│   ├── verify.py  fingerprint.py
-│   ├── browser.py  cdp.py  ws.py  browser_ext/sepia-shim.js
+├── sepia.sh                    запуск CLI без установки
+├── pyproject.toml              pip install . → команда sepia
+├── sepia/                      Python CLI
+│   ├── cli.py config.py service.py
+│   ├── proxy.py socks5.py chain.py dnsd.py dnsmsg.py httpc.py
+│   ├── verify.py fingerprint.py
+│   ├── browser.py cdp.py ws.py browser_ext/sepia-shim.js
 │   └── platforms/{darwin,linux,windows}.py
-├── core/                        # sepia-core (Rust)
-├── browser/                     # sepia-browser (Rust)
-│   └── src/{main,url,net,resolver,html,dom,css,style,layout,paint,images,fonts,gui,page,protocols}.rs
-├── native/sepiaprobe.cpp        # C++17 JA3
-├── scripts/build.sh             # сборка + все тесты
-├── docs/                        # скриншоты, фикстуры, контракт для движка
-└── tests/
+├── core/src/                   sepia-core: main, config, chain, socks5, proxy, dns, rules
+├── browser/src/                sepia-browser: url, net, resolver, html, dom, css, style,
+│                               layout, paint, images, fonts, gui, page, protocols
+├── native/sepiaprobe.cpp       JA3 через C++17
+├── scripts/build.sh            сборка и все тесты
+├── docs/HANDOFF-claude.md      контракт по движку, инварианты анонимности
+└── tests/                      юнит-тесты, Dockerfile, сценарии e2e
 ```
 
 ## Лицензия
 
-MIT — см. [LICENSE](LICENSE). Проект раньше назывался `veil`; при первом запуске
-`~/.veil` копируется в `~/.sepia`, старые `VEIL_*` переменные ещё читаются.
+MIT, см. `LICENSE`.
+
+Проект раньше назывался `veil`. При первом запуске `~/.veil` копируется в
+`~/.sepia` (старый каталог остаётся, рядом маркер `MIGRATED_FROM_VEIL`), старые
+переменные `VEIL_*` ещё читаются, `down` дополнительно чистит правила `veil-*`.

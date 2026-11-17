@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 from . import util
 
+ROUTE_MODES = ("direct", "chain", "bypass", "tor", "i2p", "proxy")
+
 DEFAULT_DOH = [
     {
         "url": "https://cloudflare-dns.com/dns-query",
@@ -44,6 +46,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "health_interval": 0,
         "on_hop_failure": "fail",  # fail | skip
     },
+    "route": {
+        # how the traffic leaves this machine:
+        #   direct — no hop at all (DoH still on; no anonymity)
+        #   chain  — the hops below, in order (our own method)
+        #   bypass — only the first hop: the fast way around blocks
+        #   tor    — SOCKS5 of a running Tor (9050, or 9150 for Tor Browser)
+        #   i2p    — HTTP proxy of a running I2P router (4444)
+        #   proxy  — one user proxy, SOCKS5 or HTTP, at user_proxy
+        "mode": "direct",
+        "user_proxy": "",
+        "tor_addr": "127.0.0.1:9050",
+        "i2p_addr": "127.0.0.1:4444",
+    },
     "dns": {
         "enabled": True,
         "servers": DEFAULT_DOH,
@@ -65,6 +80,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "allow_lan": False,
         "allow_ports": [],
         "bypass_uids": [],
+    },
+    "privacy": {
+        # normal | strict | paranoid — see docs/PRIVACY-LAYER.md.
+        # The frame for the layer that goes on top of a working browser; the
+        # engine is not required to honour it yet.
+        "level": "normal",
     },
     "system_proxy": {"enabled": False},
     "verify": {
@@ -217,6 +238,28 @@ def normalise(raw: Dict[str, Any]) -> Dict[str, Any]:
         rules.append({"domain": str(rule["domain"]).lower().strip("."), "action": action})
     cfg["rules"] = rules
 
+    route = cfg.setdefault("route", {})
+    mode = str(route.get("mode", "direct")).lower()
+    if mode not in ROUTE_MODES:
+        raise ConfigError(f"route.mode: expected one of {', '.join(ROUTE_MODES)}, got {mode!r}")
+    route["mode"] = mode
+    for key in ("user_proxy", "tor_addr", "i2p_addr"):
+        route[key] = str(route.get(key, "") or "").strip()
+    if mode == "bypass" and not ((cfg.get("chain") or {}).get("hops") or []):
+        raise ConfigError("route.mode=bypass needs at least one hop under chain.hops")
+    if mode == "proxy":
+        if not route["user_proxy"]:
+            raise ConfigError("route.mode=proxy needs route.user_proxy (host:port)")
+        host, port = util.split_hostport(route["user_proxy"])
+        if not host or not port:
+            raise ConfigError(f"route.user_proxy: expected host:port, got {route['user_proxy']!r}")
+
+    privacy = cfg.setdefault("privacy", {})
+    level = str(privacy.get("level", "normal")).lower()
+    if level not in ("normal", "strict", "paranoid"):
+        raise ConfigError(f"privacy.level: expected normal, strict or paranoid, got {level!r}")
+    privacy["level"] = level
+
     fw = cfg["firewall"]
     if isinstance(fw.get("transparent"), str) and fw["transparent"] != "auto":
         fw["transparent"] = fw["transparent"].lower() in ("1", "true", "yes", "on")
@@ -262,3 +305,28 @@ def init(force: bool = False) -> Path:
     util.write_json(path, DEFAULT_CONFIG)
     util.secure_file(path)
     return path
+
+
+def route_hops(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The hops the chosen route uses: one list, whatever the mode."""
+    route = cfg.get("route") or {}
+    mode = str(route.get("mode", "direct")).lower()
+    chain = cfg.get("chain") or {}
+    hops = [dict(hop) for hop in (chain.get("hops") or [])]
+    if mode == "direct":
+        return []
+    if mode == "chain":
+        return hops
+    if mode == "bypass":
+        if not hops:
+            raise ConfigError("route.mode=bypass needs at least one hop under chain.hops")
+        return hops[:1]
+    if mode == "tor":
+        return [{"type": "socks5", "addr": route.get("tor_addr", "127.0.0.1:9050"), "label": "tor"}]
+    if mode == "i2p":
+        return [{"type": "http", "addr": route.get("i2p_addr", "127.0.0.1:4444"), "label": "i2p"}]
+    if mode == "proxy":
+        addr = route.get("user_proxy", "")
+        kind = "http" if route.get("user_proxy_kind") == "http" else "socks5"
+        return [{"type": kind, "addr": addr, "label": "user proxy"}]
+    raise ConfigError(f"unknown route.mode {mode!r}")

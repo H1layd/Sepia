@@ -147,6 +147,41 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config_mod.ConfigError):
             config_mod.normalise({"dns": {"servers": ["http://1.1.1.1/dns-query"]}})
 
+    def test_route_modes(self) -> None:
+        hops = [{"type": "socks5", "addr": "10.0.0.5:1080", "label": "a"},
+                {"type": "http", "addr": "10.0.0.6:3128", "label": "b"}]
+        base = {"chain": {"hops": hops}, "route": {"mode": "direct"}}
+
+        def hops_for(mode: str, **route: object) -> list:
+            cfg = config_mod.normalise(dict(base, route=dict({"mode": mode}, **route)))
+            return config_mod.route_hops(cfg)
+
+        self.assertEqual(hops_for("direct"), [])
+        self.assertEqual([h["label"] for h in hops_for("chain")], ["a", "b"])
+        self.assertEqual([h["label"] for h in hops_for("bypass")], ["a"])
+        tor = hops_for("tor")
+        self.assertEqual((tor[0]["type"], tor[0]["addr"]), ("socks5", "127.0.0.1:9050"))
+        i2p = hops_for("i2p")
+        self.assertEqual((i2p[0]["type"], i2p[0]["addr"]), ("http", "127.0.0.1:4444"))
+        proxy = hops_for("proxy", user_proxy="127.0.0.1:1080")
+        self.assertEqual((proxy[0]["type"], proxy[0]["addr"]), ("socks5", "127.0.0.1:1080"))
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.normalise({"route": {"mode": "teleport"}})
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.normalise({"route": {"mode": "proxy"}})
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.normalise({"chain": {"hops": []}, "route": {"mode": "bypass"}})
+
+    def test_privacy_level(self) -> None:
+        self.assertEqual(config_mod.normalise({})["privacy"]["level"], "normal")
+        for level in ("normal", "strict", "paranoid"):
+            self.assertEqual(
+                config_mod.normalise({"privacy": {"level": level}})["privacy"]["level"],
+                level,
+            )
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.normalise({"privacy": {"level": "off"}})
+
     def test_bad_rule_action(self) -> None:
         with self.assertRaises(config_mod.ConfigError):
             config_mod.normalise({"rules": [{"domain": "x.com", "action": "allow"}]})

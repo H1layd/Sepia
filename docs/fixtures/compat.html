@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<title>Sepia compatibility regression</title>
+<style>
+  :root { --space: 16px; --loop-a: var(--loop-b); --loop-b: var(--loop-a); }
+  body { margin: 24px; color: #202124; font: 16px Arial; }
+  main { max-width: 900px; margin: 0 auto; }
+  .row { display: flex; gap: var(--space); }
+  .query { flex: 1 1 300px; min-width: 0; padding: 8px; }
+  button { flex: 0 0 100px; padding: 8px; }
+  .cards { display: flex; gap: 16px; margin-top: 24px; }
+  .cards > div { flex: 1 1 200px; min-width: 0; padding: var(--loop-a, 16px); border: 1px solid #999; }
+  #next { margin-top: 900px; }
+  @media (max-width: 700px) { .cards { flex-direction: column; } }
+</style>
+<main>
+  <h1>Проверка движка Sepia</h1>
+  <p>Текст, форма и ссылки должны оставаться доступными после изменения размера окна.</p>
+  <form class="row" action = "/search" method = "get">
+    <input class="query" name = "q" placeholder = "Поиск" value = "rust lang">
+    <button name = "go" value = "yes">Найти</button>
+  </form>
+  <p id="result">Результат пока не запрошен.</p>
+  <div class="cards"><div>Первая колонка</div><div>Вторая колонка</div><div>Третья колонка</div></div>
+  <p><a href="#next">Перейти к следующему разделу</a></p>
+  <textarea name = "notes">&lt;span&gt;Это текст, а не разметка.&lt;/span&gt;</textarea>
+  <section id="next"><h2>Следующий раздел</h2><p>Проверка якоря и поиска по странице.</p></section>
+</main>
+<script>
+document.querySelector('form').addEventListener('submit', event => {
+  event.preventDefault();
+  const values = new FormData(event.target);
+  document.getElementById('result').textContent = 'Запрос: ' + values.get('q');
+});
+</script>
+</html>

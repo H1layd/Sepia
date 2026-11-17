@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Regenerate docs/anon-dashboard.png from the browser's own audit output.
+"""Render an anonymity dashboard PNG from the browser's own audit output.
 
 The dashboard is rendered by sepia-browser itself: it is a real page, not a
-screenshot of someone else's browser.
+screenshot of someone else's browser. Writes to /tmp by default; pass --out to
+put it somewhere else. The address is redacted unless --no-redact is given.
 """
 import json
 import shutil
@@ -13,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BROWSER = ROOT / "browser" / "target" / "release" / "sepia-browser"
-OUT = ROOT / "docs" / "anon-dashboard.png"
+OUT = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else Path("/tmp/sepia-dashboard.png")
 
 
 def audit_facts() -> dict:
@@ -28,7 +29,7 @@ def audit_facts() -> dict:
         elif line.startswith("transport") and "chain" in line:
             facts["chain"] = line.split("transport", 1)[1].strip()
     # The screenshot goes into a public repository: never publish a real exit IP.
-    if "--redact" in sys.argv:
+    if "--no-redact" not in sys.argv:
         facts["ip"] = "203.0.113.7"
         facts["loc"] = "NL"
         facts["note"] = "address redacted for publication"

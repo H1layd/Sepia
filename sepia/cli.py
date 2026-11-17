@@ -118,7 +118,10 @@ def control_get(cfg: Dict[str, Any], path: str = "/status",
 
 
 def build_chain(cfg: Dict[str, Any]) -> chain_mod.Chain:
-    return chain_mod.Chain.from_config(cfg["chain"])
+    """The chain the chosen route describes, not always the raw hop list."""
+    chain_cfg = dict(cfg["chain"])
+    chain_cfg["hops"] = config_mod.route_hops(cfg)
+    return chain_mod.Chain.from_config(chain_cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +152,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         caps = capabilities(run_dir(cfg))
         heading("platform")
         kv("os", caps.get("platform"))
+        kv("privacy", cfg["privacy"]["level"])
         fw = caps.get("firewall") or {}
         kv("firewall", f"{fw.get('name')} (available={fw.get('available')})")
         kv("transparent", f"{fw.get('transparent')} scope={fw.get('transparent_scope')}")
@@ -297,6 +301,139 @@ def _rollback(cfg: Dict[str, Any], backend: Optional[Any], system_proxy: Optiona
     return notes
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Where the milliseconds go: direct, per hop, and through the chain."""
+    try:
+        cfg = load_cfg(args)
+    except config_mod.ConfigError as exc:
+        return fail(str(exc))
+    chain = build_chain(cfg)
+    url = args.url
+    runs = max(1, args.count)
+    timeout = args.timeout
+
+    async def measure(ch: chain_mod.Chain) -> List[float]:
+        samples: List[float] = []
+        for _ in range(runs):
+            started = time.monotonic()
+            try:
+                await httpc.request(ch, url, timeout=timeout, headers={"Accept": "text/html"})
+                samples.append((time.monotonic() - started) * 1000.0)
+            except Exception:  # noqa: BLE001 - a failed probe is data too
+                samples.append(float("nan"))
+        return samples
+
+    async def run() -> int:
+        heading(f"bench {url} — {runs} run(s)")
+        direct_chain = chain_mod.Chain([], timeout)
+        direct = await measure(direct_chain)
+        chained = await measure(chain) if chain.depth else []
+
+        def median(values: List[float]) -> Optional[float]:
+            clean = sorted(v for v in values if v == v)
+            return clean[len(clean) // 2] if clean else None
+
+        kv("direct", f"{median(direct):.0f} ms" if median(direct) is not None else "failed")
+        if chain.depth:
+            hop_times = []
+            for index, hop in enumerate(chain.hops):
+                try:
+                    started = time.monotonic()
+                    await chain.probe_hop(index)
+                    hop_times.append((time.monotonic() - started) * 1000.0)
+                    kv(f"hop{index + 1}", f"{hop.label}  {hop_times[-1]:.0f} ms handshake")
+                except Exception as exc:  # noqa: BLE001
+                    hop_times.append(float("nan"))
+                    kv(f"hop{index + 1}", f"{hop.label}  недоступен: {type(exc).__name__}")
+            chained_median = median(chained)
+            if chained_median is not None:
+                base = median(direct) or 0.0
+                kv("through chain", f"{chained_median:.0f} ms")
+                kv("overhead", f"+{chained_median - base:.0f} ms за {chain.depth} хоп(а)")
+            else:
+                kv("through chain", "failed")
+        else:
+            kv("chain", "нет хопов: bench мериет только прямой путь")
+        say("")
+        say("Пинг — это RTT, а не скорость загрузки. Каждый хоп стоит примерно один RTT")
+        say("на TCP и ещё один на CONNECT; TLS до сайта добавляет один RTT (1.3).")
+        say("Соединения переиспользуются, поэтому второй запрос к тому же сайту дешевле.")
+        return 0
+
+    return asyncio.run(run())
+
+
+ROUTE_HELP = {
+    "direct": "без хопов: прямое соединение, DoH остаётся; не анонимно",
+    "chain": "наша цепочка: все хопы по порядку; чем глубже, тем медленнее",
+    "bypass": "только первый хоп: быстрый обход блокировок",
+    "tor": "Tor как хоп: SOCKS5 127.0.0.1:9050 (или 9150 у Tor Browser)",
+    "i2p": "I2P как хоп: HTTP-прокси роутера, обычно 127.0.0.1:4444",
+    "proxy": "один прокси пользователя: SOCKS5 или HTTP",
+}
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_cfg(args)
+    except config_mod.ConfigError as exc:
+        return fail(str(exc))
+
+    if args.action in ("set", "use"):
+        mode = (args.mode or "").lower()
+        if mode not in config_mod.ROUTE_MODES:
+            return fail(f"mode: {' | '.join(config_mod.ROUTE_MODES)}")
+        cfg["route"]["mode"] = mode
+        if args.addr:
+            if mode == "proxy":
+                cfg["route"]["user_proxy"] = args.addr
+                cfg["route"]["user_proxy_kind"] = "http" if args.http else "socks5"
+            elif mode == "tor":
+                cfg["route"]["tor_addr"] = args.addr
+            elif mode == "i2p":
+                cfg["route"]["i2p_addr"] = args.addr
+            else:
+                return fail("--addr has no meaning for this mode")
+        try:
+            cfg = config_mod.normalise(cfg)
+        except config_mod.ConfigError as exc:
+            return fail(str(exc))
+        config_mod.save(cfg)
+        say(f"route: {mode} — {ROUTE_HELP[mode]}")
+        return 0
+
+    # show: what would happen, and is it reachable
+    mode = cfg["route"]["mode"]
+    heading(f"route: {mode}")
+    kv("meaning", ROUTE_HELP[mode])
+    try:
+        hops = config_mod.route_hops(cfg)
+    except config_mod.ConfigError as exc:
+        return fail(str(exc))
+    if not hops:
+        kv("hops", "none — direct connection")
+    async def probe() -> None:
+        for index, hop in enumerate(hops):
+            host, port = util.split_hostport(hop["addr"])
+            started = time.monotonic()
+            try:
+                _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2.5)
+                writer.close()
+                kv(f"hop{index + 1}", f"{hop.get('label') or hop['addr']}  {hop['type']}  reachable {(time.monotonic() - started) * 1000:.0f} ms")
+            except Exception as exc:  # noqa: BLE001
+                kv(f"hop{index + 1}", f"{hop.get('label') or hop['addr']}  {hop['type']}  недоступен: {type(exc).__name__}")
+    asyncio.run(probe())
+    if mode == "iroh":
+        return 0
+    if mode == "tor":
+        say("hint: Tor должен быть запущен (brew services start tor, или Tor Browser на 9150)")
+    if mode == "i2p" and hops:
+        say("hint: роутер I2P должен быть запущен и включён HTTP-прокси")
+    say("")
+    say("сменить: sepia route set tor | i2p | chain | bypass | proxy --addr host:port | direct")
+    return 0
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     try:
         cfg = load_cfg(args)
@@ -322,15 +459,21 @@ def cmd_up(args: argparse.Namespace) -> int:
     if needs_root and not util.is_root() and not args.dry_run:
         return fail("this profile needs root: run  sudo sepia up")
 
+    try:
+        route_mode = cfg["route"]["mode"]
+        route = config_mod.route_hops(cfg)
+    except config_mod.ConfigError as exc:
+        return fail(str(exc))
+
     if (cfg["firewall"]["enabled"] and cfg["firewall"]["killswitch"]
-            and not cfg["chain"]["hops"]):
+            and not route):
         return fail(
-            "killswitch needs at least one hop: with no hops there is nothing to "
-            "allow through and the machine will go dark.\n"
-            "       add chain.hops, or run 'sepia up --no-firewall'."
+            f"killswitch needs at least one hop, and route.mode={route_mode} has "
+            "none: everything would be blocked.\n"
+            "       sepia route set chain|bypass|tor|i2p|proxy, or run 'sepia up --no-firewall'."
         )
 
-    for hop in cfg["chain"]["hops"]:
+    for hop in route:
         if hop_points_at_self(cfg, str(hop["addr"])):
             return fail(
                 f"hop {hop['label']} ({hop['addr']}) points back at this very "
@@ -818,6 +961,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg = sub.add_parser("config", help="inspect or validate the config")
     p_cfg.add_argument("action", choices=["show", "validate", "path"])
     p_cfg.set_defaults(func=cmd_config)
+
+    p_route = sub.add_parser("route", help="how traffic leaves: direct, chain, tor, i2p, bypass, proxy")
+    p_route.add_argument("action", nargs="?", default="show", choices=("show", "set", "use"))
+    p_route.add_argument("mode", nargs="?", default="")
+    p_route.add_argument("--addr", help="host:port for tor/i2p/proxy")
+    p_route.add_argument("--http", action="store_true", help="the user proxy speaks HTTP, not SOCKS5")
+    p_route.set_defaults(func=cmd_route)
+
+    p_bench = sub.add_parser("bench", help="where the milliseconds go: direct vs chain")
+    p_bench.add_argument("url", nargs="?", default="https://example.com/")
+    p_bench.add_argument("-n", "--count", type=int, default=3)
+    p_bench.add_argument("--timeout", type=float, default=15.0)
+    p_bench.set_defaults(func=cmd_bench)
 
     p_chain = sub.add_parser("chain", help="probe every hop and the exit")
     p_chain.set_defaults(func=cmd_chain)
