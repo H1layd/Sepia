@@ -61,6 +61,27 @@ pub struct LinkHit {
     pub node: Option<usize>,
 }
 
+/// Multiply what a draw paints by `opacity` (CSS opacity on its box).
+fn fade(draw: &mut Draw, opacity: f32) {
+    let f = |c: &mut Color| c.a = (c.a as f32 * opacity).round() as u8;
+    match draw {
+        Draw::Rect { color, .. } | Draw::Border { color, .. } | Draw::Text { color, .. } => f(color),
+        Draw::Fill { color, gradient, .. } => {
+            if let Some(c) = color {
+                f(c);
+            }
+            if let Some(g) = gradient {
+                for stop in g.stops.iter_mut() {
+                    f(&mut stop.0);
+                }
+            }
+        }
+        Draw::Edges { colors, .. } => colors.iter_mut().for_each(f),
+        Draw::Shadow { shadow, .. } => f(&mut shadow.color),
+        Draw::Image { .. } => {}
+    }
+}
+
 /// Inside layout a link's href carries its element id after a NUL; split it.
 fn link(rect: Rect, href: &str) -> LinkHit {
     match href.split_once('\0') {
@@ -107,6 +128,7 @@ pub struct Fonts {
     /// Local faces for `monospace` and `serif`.
     pub mono: crate::fonts::LocalFamily,
     pub serif: crate::fonts::LocalFamily,
+    pub system: crate::fonts::LocalFamily,
 }
 
 impl Fonts {
@@ -172,6 +194,7 @@ impl Fonts {
             web: crate::fonts::WebFonts::default(),
             mono: crate::fonts::LocalFamily::mono(),
             serif: crate::fonts::LocalFamily::serif(),
+            system: crate::fonts::LocalFamily::system(),
         }
     }
 
@@ -243,6 +266,8 @@ pub struct Layout<'a> {
     /// Measuring min/max-content for table columns: lines start at the left
     /// edge whatever their alignment, so the extent of the draws is the width.
     measuring: bool,
+    /// the opacity of each box being laid out, innermost last
+    opacity_slots: Vec<f32>,
     /// inside a min/max-content measurement (at any depth): positioned
     /// boxes are out of flow and give their ancestors no size
     intrinsic: bool,
@@ -297,7 +322,7 @@ fn out_of_flow(style: &Style) -> bool {
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
         crate::style::set_viewport(viewport_width, sheet.viewport_height);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -385,6 +410,29 @@ impl<'a> Layout<'a> {
         y: f32,
         containing_width: f32,
     ) -> f32 {
+        // opacity applies to the whole box with what is inside it: what it drew
+        // gets the factor (nested ones multiply, as group opacity does)
+        let first_draw = self.page.draws.len();
+        self.opacity_slots.push(1.0);
+        let height = self.layout_block_inner(node, ancestors, parent, x, y, containing_width);
+        let opacity = self.opacity_slots.pop().unwrap_or(1.0);
+        if opacity < 0.999 {
+            for draw in &mut self.page.draws[first_draw..] {
+                fade(draw, opacity);
+            }
+        }
+        height
+    }
+
+    fn layout_block_inner(
+        &mut self,
+        node: &Node,
+        ancestors: &[&Node],
+        parent: Option<&Style>,
+        x: f32,
+        y: f32,
+        containing_width: f32,
+    ) -> f32 {
         if node.is_text() {
             let text = node.text.clone().unwrap_or_default();
             if text.trim().is_empty() {
@@ -408,6 +456,9 @@ impl<'a> Layout<'a> {
 
         let parent_style = parent.cloned().or_else(|| ancestors.last().map(|n| default_for(n)));
         let mut style = compute(node, parent_style.as_ref(), self.sheet, ancestors, containing_width);
+        if let Some(slot) = self.opacity_slots.last_mut() {
+            *slot = style.opacity;
+        }
         // a form control as a flex/grid item takes the size its line gives it
         if self.blockify == Some(node as *const Node) && !self.measuring && matches!(node.tag.as_str(), "input" | "select" | "textarea") && style.width.is_none() {
             style.width = Some((containing_width - style.margin.horizontal()).max(1.0));
@@ -499,7 +550,11 @@ impl<'a> Layout<'a> {
         let inner_y = box_y + b.top + pad.top;
 
         // shadow and background go under the children; their height is known at the end
-        let paints = !style.hidden && !style.transparent;
+        // while measuring content, a box without a width of its own fills the
+        // measuring space (capped only by max-width): its background and
+        // border are not content and must not read as width
+        let measuring_auto = self.intrinsic && style.width.is_none();
+        let paints = !style.hidden && !style.transparent && !measuring_auto;
         let paints_background = paints && self.canvas_node != Some(node as *const Node);
         let zero = Rect { x: box_x, y: box_y, w: 0.0, h: 0.0 };
         let shadow_index = match (paints_background, style.shadow) {
@@ -609,6 +664,11 @@ impl<'a> Layout<'a> {
         }
         if paints && (b.top > 0.0 || b.right > 0.0 || b.bottom > 0.0 || b.left > 0.0) {
             self.page.draws.push(Draw::Edges { rect, widths: b, colors: style.border_colors, radius: style.radius });
+        }
+        // a box with a width of its own is that wide for whoever measures content
+        // (a percentage of the huge measuring width is not a size: left out)
+        if style.width.is_some() && !style.width_relative && !style.hidden && rect.x + rect.w < 50_000.0 {
+            self.page.content_right = self.page.content_right.max(rect.x + rect.w);
         }
         if let Some(id) = node.attr("data-sepia-id").and_then(|v| v.parse::<usize>().ok()) {
             self.page.boxes.push((rect, id));
@@ -1487,6 +1547,7 @@ impl<'a> Layout<'a> {
             images: self.images,
             measuring,
             intrinsic: measuring || self.intrinsic,
+            opacity_slots: Vec::new(),
             pending_indent: 0.0,
             last_margin_bottom: 0.0,
             trailing_margin: 0.0,
@@ -2190,7 +2251,13 @@ impl<'a> Layout<'a> {
             let gaps = gap * (count.saturating_sub(1)) as f32;
             let total: f32 = items[line.clone()].iter().map(|i| i.basis).sum();
             let free = width - total - gaps;
-            if free > 0.0 {
+            // measuring max-content: items stay at their basis (growing into the
+            // huge measuring space would push the next item out of sight)
+            if free > 0.0 && (self.measuring || self.intrinsic) {
+                for item in &mut items[line.clone()] {
+                    item.size = item.basis;
+                }
+            } else if free > 0.0 {
                 let grow: f32 = items[line.clone()].iter().map(|i| i.flex.grow).sum();
                 for item in &mut items[line.clone()] {
                     item.size = item.basis + if grow > 0.0 { free * item.flex.grow / grow } else { 0.0 };
@@ -2573,7 +2640,8 @@ impl<'a> Layout<'a> {
                     widths[c] = min;
                     fr_total += fr;
                 }
-                Track::MinMax(min, MaxTrack::Px(max)) => widths[c] = max.max(min),
+                // starts at its minimum; grows toward the maximum below, from what is left
+                Track::MinMax(min, MaxTrack::Px(_)) => widths[c] = min,
                 Track::Auto | Track::MinMax(_, MaxTrack::Auto) => widths[c] = auto_need[c],
             }
             if !matches!(tracks[c], Track::Fr(_)) {
@@ -2589,6 +2657,28 @@ impl<'a> Layout<'a> {
                     let cut = over.min(slack) * (widths[c] - auto_min[c]) / slack;
                     widths[c] -= cut;
                     used -= cut;
+                }
+            }
+        }
+        // grow minmax(min, <length>) tracks toward their maximum with the free space
+        {
+            let mut free = (width - used).max(0.0);
+            let growable: Vec<usize> = (0..columns).filter(|c| matches!(tracks[*c], Track::MinMax(_, MaxTrack::Px(_)))).collect();
+            let mut rounds = 0;
+            while free > 0.5 && rounds < 8 {
+                rounds += 1;
+                let open: Vec<usize> = growable.iter().copied().filter(|c| matches!(tracks[*c], Track::MinMax(_, MaxTrack::Px(max)) if widths[*c] < max)).collect();
+                if open.is_empty() {
+                    break;
+                }
+                let share = free / open.len() as f32;
+                for c in open {
+                    if let Track::MinMax(_, MaxTrack::Px(max)) = tracks[c] {
+                        let add = share.min(max - widths[c]);
+                        widths[c] += add;
+                        used += add;
+                        free -= add;
+                    }
                 }
             }
         }
@@ -2926,6 +3016,36 @@ mod tests {
     fn cjk_text_breaks_between_characters() {
         let words: Vec<String> = split_words("该域名仅用于。ok", false).into_iter().map(|w| w.0).collect();
         assert_eq!(words, vec!["该", "域", "名", "仅", "用", "于。", "ok"]);
+    }
+
+    #[test]
+    fn grid_minmax_length_tracks_leave_room_for_content_columns() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:grid;grid-template-columns:minmax(0,900px) min-content;width:600px'><div>main text</div><div><div style='width:150px'>side</div></div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let side = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("side") => Some(*x), _ => None }).unwrap();
+        assert!(side > 400.0 && side < 460.0, "side column at {side}");
+    }
+
+    #[test]
+    fn growing_flex_items_do_not_inflate_a_measured_width() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:flex;flex-wrap:wrap;width:800px'><div style='width:200px'>start</div><div style='display:flex;flex-grow:1'><div style='flex-grow:1'>field</div><div>Search</div></div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let y = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { baseline, text, .. } if text.contains(w) => Some(*baseline), _ => None }).unwrap();
+        assert_eq!(y("start"), y("Search"), "the growing item wrapped to a second line");
+    }
+
+    #[test]
+    fn row_less_tables_shrink_to_their_content() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><figure style='display:table;margin:0;float:right'><img width=100 height=50><figcaption>cap</figcaption></figure><p>text</p></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let cap = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("cap") => Some(*x), _ => None }).unwrap();
+        assert!(cap > 600.0, "caption of a floated row-less table at {cap}");
     }
 
     #[test]

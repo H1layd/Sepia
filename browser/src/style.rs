@@ -218,6 +218,8 @@ pub struct Style {
     pub border_width: f32,
     pub border_color: Color,
     pub width: Option<f32>,
+    /// the width depends on the container (a percentage): not a size of its own when measuring content
+    pub width_relative: bool,
     pub height: Option<f32>,
     pub line_height: LineHeight,
     /// extra px after every character (inherited)
@@ -353,6 +355,7 @@ impl Default for Style {
             grid_area: None,
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
+            width_relative: false,
             dark: false,
             family: None,
         }
@@ -1761,7 +1764,10 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 }
             }
         }
-        "width" => style.width = parse_length(value, font_size, containing_width),
+        "width" => {
+            style.width = parse_length(value, font_size, containing_width);
+            style.width_relative = value.contains('%') || value.contains("vw");
+        }
         "height" => style.height = height_length(value, font_size),
         "line-height" => {
             style.line_height = if value == "normal" {

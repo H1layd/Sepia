@@ -132,7 +132,7 @@ fn open_once(
             let kind = response.content_type();
             let html = kind.is_empty() || kind.contains("html") || kind.contains("xml");
             let (body, encoding) = crate::charset::decode(&response.body, &kind, html, crate::charset::Encoding::Utf8);
-            Ok(finish(
+            let opened = finish(
                 url,
                 body,
                 response.status,
@@ -143,7 +143,18 @@ fn open_once(
                 0,
                 Some(ImageFetch { page: Some(url.clone()), encoding, chain, resolver, timeout, site: final_site.clone() }),
                 defer_images,
-            ))
+            );
+            // an error answer that shows nothing (a bot wall, a rate limit, a
+            // challenge only a script engine passes): say what happened instead
+            // of a blank page
+            let shown: usize = opened.0.page.text.iter().map(|t| t.trim().chars().count()).sum();
+            if response.status >= 400 && shown < 40 {
+                let html = blocked_page(url, &response);
+                let (mut loaded, _, _) = finish(url, html, response.status, String::new(), format!("http {} · explained", response.status), width, fonts, 0, None, false);
+                loaded.status = response.status;
+                return Ok((loaded, None, None));
+            }
+            Ok(opened)
         }
     }
 }
@@ -981,4 +992,35 @@ mod navigation_tests {
             assert!(late.is_none());
         }
     }
+}
+
+
+/// The page shown for an error answer that renders nothing: why, and a way to try again.
+fn blocked_page(url: &Url, response: &Response) -> String {
+    let ru = crate::persona::current().country.language.starts_with("ru");
+    let header = |name: &str| response.header(name).unwrap_or("").to_ascii_lowercase();
+    let cloudflare = header("server").contains("cloudflare") || response.header("cf-ray").is_some() || response.header("cf-mitigated").is_some();
+    let status = response.status;
+    let (title, reason) = match (status, cloudflare, ru) {
+        (429, _, true) => ("Слишком много запросов", "Сайт ограничил частоту обращений с этого адреса. Подождите немного и повторите."),
+        (429, _, false) => ("Too many requests", "The site limits how often this address may ask. Wait a little and try again."),
+        (401, _, true) => ("Нужен вход", "Сайт не показывает эту страницу без входа или считает запрос автоматическим."),
+        (401, _, false) => ("Sign-in required", "The site does not show this page without signing in, or took the request for a bot."),
+        (403 | 498 | 503, true, true) | (403 | 498, false, true) => ("Сайт закрылся от автоматики", "Защита сайта (часто Cloudflare или похожая) не пропустила запрос: она проверяет браузер скриптами или признаками, которые наш движок пока не проходит."),
+        (403 | 498 | 503, true, false) | (403 | 498, false, false) => ("The site blocked automated access", "The site's protection (often Cloudflare or similar) did not let the request through: it checks the browser with scripts or signals our engine does not pass yet."),
+        (_, _, true) => ("Сайт ответил ошибкой", "Сервер вернул ошибку и не показал содержимого."),
+        (_, _, false) => ("The site answered with an error", "The server returned an error and showed nothing."),
+    };
+    let retry = if ru { "Повторить" } else { "Try again" };
+    let detail = if cloudflare { " · Cloudflare" } else { "" };
+    let href = url.to_string().replace('&', "&amp;").replace('"', "&quot;");
+    let host = url.host.replace('&', "&amp;").replace('<', "&lt;");
+    format!(
+        "<!doctype html><html><head><title>{title}</title><style>\
+         body{{font:16px/1.5 sans-serif;max-width:34em;margin:18vh auto 0;padding:0 2em;color:#222}}\
+         h1{{font-size:24px;font-weight:600;margin:0 0 .6em}} p{{margin:0 0 1em}} .code{{color:#777;font-size:14px}}\
+         a.retry{{display:inline-block;padding:.5em 1.4em;border-radius:6px;background:#222;color:#fff;text-decoration:none}}\
+         </style></head><body><h1>{title}</h1><p>{reason}</p>\
+         <p class=code>{host} · HTTP {status}{detail}</p><p><a class=retry href=\"{href}\">{retry}</a></p></body></html>"
+    )
 }

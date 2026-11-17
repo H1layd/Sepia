@@ -285,6 +285,12 @@ const MONO_FACES: &[(&str, u32)] = &[
     ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
     (r"C:\Windows\Fonts\consola.ttf", 0),
 ];
+/// The system UI face (`system-ui`, `-apple-system`): San Francisco on macOS.
+const SYSTEM_FACES: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/SFNS.ttf", 0),
+    (r"C:\Windows\Fonts\segoeui.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+];
 const SERIF_FACES: &[(&str, u32)] = &[
     ("/System/Library/Fonts/Supplemental/Georgia.ttf", 0),
     ("/System/Library/Fonts/Supplemental/Times New Roman.ttf", 0),
@@ -306,6 +312,10 @@ impl LocalFamily {
 
     pub fn serif() -> LocalFamily {
         LocalFamily { paths: SERIF_FACES, face: OnceLock::new() }
+    }
+
+    pub fn system() -> LocalFamily {
+        LocalFamily { paths: SYSTEM_FACES, face: OnceLock::new() }
     }
 
     fn get(&self) -> Option<&Font> {
@@ -333,6 +343,8 @@ impl Fonts {
                 let local = match name.as_str() {
                     "monospace" | "ui-monospace" | "sfmono-regular" | "sf mono" | "menlo" | "monaco" | "consolas" | "courier" | "courier new" | "liberation mono" | "dejavu sans mono" => Some(&self.mono),
                     "serif" | "ui-serif" | "georgia" | "times" | "times new roman" | "cambria" => Some(&self.serif),
+                    // the system face has one weight here: bold and italic keep the default faces
+                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" if !bold && !italic && std::env::var_os("SEPIA_SF").is_some() => Some(&self.system),
                     "sans-serif" | "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" | "arial" | "helvetica" | "helvetica neue" | "segoe ui" | "roboto" => return self.pick(bold, italic),
                     _ => None,
                 };

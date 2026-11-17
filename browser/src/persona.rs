@@ -190,8 +190,33 @@ pub struct Persona {
 
 impl Default for Persona {
     fn default() -> Persona {
-        Persona { browser: &BROWSERS[0], country: &COUNTRIES[0] }
+        // tests must not depend on the machine's locale
+        let system = if cfg!(test) { None } else { system_country() };
+        Persona { browser: &BROWSERS[0], country: system.unwrap_or(&COUNTRIES[0]) }
     }
+}
+
+/// The country of the system's own locale (macOS AppleLocale, else LC_ALL /
+/// LANG), as a browser takes its language from the system, not from the exit IP.
+fn system_country() -> Option<&'static Country> {
+    static FOUND: std::sync::OnceLock<Option<&'static Country>> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let locale = std::env::var("LC_ALL").ok().filter(|v| !v.is_empty() && v != "C" && v != "POSIX")
+            .or_else(|| {
+                cfg!(target_os = "macos").then(|| {
+                    std::process::Command::new("/usr/bin/defaults").args(["read", "-g", "AppleLocale"]).output().ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                }).flatten().filter(|v| !v.is_empty())
+            })
+            .or_else(|| std::env::var("LANG").ok().filter(|v| !v.is_empty() && v != "C"))?;
+        // ru_RU, ru-RU, ru_RU.UTF-8, en_US@rg=… → the region, else the language's usual country
+        let main = locale.split(['.', '@']).next().unwrap_or("");
+        let mut parts = main.split(['_', '-']);
+        let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+        let region = parts.last().filter(|r| r.len() == 2).map(|r| r.to_ascii_uppercase());
+        region.and_then(|r| country(&r))
+            .or_else(|| COUNTRIES.iter().find(|c| c.language.to_ascii_lowercase().starts_with(&format!("{lang}-"))))
+    })
 }
 
 static CURRENT: RwLock<Option<Persona>> = RwLock::new(None);
