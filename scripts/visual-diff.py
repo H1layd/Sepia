@@ -155,6 +155,21 @@ def coarse_iou(mask_ref: np.ndarray, mask_ours: np.ndarray, cell: int = 8) -> fl
     return float((a & b).sum()) / union if union else 1.0
 
 
+def column_bands(mask_ref: np.ndarray, mask_ours: np.ndarray, count: int = 6) -> List[Dict]:
+    """Вертикальные полосы: какая колонка страницы опустела."""
+    width = mask_ref.shape[1]
+    step = max(1, width // count)
+    result = []
+    for index in range(count):
+        x0, x1 = index * step, min((index + 1) * step, width)
+        if x0 >= x1:
+            break
+        ref = float(mask_ref[:, x0:x1].mean())
+        ours = float(mask_ours[:, x0:x1].mean())
+        result.append({"band": index, "x": [x0, x1], "ref_ink": round(ref, 4), "ours_ink": round(ours, 4)})
+    return result
+
+
 def composite(ref: Image.Image, ours: Image.Image, mask_ref: np.ndarray, mask_ours: np.ndarray, out: Path) -> None:
     size = (max(ref.width, ours.width), max(ref.height, ours.height))
     ref_p = Image.new("RGB", size, (255, 255, 255))
@@ -206,6 +221,7 @@ def compare(url: str, width: int, height: int, outdir: Path, ours_bin: Path, chr
     r_ref, c_ref = profiles(m_ref)
     r_ours, c_ours = profiles(m_aligned)
     band_rows = bands(m_ref, m_aligned)
+    band_cols = column_bands(m_ref, m_aligned)
     missing_bands = [b for b in band_rows if b["ref_ink"] > 0.02 and b["ours_ink"] < b["ref_ink"] * 0.4]
     extra_bands = [b for b in band_rows if b["ours_ink"] > 0.02 and b["ref_ink"] < b["ours_ink"] * 0.4]
 
@@ -214,7 +230,8 @@ def compare(url: str, width: int, height: int, outdir: Path, ours_bin: Path, chr
     ink_similarity = 1.0 - abs(a - b) / max(a, b, 1e-6)
     band_gap = float(np.mean([abs(row["ours_ink"] - row["ref_ink"]) for row in band_rows])) if band_rows else 0.0
     band_similarity = max(0.0, 1.0 - band_gap / max(a, b, 1e-6))
-    block_iou = coarse_iou(m_ref, m_aligned)
+    block_iou = coarse_iou(m_ref, m_aligned, cell=8)
+    detail_iou = coarse_iou(m_ref, m_aligned, cell=24)
     score = 100.0 * (0.35 * block_iou + 0.20 * max(0.0, correlation(c_ref, c_ours))
                      + 0.20 * max(0.0, correlation(r_ref, r_ours))
                      + 0.10 * ink_similarity + 0.15 * band_similarity)
@@ -223,11 +240,14 @@ def compare(url: str, width: int, height: int, outdir: Path, ours_bin: Path, chr
         "score": round(score, 1),
         "iou": round(iou, 4),
         "block_iou": round(block_iou, 3),
+        "detail_iou": round(detail_iou, 3),
         "ink_reference": round(a, 4),
         "ink_ours": round(b, 4),
         "row_correlation": round(correlation(r_ref, r_ours), 3),
         "column_correlation": round(correlation(c_ref, c_ours), 3),
         "bands": band_rows,
+        "columns": band_cols,
+        "empty_columns": [c["x"] for c in band_cols if c["ref_ink"] > 0.08 and c["ours_ink"] < c["ref_ink"] * 0.4],
         "missing_bands": [b_["y"] for b_ in missing_bands],
         "extra_bands": [b_["y"] for b_ in extra_bands],
         "shift": [dy, dx],
@@ -265,9 +285,11 @@ def main() -> int:
         return 1
     print(f"{stats['url']}")
     print(f"  сходство       {stats['score']:>5.1f}/100")
-    print(f"  раскладка      {stats['block_iou']:.2f} (блоки 8x8), пиксельный IoU {stats['iou']:.2f}, сдвиг {stats['shift']}")
+    print(f"  раскладка      {stats['block_iou']:.2f} (блоки 8x8), детализация {stats['detail_iou']:.2f} (блоки 24x24), IoU {stats['iou']:.2f}")
     print(f"  чернила        эталон {stats['ink_reference'] * 100:.1f}%, наш {stats['ink_ours'] * 100:.1f}%")
     print(f"  построчно      r={stats['row_correlation']:+.2f}   поколоночно r={stats['column_correlation']:+.2f}")
+    if stats.get("empty_columns"):
+        print(f"  опустели колонки x={stats['empty_columns']}")
     if stats["missing_bands"]:
         print(f"  пропало в полосах y={stats['missing_bands']}")
     if stats["extra_bands"]:
