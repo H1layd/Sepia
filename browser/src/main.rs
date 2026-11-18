@@ -290,8 +290,13 @@ fn click_check(url: &Url, chain: &Chain, resolver: Option<&resolver::Resolver>, 
         fn count(n: &dom::Node) -> usize { 1 + n.children.iter().map(count).sum::<usize>() }
         println!("dom         {} nodes, {} chars of text", count(&tree), tree.text_content().len());
         walk(&tree, &loaded.page, &mut out);
-        for line in out.iter().take(60) {
+        for line in &out {
             println!("{line}");
+        }
+        // every clickable link rectangle: x,y w,h and where it goes (the centre clicks it)
+        for hit in &loaded.page.links {
+            let r = hit.rect;
+            println!("  link {:.0},{:.0} {:.0}x{:.0} {}", r.x, r.y, r.w, r.h, hit.href);
         }
         return;
     }
@@ -485,7 +490,10 @@ fn run_cli(args: Args, resolver_setting: Option<resolver::Resolver>) {
     println!("title       {}", if title.is_empty() { "(none)" } else { &title });
     println!("styles      {} rules", loaded.rules);
     println!("page height {:.0}px", page.height);
-    println!("links       {}", page.links.len());
+    // distinct links (href and element), and the clickable rectangles they make
+    let distinct: std::collections::HashSet<(&str, Option<usize>)> = page.links.iter().map(|l| (l.href.as_str(), l.node)).collect();
+    println!("links       {}", distinct.len());
+    println!("link rects  {}", page.links.len());
     println!("text nodes  {}", page.text.len());
     println!("note        {}", loaded.note);
     match &loaded.icon {

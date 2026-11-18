@@ -220,6 +220,8 @@ pub struct Style {
     pub width: Option<f32>,
     /// the width depends on the container (a percentage): not a size of its own when measuring content
     pub width_relative: bool,
+    /// display: table-caption (laid out as a block, at its table's width)
+    pub caption: bool,
     pub height: Option<f32>,
     pub line_height: LineHeight,
     /// extra px after every character (inherited)
@@ -356,6 +358,7 @@ impl Default for Style {
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
             width_relative: false,
+            caption: false,
             dark: false,
             family: None,
         }
@@ -1282,6 +1285,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
     let font_size = style.font_size;
     match name {
         "display" => {
+            style.caption = value == "table-caption";
             style.display = match value {
                 "none" => Display::None,
                 "flex" => Display::Flex,

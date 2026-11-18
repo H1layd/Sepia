@@ -1345,7 +1345,17 @@ impl<'a> Layout<'a> {
                 family: item.style.family.clone(),
             });
             if let Some(href) = &item.href {
-                self.page.links.push(link(Rect { x: pen_x, y: baseline - ascent, w: advance.max(2.0), h: ascent + descent }, href));
+                let piece = link(Rect { x: pen_x, y: baseline - ascent, w: advance.max(2.0), h: ascent + descent }, href);
+                // the words of one link on one line are one rectangle
+                match self.page.links.last_mut() {
+                    Some(last) if last.href == piece.href && last.node == piece.node
+                        && (last.rect.y - piece.rect.y).abs() < 0.5 && (last.rect.h - piece.rect.h).abs() < 0.5
+                        && piece.rect.x >= last.rect.x && piece.rect.x <= last.rect.x + last.rect.w + piece.rect.h =>
+                    {
+                        last.rect.w = piece.rect.x + piece.rect.w - last.rect.x;
+                    }
+                    _ => self.page.links.push(piece),
+                }
             }
             self.page.text.push(text.clone());
             pen_x += advance;
@@ -1824,6 +1834,23 @@ impl<'a> Layout<'a> {
             let mut with_node: Vec<&Node> = ancestors.to_vec();
             with_node.push(node);
             let saved = std::mem::replace(&mut self.flow_width, containing_width.max(1.0));
+            // a caption (figcaption as table-caption) takes the table's width, it
+            // does not set it: measure the rest, then lay everything out that wide
+            let captions: Vec<bool> = node.children.iter().map(|c| c.text.is_none() && compute(c, Some(style), self.sheet, &with_node, containing_width).caption).collect();
+            if captions.iter().any(|c| *c) && block.width.is_none() {
+                let body = Node {
+                    tag: node.tag.clone(),
+                    attrs: node.attrs.clone(),
+                    children: node.children.iter().zip(&captions).filter(|(_, c)| !**c).map(|(n, _)| n.clone()).collect(),
+                    text: None,
+                };
+                let mut body_ancestors: Vec<&Node> = ancestors.to_vec();
+                body_ancestors.push(&body);
+                if let Some((_, _, w, _)) = self.make_atom(&body, &body_ancestors, &block) {
+                    let chrome = style.padding.horizontal() + style.border.left + style.border.right;
+                    block.width = Some((w - style.margin.horizontal() - if block.border_box { 0.0 } else { chrome }).max(1.0));
+                }
+            }
             let atom = self.make_atom(node, &with_node, &block);
             self.flow_width = saved;
             let Some((page, _, w, h)) = atom else { return margin.vertical() };
@@ -3046,6 +3073,25 @@ mod tests {
         let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
         let cap = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("cap") => Some(*x), _ => None }).unwrap();
         assert!(cap > 600.0, "caption of a floated row-less table at {cap}");
+    }
+
+    #[test]
+    fn table_captions_wrap_to_the_table_width() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><figure style='display:table;margin:0;float:right'><span style='display:inline-block;width:120px;height:40px'></span><figcaption style='display:table-caption'>a long caption that is much wider than the picture above it</figcaption></figure><p>text</p></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let xs: Vec<f32> = page.draws.iter().filter_map(|d| match d { Draw::Text { x, text, .. } if !text.contains("text") => Some(*x), _ => None }).collect();
+        assert!(xs.iter().all(|x| *x > 650.0), "caption lines start at {xs:?}");
+    }
+
+    #[test]
+    fn a_link_on_one_line_is_one_rectangle() {
+        let fonts = fonts();
+        let doc = parse_document("<body><p><a href=/a>one two three</a> and <a href=/b>four five</a></p></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        assert_eq!(page.links.len(), 2, "{:?}", page.links.iter().map(|l| (&l.href, l.rect)).collect::<Vec<_>>());
     }
 
     #[test]
