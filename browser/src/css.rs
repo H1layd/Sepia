@@ -839,6 +839,21 @@ impl FontFace {
     }
 }
 
+thread_local! {
+    /// the root selector of the `@scope` being parsed
+    static SCOPE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `(root) to (limit)` → the root as one compound selector (`:is(...)` for a list).
+fn scope_root(prelude: &str) -> Option<String> {
+    let p = prelude.trim().strip_prefix('(')?;
+    let mut depth = 1;
+    let end = p.char_indices().find(|&(_, c)| { if c == '(' { depth += 1 } else if c == ')' { depth -= 1 } depth == 0 }).map(|(i, _)| i)?;
+    let root = p[..end].trim();
+    if root.is_empty() { return None; }
+    Some(if root.contains(',') || root.contains(' ') || root.contains('>') { format!(":is({root})") } else { root.to_string() })
+}
+
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
@@ -1034,7 +1049,20 @@ impl Stylesheet {
                     }
                     // feature queries: we take the first branch, as most sites
                     // write fallbacks outside and enhancements inside
-                    "supports" | "layer" | "container" | "document" | "-moz-document" | "scope" | "starting-style" => {
+                    // `@scope (root) { … }`: each rule applies inside `root` only
+                    // (also how a shadow tree's stylesheet stays in its tree)
+                    "scope" => {
+                        let root = scope_root(condition);
+                        let outer = SCOPE.with(|s| s.borrow().clone());
+                        let combined = match (&outer, root) {
+                            (Some(o), Some(r)) => Some(format!("{o} {r}")),
+                            (o, r) => r.or(o.clone()),
+                        };
+                        SCOPE.with(|s| *s.borrow_mut() = combined);
+                        self.parse_block(&body, media);
+                        SCOPE.with(|s| *s.borrow_mut() = outer);
+                    }
+                    "supports" | "layer" | "container" | "document" | "-moz-document" | "starting-style" => {
                         if !condition.contains("not ") {
                             self.parse_block(&body, media);
                         }
@@ -1053,7 +1081,13 @@ impl Stylesheet {
             if declarations.is_empty() {
                 continue;
             }
+            let scope = SCOPE.with(|s| s.borrow().clone());
             for selector_text in split_top_level(&prelude, ',') {
+                let selector_text = match &scope {
+                    Some(root) if selector_text.contains(":scope") => selector_text.replace(":scope", root),
+                    Some(root) => format!("{root} {selector_text}"),
+                    None => selector_text,
+                };
                 if let Some(selector) = Selector::parse(&selector_text) {
                     let order = self.rules.len();
                     self.rules.push(Rule { selector, declarations: declarations.clone(), media: media.clone(), order });
@@ -1628,6 +1662,19 @@ mod tests {
         assert!(link.contains(&"teal".into()) && !link.contains(&"pink".into()), "no :hover on a static page");
         assert!(values(&sheet, div.find_first("nav").unwrap(), &[&doc, div]).contains(&"flex".into()));
         assert!(!values(&sheet, p, &[&doc, div]).contains(&"'x'".into()), "pseudo-elements never match");
+    }
+
+    #[test]
+    fn scoped_rules_stay_inside_their_root() {
+        let doc = parse_document("<div><x-card><a>in</a></x-card><a>out</a></div>");
+        let sheet = Stylesheet::parse("@scope (x-card) { a { display: grid } :scope { color: red } }");
+        let div = doc.find_first("div").unwrap();
+        let card = div.find_first("x-card").unwrap();
+        let inner = card.find_first("a").unwrap();
+        let outer = div.children.iter().filter(|c| c.tag == "a").last().unwrap();
+        assert!(values(&sheet, inner, &[&doc, div, card]).contains(&"grid".into()));
+        assert!(!values(&sheet, outer, &[&doc, div]).contains(&"grid".into()), "a scoped rule leaked out");
+        assert!(values(&sheet, card, &[&doc, div]).contains(&"red".into()), ":scope is the root");
     }
 
     #[test]

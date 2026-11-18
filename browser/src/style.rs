@@ -894,6 +894,15 @@ pub fn compute(
     let inline: Vec<Declaration> = node.attr("style").map(parse_declarations).unwrap_or_default();
     // (declaration, from a stylesheet: its text lives as long as the layout)
     let declarations: Vec<(&Declaration, bool)> = matched.iter().map(|d| (d, true)).chain(inline.iter().map(|d| (d, false))).collect();
+    // SEPIA_WHY=substring: print what reaches an element whose markup starts with it
+    if let Ok(why) = std::env::var("SEPIA_WHY") {
+        let head = format!("{} {:?}", node.tag, node.attrs);
+        if head.contains(&why) {
+            for (d, _) in &declarations {
+                eprintln!("why {head}: {}: {}", d.name, d.value);
+            }
+        }
+    }
     // custom properties first (they inherit), then everything else with var() resolved
     let mut own_vars: Vec<(String, String)> = Vec::new();
     for (declaration, _) in declarations.iter().filter(|(d, _)| d.name.starts_with("--")) {

@@ -2029,28 +2029,33 @@ impl boa_engine::module::ModuleLoader for Loader {
     }
 }
 
-/// A shadow tree's stylesheet applied to the page's one cascade: `:host`
-/// becomes the host's tag, `::slotted(x)` becomes `x` (scoping is not kept).
+/// A shadow tree's stylesheet applied to the page's one cascade: wrapped in
+/// `@scope (host)` so its rules reach only the host and what is inside it;
+/// `:host` becomes `:scope`, `::slotted(x)` becomes `x`.
 fn scope_shadow_css(css: &str, host: &str) -> String {
-    let mut out = String::with_capacity(css.len());
+    let mut out = String::with_capacity(css.len() + host.len() + 16);
+    out.push_str("@scope (");
+    out.push_str(host);
+    out.push_str(") {\n");
     let mut rest = css;
     while let Some(i) = rest.find(":host") {
         out.push_str(&rest[..i]);
         let after = &rest[i + 5..];
         if let Some(inner) = after.strip_prefix('(') {
             let close = inner.find(')').unwrap_or(inner.len());
-            out.push_str(host);
+            out.push_str(":scope");
             out.push_str(inner[..close].trim());
             rest = inner.get(close + 1..).unwrap_or("");
         } else if after.starts_with("-context") {
-            out.push_str(host);
+            out.push_str(":scope");
             rest = after.split_once(')').map(|(_, r)| r).unwrap_or("");
         } else {
-            out.push_str(host);
+            out.push_str(":scope");
             rest = after;
         }
     }
     out.push_str(rest);
+    out.push_str("\n}");
     out.replace("::slotted(", ":is(")
 }
 

@@ -881,7 +881,9 @@ impl<'a> Layout<'a> {
             return;
         }
         // img and svg are replaced elements whatever their display says
-        if style.display == Display::InlineBlock && !matches!(node.tag.as_str(), "img" | "svg") {
+        // form controls are inline-blocks even when a site says `display: inline`
+        let control = matches!(node.tag.as_str(), "button" | "input" | "select" | "textarea");
+        if (style.display == Display::InlineBlock || control) && !matches!(node.tag.as_str(), "img" | "svg") {
             let mut node_ancestors: Vec<&Node> = ancestors.to_vec();
             node_ancestors.push(node);
             if let Some((page, baseline, w, h)) = self.make_atom(node, &node_ancestors, &style) {
@@ -2143,6 +2145,15 @@ struct FlexItem<'n> {
     /// a definite width the item gives itself (outer): a column item that is
     /// not stretched keeps it instead of shrinking to its content
     fixed_outer: Option<f32>,
+    /// ancestors and parent style when the item comes from a `display:
+    /// contents` child (None: the container's own)
+    via: Option<(Vec<&'n Node>, Style)>,
+}
+
+impl<'n> FlexItem<'n> {
+    fn ctx<'s>(&'s self, ancestors: &'s [&'n Node], style: &'s Style) -> (&'s [&'n Node], &'s Style) {
+        match &self.via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) }
+    }
 }
 
 /// `align-items: stretch`: grow the item's own box (its background and
@@ -2237,18 +2248,23 @@ impl<'a> Layout<'a> {
         let reverse = matches!(f.direction, FlexDirection::RowReverse | FlexDirection::ColumnReverse);
 
         let mut items: Vec<FlexItem> = Vec::new();
-        for child in &node.children {
+        let entries: Vec<(&Node, Option<(Vec<&Node>, Style)>)> = match self.contents_children(node, ancestors, style, width) {
+            Some(list) => list.into_iter().map(|(n, chain, parent)| (n, Some((chain, parent)))).collect(),
+            None => node.children.iter().map(|c| (c, None)).collect(),
+        };
+        for (child, via) in entries {
+            let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
             let mut fixed_outer = None;
             let (item_flex, margin_top, margin_bottom, right_chrome, min_outer) = match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
                 Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0, 0.0),
                 None => {
-                    let s = compute(child, Some(style), self.sheet, ancestors, width);
+                    let s = compute(child, Some(parent), self.sheet, anc, width);
                     if s.display == Display::None {
                         continue;
                     }
                     if out_of_flow(&s) {
-                        self.place_out_of_flow(child, ancestors, &s, x, y);
+                        self.place_out_of_flow(child, anc, &s, x, y);
                         continue;
                     }
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
@@ -2261,7 +2277,7 @@ impl<'a> Layout<'a> {
                 }
             };
             let align = item_flex.align_self.unwrap_or(f.align);
-            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer });
+            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer, via });
         }
         if reverse {
             items.reverse();
@@ -2276,13 +2292,14 @@ impl<'a> Layout<'a> {
 
         // ----- measure along the main (horizontal) axis ----------------------
         for item in &mut items {
-            let (wide, _) = self.item_page(item.node, ancestors, style, 100_000.0, true);
-            let (narrow, _) = self.item_page(item.node, ancestors, style, 1.0, true);
+            let (anc, parent) = item.ctx(ancestors, style);
+            let (wide, _) = self.item_page(item.node, anc, parent, 100_000.0, true);
+            let (narrow, _) = self.item_page(item.node, anc, parent, 1.0, true);
             let (own, basis_chrome, explicit_min) = match item.node.text {
                 Some(_) => (None, 0.0, false),
                 // a declared width is the content box; the item's outer size adds its margins
                 None => {
-                    let s = compute(item.node, Some(style), self.sheet, ancestors, width);
+                    let s = compute(item.node, Some(parent), self.sheet, anc, width);
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
                     (s.width.map(|w| w + chrome + s.margin.horizontal()),
                      chrome + s.margin.horizontal(), s.min_width.is_some())
@@ -2377,7 +2394,7 @@ impl<'a> Layout<'a> {
             };
             let laid: Vec<(Page, f32)> = items[line.clone()]
                 .iter()
-                .map(|item| self.item_page_sized(item.node, ancestors, style, item.size))
+                .map(|item| { let (anc, parent) = item.ctx(ancestors, style); self.item_page_sized(item.node, anc, parent, item.size) })
                 .collect();
             let line_h = laid.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
             for (item, (mut page, h)) in items[line.clone()].iter().zip(laid) {
@@ -2413,10 +2430,12 @@ impl<'a> Layout<'a> {
             } else if let Some(fixed) = item.fixed_outer {
                 fixed.min(width).max(1.0)
             } else {
-                let (wide, _) = self.item_page(item.node, ancestors, style, width, true);
+                let (anc, parent) = item.ctx(ancestors, style);
+                let (wide, _) = self.item_page(item.node, anc, parent, width, true);
                 (self.extent(&wide) + item.right_chrome).min(width).max(1.0)
             };
-            let (page, h) = self.item_page(item.node, ancestors, style, item_w, false);
+            let (anc, parent) = item.ctx(ancestors, style);
+            let (page, h) = self.item_page(item.node, anc, parent, item_w, false);
             laid.push((page, h, item_w));
             aligns.push(item.align);
         }
@@ -3118,6 +3137,28 @@ mod tests {
         let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
         let y = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { baseline, text, .. } if text.contains(w) => Some(*baseline), _ => None }).unwrap();
         assert_eq!(y("start"), y("Search"), "the growing item wrapped to a second line");
+    }
+
+    #[test]
+    fn inline_buttons_draw_their_children() {
+        let fonts = fonts();
+        let doc = parse_document("<body><p>menu <button style='display:inline'><span>HTML</span></button></p></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let texts: Vec<String> = page.draws.iter().filter_map(|d| match d { Draw::Text { text, .. } => Some(text.clone()), _ => None }).collect();
+        assert!(texts.iter().any(|t| t.contains("HTML")) && !texts.iter().any(|t| t.contains('[')), "{texts:?}");
+    }
+
+    #[test]
+    fn display_contents_children_are_flex_items() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:flex;width:800px'><div>left</div><div style='display:contents'><div>mid</div><div>right</div></div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let pos = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(w) => Some((*x, *baseline)), _ => None }).unwrap();
+        let (l, m, r) = (pos("left"), pos("mid"), pos("right"));
+        assert_eq!(l.1, r.1, "contents children wrapped to new lines");
+        assert!(l.0 < m.0 && m.0 < r.0, "{l:?} {m:?} {r:?}");
     }
 
     #[test]
