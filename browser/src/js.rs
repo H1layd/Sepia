@@ -2380,6 +2380,11 @@ impl Session {
         with(|st| st.navigate.take().map(|target| (target, st.form.take())))
     }
 
+    /// Requests the page started that have not been answered and handed over yet.
+    pub fn network_busy(&self) -> bool {
+        with(|st| !st.inflight.is_empty() || !st.ready.is_empty())
+    }
+
     pub fn next_timer_delay(&mut self) -> Option<Duration> {
         let waiting = with(|st| !st.inflight.is_empty() || !st.ready.is_empty());
         let delay = self.ctx.eval(Source::from_bytes("__sepia_next_timer()")).ok().and_then(|v| v.as_number());

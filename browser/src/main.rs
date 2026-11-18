@@ -53,9 +53,11 @@ fn usage() -> &'static str {
        --verbose   log DoH resolutions to stderr\n\
        --via tor|i2p  use the local Tor SOCKS or I2P HTTP proxy\n\
        --insecure  accept self-signed certificates (Gemini capsules)\n\
-       --wait MS   keep the page's scripts running MS ms before reporting (as the window does)\n\
+       --wait MS   keep the page's scripts running MS ms before reporting (as the window does);\n\
+                   without it, until the network is quiet for 0.5 s (at most 20 s), as browsers do\n\
+                   before a screenshot; --wait 0 reports right after load\n\
        --browser ID   present as this browser for this run (firefox-mac, chrome-win, ...)\n\
-       --country CODE present as from this country for this run (US, RU, DE, ...)\n\
+       --country CODE present as from this country for this run (US, RU, DE, ...; system = the system locale)\n\
        --no-embed  accepted for compatibility; all pages use our own engine\n"
 }
 
@@ -114,7 +116,7 @@ fn parse_args() -> Result<Args, String> {
         via: None,
         insecure: false,
         click: None,
-        wait: 0,
+        wait: u64::MAX,
         browser: None,
         country: None,
     };
@@ -363,14 +365,17 @@ fn main() {
         }
     }
     if let Some(code) = &args.country {
-        match persona::country(code) {
+        // "system": the system's own locale, whatever the settings saved
+        if code.eq_ignore_ascii_case("system") {
+            chosen.country = persona::Persona::default().country;
+        } else { match persona::country(code) {
             Some(c) => chosen.country = c,
             None => {
                 let codes: Vec<&str> = persona::COUNTRIES.iter().map(|c| c.code).collect();
-                eprintln!("error: unknown --country {code:?}: one of {}", codes.join(", "));
+                eprintln!("error: unknown --country {code:?}: system or one of {}", codes.join(", "));
                 std::process::exit(2);
             }
-        }
+        } }
     }
     persona::set(chosen);
 
@@ -453,10 +458,28 @@ fn run_cli(args: Args, resolver_setting: Option<resolver::Resolver>) {
     );
     let loaded = match opened {
         Ok((mut loaded, session, _)) => {
-            if let (Some(mut session), true) = (session, args.wait > 0) {
-                let until = std::time::Instant::now() + Duration::from_millis(args.wait);
+            // no --wait: until the network has been quiet for half a second
+            // (the page's late modules and data have come in), at most 20 s
+            let auto = args.wait == u64::MAX;
+            let wait = if auto { 20_000 } else { args.wait };
+            if let (Some(mut session), true) = (session, wait > 0) {
+                let until = std::time::Instant::now() + Duration::from_millis(wait);
+                let mut quiet_since = std::time::Instant::now();
                 while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
-                    let Some(delay) = session.next_timer_delay() else { break };
+                    if auto {
+                        if session.network_busy() {
+                            quiet_since = std::time::Instant::now();
+                        } else if quiet_since.elapsed() >= Duration::from_millis(500) {
+                            break;
+                        }
+                    }
+                    let delay = match session.next_timer_delay() {
+                        Some(d) => d,
+                        // nothing scheduled: an auto wait still watches the quiet period
+                        None if auto => Duration::from_millis(50),
+                        None => break,
+                    };
+                    let delay = if auto { delay.min(Duration::from_millis(50)) } else { delay };
                     std::thread::sleep(delay.min(left));
                     if std::time::Instant::now() >= until {
                         break;
