@@ -152,10 +152,48 @@ pub enum Glyph<'f> {
     Emoji(&'f ColorEmoji, u16),
 }
 
+/// Variable faces with an optical-size axis (San Francisco): browsers set
+/// `opsz` to the font size, which changes the advances. Our rasteriser draws
+/// the default instance, but the widths (and so line breaks) follow opsz.
+static OPSZ_FACES: Mutex<Vec<(usize, &'static [u8])>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static OPSZ_CACHE: std::cell::RefCell<HashMap<(usize, char, u32), f32>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Remember `bytes` as the file of `font` if it has an `opsz` axis.
+fn register_opsz(font: &Font, bytes: &[u8]) {
+    let Ok(face) = ttf_parser::Face::parse(bytes, 0) else { return };
+    if !face.variation_axes().into_iter().any(|a| a.tag == ttf_parser::Tag::from_bytes(b"opsz")) {
+        return;
+    }
+    let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+    if let Ok(mut faces) = OPSZ_FACES.lock() {
+        faces.push((font.file_hash(), leaked));
+    }
+}
+
+fn opsz_advance(font: &Font, ch: char, size: f32) -> Option<f32> {
+    let key = font.file_hash();
+    let bytes = OPSZ_FACES.lock().ok()?.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)?;
+    let cache_key = (key, ch, size.to_bits());
+    if let Some(v) = OPSZ_CACHE.with(|c| c.borrow().get(&cache_key).copied()) {
+        return Some(v);
+    }
+    let mut face = ttf_parser::Face::parse(bytes, 0).ok()?;
+    let tag = ttf_parser::Tag::from_bytes(b"opsz");
+    let axis = face.variation_axes().into_iter().find(|a| a.tag == tag)?;
+    face.set_variation(tag, size.clamp(axis.min_value, axis.max_value));
+    let gid = face.glyph_index(ch)?;
+    let advance = face.glyph_hor_advance(gid)? as f32 * size / face.units_per_em() as f32;
+    OPSZ_CACHE.with(|c| c.borrow_mut().insert(cache_key, advance));
+    Some(advance)
+}
+
 impl<'f> Glyph<'f> {
     pub fn advance(&self, size: f32) -> f32 {
         match self {
-            Glyph::Outline(font, ch) => font.metrics(*ch, size).advance_width,
+            Glyph::Outline(font, ch) => opsz_advance(font, *ch, size).unwrap_or_else(|| font.metrics(*ch, size).advance_width),
             Glyph::Emoji(face, gid) => face.advance(*gid, size),
         }
     }
@@ -323,7 +361,11 @@ impl LocalFamily {
             .get_or_init(|| {
                 self.paths.iter().find_map(|(path, index)| {
                     let bytes = std::fs::read(path).ok()?;
-                    Font::from_bytes(bytes, FontSettings { collection_index: *index, ..FontSettings::default() }).ok()
+                    let font = Font::from_bytes(bytes.as_slice(), FontSettings { collection_index: *index, ..FontSettings::default() }).ok()?;
+                    if *index == 0 {
+                        register_opsz(&font, &bytes);
+                    }
+                    Some(font)
                 })
             })
             .as_ref()
@@ -343,7 +385,8 @@ impl Fonts {
                 let local = match name.as_str() {
                     "monospace" | "ui-monospace" | "sfmono-regular" | "sf mono" | "menlo" | "monaco" | "consolas" | "courier" | "courier new" | "liberation mono" | "dejavu sans mono" => Some(&self.mono),
                     "serif" | "ui-serif" | "georgia" | "times" | "times new roman" | "cambria" => Some(&self.serif),
-                    // the system face has one weight here: bold and italic keep the default faces
+                    // San Francisco is a variable font our rasteriser cannot draw yet
+                    // (it yields empty glyphs): opt in with SEPIA_SF=1 for work on it
                     "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" if !bold && !italic && std::env::var_os("SEPIA_SF").is_some() => Some(&self.system),
                     "sans-serif" | "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" | "arial" | "helvetica" | "helvetica neue" | "segoe ui" | "roboto" => return self.pick(bold, italic),
                     _ => None,

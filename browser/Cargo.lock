@@ -2405,6 +2405,7 @@ dependencies = [
  "png",
  "rustls",
  "softbuffer",
+ "ttf-parser",
  "webpki-roots 0.26.11",
  "winit",
  "zune-core",
