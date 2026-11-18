@@ -44,6 +44,19 @@ impl Bitmap {
         Bitmap::new(width, height, rgba)
     }
 
+    /// This image used as a mask (CSS mask-image): its alpha, filled with `rgba`.
+    pub fn tinted(&self, rgba: [u8; 4]) -> Bitmap {
+        let mut out = Vec::with_capacity(self.rgba.len());
+        for px in self.rgba.chunks_exact(4) {
+            let a = (px[3] as u32 * rgba[3] as u32 / 255) as u8;
+            // premultiplied, as every bitmap here
+            out.extend_from_slice(&[(rgba[0] as u32 * a as u32 / 255) as u8, (rgba[1] as u32 * a as u32 / 255) as u8, (rgba[2] as u32 * a as u32 / 255) as u8, a]);
+        }
+        let mut b = Bitmap::new(self.width, self.height, out);
+        b.natural = self.natural;
+        b
+    }
+
     /// The pixels inside (x, y, w, h), clamped to the bitmap; crops are
     /// remembered, since the same background is laid out again and again.
     pub fn crop(self: &Arc<Self>, x: usize, y: usize, w: usize, h: usize) -> Arc<Bitmap> {

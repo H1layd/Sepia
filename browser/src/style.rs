@@ -274,6 +274,13 @@ pub struct Style {
     pub clear: bool,
     /// mask-image: the background is only a colour for an icon shape we cannot cut out
     pub masked: bool,
+    /// mask-image: the mask's URL, size and position (drawn as the
+    /// background colour cut out by the image's alpha)
+    pub mask_image: Option<Arc<str>>,
+    pub mask_size: Option<BgSize>,
+    pub mask_pos: Option<(BgPos, BgPos)>,
+    /// the colour a mask is filled with (the box's background colour)
+    pub mask_tint: Option<Color>,
     /// background-image url (absolute when it came from a stylesheet)
     pub bg_image: Option<Arc<str>>,
     pub bg_size: BgSize,
@@ -347,6 +354,10 @@ impl Default for Style {
             clip_y: false,
             clear: false,
             masked: false,
+            mask_image: None,
+            mask_size: None,
+            mask_pos: None,
+            mask_tint: None,
             bg_image: None,
             bg_size: BgSize::Auto,
             bg_pos: (BgPos::Frac(0.0), BgPos::Frac(0.0)),
@@ -923,6 +934,10 @@ pub fn compute(
     if style.dark && !explicit_color && parent.map_or(true, |p| !p.dark) {
         style.color = crate::css::Color::rgb(255, 255, 255);
     }
+    // links keep the scheme's link colour (LinkText) unless the page sets one
+    if style.dark && !explicit_color && node.tag == "a" && node.attr("href").is_some() {
+        style.color = crate::css::Color::rgb(158, 158, 255);
+    }
     // a <table> made display:block still holds rows: CSS wraps them in an
     // anonymous table, so it lays out as one
     if node.tag == "table" && matches!(style.display, Display::Block | Display::ListItem) {
@@ -933,7 +948,14 @@ pub fn compute(
         ROOT_FONT.with(|r| r.set(style.font_size.clamp(4.0, 200.0)));
     }
     if style.masked {
-        // a solid square where an icon should be reads as a glitch; draw nothing
+        // the mask image is drawn in the box's background colour; without a
+        // usable image nothing is drawn (a solid square would read as a glitch)
+        style.mask_tint = style.background.filter(|_| style.mask_image.is_some());
+        if style.mask_tint.is_some() {
+            style.bg_image = style.mask_image.clone();
+            style.bg_size = style.mask_size.unwrap_or(BgSize::Auto);
+            style.bg_pos = style.mask_pos.unwrap_or((BgPos::Frac(0.0), BgPos::Frac(0.0)));
+        }
         style.background = None;
         style.gradient = None;
     }
@@ -1459,7 +1481,18 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             style.clip_x = matches!(x, "hidden" | "clip");
             style.clip_y = matches!(y, "hidden" | "clip");
         }
-        "mask-image" | "-webkit-mask-image" | "mask" | "-webkit-mask" => style.masked = value.contains("url("),
+        "mask-image" | "-webkit-mask-image" | "mask" | "-webkit-mask" => {
+            style.masked = value.contains("url(");
+            style.mask_image = crate::css::css_url(value).map(|u| Arc::from(u.as_str()));
+            if name.ends_with("mask") {
+                // the shorthand: `url() center / contain no-repeat`
+                if let Some((_, size)) = value.split_once('/') {
+                    style.mask_size = Some(parse_bg_size(size.split_whitespace().take(2).collect::<Vec<_>>().join(" ").as_str(), font_size));
+                }
+            }
+        }
+        "mask-size" | "-webkit-mask-size" => style.mask_size = Some(parse_bg_size(value, font_size)),
+        "mask-position" | "-webkit-mask-position" => style.mask_pos = parse_bg_pos(value, font_size),
         "clear" => style.clear = matches!(value, "both" | "left" | "right" | "inline-start" | "inline-end"),
         "overflow-x" => style.clip_x = matches!(value, "hidden" | "clip"),
         "overflow-y" => style.clip_y = matches!(value, "hidden" | "clip"),

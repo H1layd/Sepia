@@ -1138,3 +1138,89 @@ mod tests {
         assert_eq!(find_header_end(b"HTTP/1.1 200"), None);
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// WebSocket: the same path as every request (system proxy, chain, DoH, TLS)
+// ---------------------------------------------------------------------------
+
+/// A connection a WebSocket runs over: our transport, with a read timeout
+/// the socket thread uses to interleave reading and sending.
+pub struct SocketStream(Transport);
+
+impl SocketStream {
+    pub fn set_read_timeout(&self, d: Option<Duration>) {
+        let _ = match &self.0 {
+            Transport::Plain(s) => s.set_read_timeout(d),
+            Transport::Tls(s) => s.sock.set_read_timeout(d),
+        };
+    }
+}
+
+impl Read for SocketStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for SocketStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// Open `ws://` / `wss://` `url` for a page of `site` at `page`: the
+/// handshake carries the page's Origin, the site's cookies and the persona's
+/// User-Agent and language, as a browser's does.
+pub fn websocket_connect(
+    url: &Url,
+    page: &Url,
+    site: &str,
+    protocols: &[String],
+    chain: &Chain,
+    resolver: Option<&crate::resolver::Resolver>,
+    timeout: Duration,
+) -> Result<(tungstenite::WebSocket<SocketStream>, String), String> {
+    let secure = url.scheme == "wss";
+    let mut http = url.clone();
+    http.scheme = if secure { "https".into() } else { "http".into() };
+    let system;
+    let chain = match chain.hops.is_empty().then(|| system_proxy(&http)).flatten() {
+        Some(found) => {
+            system = found;
+            &system
+        }
+        None => chain,
+    };
+    let transport = connect_through(&http, chain, resolver, timeout)?;
+    use tungstenite::client::IntoClientRequest;
+    let mut request = url.to_string().into_client_request().map_err(|e| format!("bad WebSocket URL: {e}"))?;
+    {
+        let headers = request.headers_mut();
+        let mut put = |name: &'static str, value: &str| {
+            if let Ok(v) = tungstenite::http::HeaderValue::from_str(value) {
+                headers.insert(name, v);
+            }
+        };
+        put("Origin", &origin_of(page));
+        for (k, v) in request_headers(&http) {
+            if k.eq_ignore_ascii_case("user-agent") {
+                put("User-Agent", &v);
+            } else if k.eq_ignore_ascii_case("accept-language") {
+                put("Accept-Language", &v);
+            }
+        }
+        if let Some(cookie) = crate::cookies::header_for(site, &http) {
+            put("Cookie", &cookie);
+        }
+        if !protocols.is_empty() {
+            put("Sec-WebSocket-Protocol", &protocols.join(", "));
+        }
+    }
+    let (socket, response) = tungstenite::client::client(request, SocketStream(transport)).map_err(|e| format!("WebSocket handshake failed: {e}"))?;
+    let protocol = response.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    Ok((socket, protocol))
+}

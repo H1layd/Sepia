@@ -107,7 +107,17 @@ impl Canvas {
         fonts.for_each_glyph_in(family, text, bold, italic, |glyph| {
             match &glyph {
                 Glyph::Outline(font, ch) => {
-                    let (metrics, coverage) = font.rasterize(*ch, size);
+                    // variable faces (San Francisco) are drawn by swash at their optical size
+                    let (metrics, coverage): (fontdue::Metrics, std::borrow::Cow<[u8]>) = match crate::fonts::variable_glyph(font, *ch, size) {
+                        Some((xmin, ymin, width, height, data)) => (
+                            fontdue::Metrics { xmin, ymin, width, height, ..font.metrics(*ch, size) },
+                            std::borrow::Cow::Owned((*data).clone()),
+                        ),
+                        None => {
+                            let (m, c) = font.rasterize(*ch, size);
+                            (m, std::borrow::Cow::Owned(c))
+                        }
+                    };
                     let glyph_x = pen + metrics.xmin as f32;
                     // Glyphs are positioned relative to the baseline.
                     let glyph_y = baseline - (metrics.ymin as f32 + metrics.height as f32) - scroll;

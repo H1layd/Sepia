@@ -190,6 +190,41 @@ fn opsz_advance(font: &Font, ch: char, size: f32) -> Option<f32> {
     Some(advance)
 }
 
+thread_local! {
+    static SWASH: std::cell::RefCell<swash::scale::ScaleContext> = std::cell::RefCell::new(swash::scale::ScaleContext::new());
+    static SWASH_CACHE: std::cell::RefCell<HashMap<(usize, char, u32), Option<(i32, i32, usize, usize, std::rc::Rc<Vec<u8>>)>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// A glyph of a variable face (one fontdue cannot draw), rendered by swash at
+/// opsz = size: (xmin, ymin, width, height, coverage) in fontdue's convention
+/// (ymin: the bitmap's bottom relative to the baseline, up positive).
+pub fn variable_glyph(font: &Font, ch: char, size: f32) -> Option<(i32, i32, usize, usize, std::rc::Rc<Vec<u8>>)> {
+    let key = font.file_hash();
+    let bytes = OPSZ_FACES.lock().ok()?.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)?;
+    let cache_key = (key, ch, size.to_bits());
+    if let Some(hit) = SWASH_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+        return hit;
+    }
+    let rendered = (|| {
+        let face = swash::FontRef::from_index(bytes, 0)?;
+        let gid = face.charmap().map(ch);
+        if gid == 0 {
+            return None;
+        }
+        SWASH.with(|ctx| {
+            let mut ctx = ctx.borrow_mut();
+            let mut scaler = ctx.builder(face).size(size).variations(&[("opsz", size)]).hint(false).build();
+            let image = swash::scale::Render::new(&[swash::scale::Source::Outline])
+                .format(swash::zeno::Format::Alpha)
+                .render(&mut scaler, gid)?;
+            let p = image.placement;
+            Some((p.left, p.top - p.height as i32, p.width as usize, p.height as usize, std::rc::Rc::new(image.data)))
+        })
+    })();
+    SWASH_CACHE.with(|c| c.borrow_mut().insert(cache_key, rendered.clone()));
+    rendered
+}
+
 impl<'f> Glyph<'f> {
     pub fn advance(&self, size: f32) -> f32 {
         match self {
@@ -385,8 +420,9 @@ impl Fonts {
                 let local = match name.as_str() {
                     "monospace" | "ui-monospace" | "sfmono-regular" | "sf mono" | "menlo" | "monaco" | "consolas" | "courier" | "courier new" | "liberation mono" | "dejavu sans mono" => Some(&self.mono),
                     "serif" | "ui-serif" | "georgia" | "times" | "times new roman" | "cambria" => Some(&self.serif),
-                    // San Francisco is a variable font our rasteriser cannot draw yet
-                    // (it yields empty glyphs): opt in with SEPIA_SF=1 for work on it
+                    // San Francisco: a variable face, drawn by swash at its optical size.
+                    // Off by default until its vertical metrics and macOS-like stroke
+                    // weight match Chrome (example.com: 66 with it, 73 without); SEPIA_SF=1
                     "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" if !bold && !italic && std::env::var_os("SEPIA_SF").is_some() => Some(&self.system),
                     "sans-serif" | "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" | "arial" | "helvetica" | "helvetica neue" | "segoe ui" | "roboto" => return self.pick(bold, italic),
                     _ => None,

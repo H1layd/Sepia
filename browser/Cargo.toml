@@ -9,6 +9,8 @@ license = "MIT"
 [dependencies]
 fontdue = "0.9"
 ttf-parser = "0.25"
+swash = "0.2"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 png = "0.17"
 rustls = "0.23"
 webpki-roots = "0.26"

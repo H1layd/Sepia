@@ -888,7 +888,7 @@ impl Stylesheet {
     pub fn absolutize_urls(&mut self, base: &crate::url::Url) {
         for rule in &mut self.rules {
             for d in &mut rule.declarations {
-                if d.name.starts_with("background") {
+                if d.name.starts_with("background") || d.name.starts_with("mask") || d.name.starts_with("-webkit-mask") {
                     if let Some(found) = css_url(&d.value) {
                         if !found.starts_with("data:") {
                             if let Some(abs) = base.resolve(&found) {
@@ -908,18 +908,15 @@ impl Stylesheet {
             .rules
             .iter()
             .filter(|r| r.media.matches_viewport(self.viewport_width, self.viewport_height))
-            .filter_map(|r| r.declarations.iter().filter(|d| d.name == "background" || d.name == "background-image").find_map(|d| css_url(&d.value)).map(|u| (r, u)))
+            .flat_map(|r| r.declarations.iter().filter(|d| is_image_property(&d.name)).filter_map(|d| css_url(&d.value)).map(move |u| (r, u)))
             .collect();
         let mut out: Vec<String> = Vec::new();
         fn walk<'n>(node: &'n crate::dom::Node, ancestors: &mut Vec<&'n crate::dom::Node>, rules: &[(&Rule, String)], out: &mut Vec<String>) {
             if matches!(node.tag.as_str(), "template" | "noscript") { return; }
-            if out.len() >= 48 {
-                return;
-            }
             if node.text.is_none() && !matches!(node.tag.as_str(), "#document" | "head" | "script" | "style") {
                 if let Some(inline) = node.attr("style").filter(|s| s.contains("url(")) {
                     for d in parse_declarations(inline) {
-                        if d.name == "background" || d.name == "background-image" {
+                        if is_image_property(&d.name) {
                             if let Some(u) = css_url(&d.value) {
                                 if !out.contains(&u) {
                                     out.push(u);
@@ -1143,6 +1140,11 @@ impl Stylesheet {
 }
 
 /// The first `url(...)` in a value, quotes taken off.
+/// Properties whose url() is an image the page draws: backgrounds and masks.
+fn is_image_property(name: &str) -> bool {
+    matches!(name, "background" | "background-image" | "mask" | "mask-image" | "-webkit-mask" | "-webkit-mask-image")
+}
+
 pub fn css_url(value: &str) -> Option<String> {
     let at = value.to_ascii_lowercase().find("url(")?;
     let inner = &value[at + 4..];

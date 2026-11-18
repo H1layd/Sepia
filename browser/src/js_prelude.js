@@ -809,12 +809,50 @@
     reload() { __page_navigate(this.href); },
     toString() { return this.href; },
   };
+  // same-document history: pushState entries of this page, walked by
+  // back/forward/go with popstate (a step past them leaves the page)
+  const historyEntries = [{ url: null, state: null }];
+  let historyIndex = 0;
+  const cloneState = s => { try { return s === undefined ? null : G.structuredClone ? G.structuredClone(s) : s; } catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); } };
   const history = {
-    length: 1, state: null, scrollRestoration: 'auto',
-    pushState(state, _, url) { this.state = state ?? null; if (url != null) __page_set_url(String(url)); },
-    replaceState(state, _, url) { this.state = state ?? null; if (url != null) __page_set_url(String(url)); },
-    back() {}, forward() {}, go() {},
+    scrollRestoration: 'auto',
+    get length() { return historyEntries.length; },
+    get state() { return historyEntries[historyIndex].state; },
+    pushState(state, _, url) {
+      const entry = { url: url == null ? location.href : new URL(String(url), location.href).href, state: cloneState(state) };
+      if (historyEntries[0].url === null) historyEntries[0].url = location.href;
+      historyEntries.splice(historyIndex + 1, Infinity, entry);
+      historyIndex = historyEntries.length - 1;
+      if (url != null) __page_set_url(entry.url);
+    },
+    replaceState(state, _, url) {
+      const entry = { url: url == null ? location.href : new URL(String(url), location.href).href, state: cloneState(state) };
+      historyEntries[historyIndex] = entry;
+      if (url != null) __page_set_url(entry.url);
+    },
+    go(delta = 0) {
+      delta = Number(delta) || 0;
+      if (delta === 0) { location.reload(); return; }
+      const target = historyIndex + delta;
+      if (target < 0 || target >= historyEntries.length) { if (target < 0) __sepia_history_leave(delta); return; }
+      setTimeout(() => {
+        historyIndex = target;
+        const entry = historyEntries[target];
+        if (entry.url) __page_set_url(entry.url);
+        const e = new Event('popstate'); e.state = entry.state;
+        G.dispatchEvent(e);
+      }, 0);
+    },
+    back() { this.go(-1); },
+    forward() { this.go(1); },
   };
+  // the window's back button: true when the page handled it within itself
+  G.__sepia_history_back = () => { if (historyIndex > 0) { history.back(); return true; } return false; };
+  G.__sepia_history_forward = () => { if (historyIndex < historyEntries.length - 1) { history.forward(); return true; } return false; };
+  // (index << 16 | length) of the page's own history, for the window
+  G.__sepia_history_position = () => historyIndex * 65536 + historyEntries.length;
+  // leaving the page backwards is the window's job
+  G.__sepia_history_leave = () => {};
 
   class Storage {
     constructor() { Object.defineProperty(this, '__m', { value: new Map() }); }
@@ -1038,11 +1076,79 @@
   const awaiting = new Map();
   G.__sepia_await = (id, cb) => { awaiting.set(id, cb); };
   G.__sepia_net = () => {
-    if (!awaiting.size) return 0;
+    const socketEvents = sockets.size ? deliverSockets() : 0;
+    if (!awaiting.size) return socketEvents;
     const rows = __fetch_poll();
     for (const row of rows) { const cb = awaiting.get(row[0]); awaiting.delete(row[0]); if (cb) cb(row); }
-    return rows.length;
+    return rows.length + socketEvents;
   };
+  // ----- WebSocket: a thread per socket in the engine, events here ---------
+  const sockets = new Map();
+  function deliverSockets() {
+    const rows = __ws_poll();
+    for (const row of rows) {
+      const ws = sockets.get(row[0]);
+      if (!ws) continue;
+      ws.__event(row);
+    }
+    return rows.length;
+  }
+  class WebSocket extends EventTarget {
+    constructor(url, protocols) {
+      super();
+      let href;
+      try { href = new URL(String(url), location.href); } catch (_) { throw new DOMException(`Failed to construct 'WebSocket': The URL '${url}' is invalid.`, 'SyntaxError'); }
+      if (href.protocol === 'http:') href.protocol = 'ws:';
+      if (href.protocol === 'https:') href.protocol = 'wss:';
+      if (href.protocol !== 'ws:' && href.protocol !== 'wss:') throw new DOMException(`Failed to construct 'WebSocket': The URL's scheme must be either 'ws' or 'wss'.`, 'SyntaxError');
+      if (href.hash) throw new DOMException("Failed to construct 'WebSocket': The URL contains a fragment identifier.", 'SyntaxError');
+      const list = protocols === undefined ? [] : Array.isArray(protocols) ? protocols.map(String) : [String(protocols)];
+      Object.assign(this, { url: href.href, readyState: 0, protocol: '', extensions: '', bufferedAmount: 0, binaryType: 'blob', onopen: null, onmessage: null, onerror: null, onclose: null });
+      this.__id = __ws_open(this.url, list.join(','));
+      if (this.__id < 0) {
+        setTimeout(() => { this.__event([0, 'error', 'network is off']); this.__event([0, 'close', 1006, '']); }, 0);
+      } else {
+        sockets.set(this.__id, this);
+      }
+    }
+    // dispatchEvent runs the on<type> handler too
+    __emit(e) { this.dispatchEvent(e); }
+    __event(row) {
+      const kind = row[1];
+      if (kind === 'open') { this.readyState = 1; this.protocol = row[2] || ''; this.__emit(new Event('open')); }
+      else if (kind === 'text' || kind === 'binary') {
+        if (this.readyState !== 1) return;
+        let data = row[2];
+        if (kind === 'binary') { const bytes = new Uint8Array(data); data = this.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]); }
+        const e = new MessageEvent('message', { data, origin: new URL(this.url).origin });
+        this.__emit(e);
+      }
+      else if (kind === 'error') { this.__emit(new Event('error')); }
+      else if (kind === 'close') {
+        this.readyState = 3; sockets.delete(this.__id);
+        const e = new Event('close'); e.code = row[2]; e.reason = row[3] || ''; e.wasClean = row[2] === 1000;
+        this.__emit(e);
+      }
+    }
+    send(data) {
+      if (this.readyState === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+      if (this.readyState !== 1) return;
+      if (typeof data === 'string') return __ws_send(this.__id, false, data);
+      let bytes;
+      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+      else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else if (data && data.__s !== undefined) bytes = new TextEncoder().encode(data.__s);
+      else return __ws_send(this.__id, false, String(data));
+      __ws_send(this.__id, true, Array.from(bytes));
+    }
+    close(code = 1000, reason = '') {
+      if (this.readyState >= 2) return;
+      this.readyState = 2;
+      __ws_close(this.__id, Number(code), String(reason));
+    }
+  }
+  for (const [k, v] of Object.entries({ CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 })) { WebSocket[k] = v; WebSocket.prototype[k] = v; }
+  G.WebSocket = WebSocket;
   // start a request without blocking; done(row) gets [id, status, text, url, headers] or [id, null, error]
   function sendLater(url, method, body, headers, done, noCors) {
     const list = headers ? [...new Headers(headers)].filter(([k]) => k !== 'content-type') : [];
@@ -1675,7 +1781,6 @@
         if (now === l.__was) continue;
         l.__was = now;
         const e = new Event('change'); e.matches = now; e.media = l.media;
-        if (typeof l.onchange === 'function') { try { l.onchange(e); } catch (err) { log('matchMedia', err); } }
         l.dispatchEvent(e);
       }
     });

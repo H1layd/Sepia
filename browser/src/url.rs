@@ -18,7 +18,7 @@ impl Url {
         let (scheme, rest) = match input.split_once("://") {
             Some((s, r)) => {
                 let scheme = s.to_lowercase();
-                if !matches!(scheme.as_str(), "http" | "https" | "gemini" | "gopher") {
+                if !matches!(scheme.as_str(), "http" | "https" | "gemini" | "gopher" | "ws" | "wss") {
                     return None;
                 }
                 (scheme, r)
@@ -132,7 +132,7 @@ impl Url {
 
 pub fn scheme_default_port(scheme: &str) -> u16 {
     match scheme {
-        "https" => 443,
+        "https" | "wss" => 443,
         "gemini" => 1965,
         "gopher" => 70,
         _ => 80,

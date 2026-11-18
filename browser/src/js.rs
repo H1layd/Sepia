@@ -440,6 +440,93 @@ struct State {
     /// answers ready without a trip (from the page's cache), waiting to be handed over
     ready: Vec<(u32, Result<crate::net::Response, String>)>,
     next_request: u32,
+    /// open WebSockets: what the page sends, and what arrives for it
+    sockets: Vec<Socket>,
+}
+
+/// One WebSocket: its id, the way to its thread, and its events.
+struct Socket {
+    id: u32,
+    out: std::sync::mpsc::Sender<SocketOut>,
+    events: std::sync::mpsc::Receiver<SocketEvent>,
+    closed: bool,
+}
+
+enum SocketOut {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16, String),
+}
+
+enum SocketEvent {
+    Open(String),
+    Text(String),
+    Binary(Vec<u8>),
+    Error(String),
+    Close(u16, String),
+}
+
+/// The socket's thread: connect through the page's path, then pass messages
+/// both ways until either side closes.
+fn socket_thread(url: Url, page: Url, protocols: Vec<String>, net: (Chain, Option<Resolver>, Duration), out: std::sync::mpsc::Receiver<SocketOut>, events: std::sync::mpsc::Sender<SocketEvent>) {
+    use tungstenite::{protocol::frame::coding::CloseCode, protocol::CloseFrame, Message};
+    let site = crate::cookies::site_of(&page.host);
+    let (mut ws, protocol) = match crate::net::websocket_connect(&url, &page, &site, &protocols, &net.0, net.1.as_ref(), net.2) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = events.send(SocketEvent::Error(e));
+            let _ = events.send(SocketEvent::Close(1006, String::new()));
+            return;
+        }
+    };
+    let _ = events.send(SocketEvent::Open(protocol));
+    ws.get_ref().set_read_timeout(Some(Duration::from_millis(20)));
+    let mut close_seen: Option<(u16, String)> = None;
+    // we asked to close: what follows is the end of the closing handshake
+    let mut closing = false;
+    loop {
+        loop {
+            match out.try_recv() {
+                Ok(SocketOut::Text(t)) => { let _ = ws.send(Message::Text(t.into())); }
+                Ok(SocketOut::Binary(b)) => { let _ = ws.send(Message::Binary(b.into())); }
+                Ok(SocketOut::Close(code, reason)) => {
+                    closing = true;
+                    let _ = ws.close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // the page is gone: close quietly
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let _ = ws.close(None);
+                    let _ = ws.flush();
+                    return;
+                }
+            }
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => { let _ = events.send(SocketEvent::Text(t.to_string())); }
+            Ok(Message::Binary(b)) => { let _ = events.send(SocketEvent::Binary(b.to_vec())); }
+            Ok(Message::Close(frame)) => {
+                close_seen = Some(frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1005, String::new())));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                let _ = ws.flush();
+            }
+            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
+                let (code, reason) = close_seen.take().unwrap_or((1000, String::new()));
+                let _ = events.send(SocketEvent::Close(code, reason));
+                return;
+            }
+            Err(e) => {
+                if !closing && close_seen.is_none() {
+                    let _ = events.send(SocketEvent::Error(e.to_string()));
+                }
+                let (code, reason) = close_seen.take().unwrap_or(if closing { (1000, String::new()) } else { (1006, String::new()) });
+                let _ = events.send(SocketEvent::Close(code, reason));
+                return;
+            }
+        }
+    }
 }
 
 /// One request in flight: its id, whether its answer may be kept, and where it arrives.
@@ -1093,6 +1180,83 @@ fn register(ctx: &mut Context) {
         }
         Ok(out.into())
     });
+    // WebSocket: open (returns an id), send, close, and the events that arrived
+    native!(ctx, "__ws_open", 2, |_, a, ctx| {
+        let target = arg_str(a, 0, ctx)?;
+        let protocols: Vec<String> = arg_str(a, 1, ctx)?.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+        let Some(url) = Url::parse(&target).filter(|u| matches!(u.scheme.as_str(), "ws" | "wss")) else {
+            return Err(boa_engine::JsNativeError::syntax().with_message(format!("Failed to construct 'WebSocket': The URL '{target}' is invalid.")).into());
+        };
+        let started = with(|st| {
+            let page = st.url.clone()?;
+            let net = st.net.as_ref().map(|n| (n.chain.clone(), n.resolver.clone(), n.timeout))?;
+            st.next_request += 1;
+            let id = st.next_request;
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || socket_thread(url, page, protocols, net, out_rx, ev_tx));
+            st.sockets.push(Socket { id, out: out_tx, events: ev_rx, closed: false });
+            Some(id)
+        });
+        Ok(started.map(|id| JsValue::from(id)).unwrap_or(JsValue::from(-1)))
+    });
+    native!(ctx, "__ws_send", 3, |_, a, ctx| {
+        let id = a.first().and_then(|v| v.as_number()).unwrap_or(-1.0) as u32;
+        let binary = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+        let message = if binary {
+            let bytes = a.get(2).and_then(|v| v.as_object()).map(|o| {
+                let len = o.get(js_string!("length"), ctx).ok().and_then(|l| l.as_number()).unwrap_or(0.0) as usize;
+                (0..len).map(|i| o.get(i, ctx).ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u8).collect::<Vec<u8>>()
+            }).unwrap_or_default();
+            SocketOut::Binary(bytes)
+        } else {
+            SocketOut::Text(arg_str(a, 2, ctx)?)
+        };
+        with(|st| {
+            if let Some(s) = st.sockets.iter().find(|s| s.id == id) {
+                let _ = s.out.send(message);
+            }
+        });
+        Ok(JsValue::undefined())
+    });
+    native!(ctx, "__ws_close", 3, |_, a, ctx| {
+        let id = a.first().and_then(|v| v.as_number()).unwrap_or(-1.0) as u32;
+        let code = a.get(1).and_then(|v| v.as_number()).unwrap_or(1000.0) as u16;
+        let reason = arg_str(a, 2, ctx).unwrap_or_default();
+        with(|st| {
+            if let Some(s) = st.sockets.iter().find(|s| s.id == id) {
+                let _ = s.out.send(SocketOut::Close(code, reason));
+            }
+        });
+        Ok(JsValue::undefined())
+    });
+    native!(ctx, "__ws_poll", 0, |_, _, ctx| {
+        let mut rows: Vec<JsValue> = Vec::new();
+        let events: Vec<(u32, SocketEvent)> = with(|st| {
+            let mut out = Vec::new();
+            for s in &mut st.sockets {
+                while let Ok(e) = s.events.try_recv() {
+                    if matches!(e, SocketEvent::Close(..)) {
+                        s.closed = true;
+                    }
+                    out.push((s.id, e));
+                }
+            }
+            st.sockets.retain(|s| !s.closed);
+            out
+        });
+        for (id, e) in events {
+            let row: Vec<JsValue> = match e {
+                SocketEvent::Open(p) => vec![id.into(), js_string!("open").into(), JsString::from(p.as_str()).into()],
+                SocketEvent::Text(t) => vec![id.into(), js_string!("text").into(), JsString::from(t.as_str()).into()],
+                SocketEvent::Binary(b) => vec![id.into(), js_string!("binary").into(), JsArray::from_iter(b.into_iter().map(|x| JsValue::from(x as u32)), ctx).into()],
+                SocketEvent::Error(m) => vec![id.into(), js_string!("error").into(), JsString::from(m.as_str()).into()],
+                SocketEvent::Close(code, reason) => vec![id.into(), js_string!("close").into(), JsValue::from(code as u32), JsString::from(reason.as_str()).into()],
+            };
+            rows.push(JsArray::from_iter(row, ctx).into());
+        }
+        Ok(JsArray::from_iter(rows, ctx).into())
+    });
     native!(ctx, "__media_matches", 3, |_, a, ctx| {
         let query = arg_str(a, 0, ctx)?;
         let width = a.get(1).and_then(|v| v.as_number()).unwrap_or(1024.0) as f32;
@@ -1446,6 +1610,10 @@ pub enum PageEvent {
     /// The fragment changed (a same-page `#link`).
     #[allow(dead_code)]
     Hash(String),
+    /// The window's back (-1) or forward (1) inside the page's own history
+    /// (when `Outcome::history` said it has such a step).
+    #[allow(dead_code)]
+    History(i32),
 }
 
 /// What a page event led to.
@@ -1462,6 +1630,9 @@ pub struct Outcome {
     pub focus: Option<(usize, String)>,
     /// `location.hash` changed: scroll to that anchor
     pub jump: Option<String>,
+    /// The page's own history (pushState entries): (current index, length),
+    /// so the window's back and forward can step inside the page first
+    pub history: Option<(usize, usize)>,
 }
 
 /// One live page: DOM, scripts, styles, images.
@@ -1471,7 +1642,11 @@ pub struct Session {
     sheet: Stylesheet,
     /// the stylesheet with the CSS scripts added, and what it was built from
     live_sheet: RefCell<Option<(u64, Stylesheet)>>,
-    images: ImageMap,
+    /// the page's images; backgrounds and masks of CSS that scripts add are
+    /// fetched into it as that CSS appears
+    images: RefCell<ImageMap>,
+    /// image URLs already asked for (each once, answered or not)
+    asked_images: RefCell<std::collections::HashSet<String>>,
     width: f32,
 }
 
@@ -2174,7 +2349,7 @@ impl Session {
         if std::env::var_os("SEPIA_VERBOSE").is_some() {
             eprintln!("page timing: load events {} ms", loaded_started.elapsed().as_millis());
         }
-        let mut session = Session { ctx, hooks, sheet, live_sheet: RefCell::new(None), images, width };
+        let mut session = Session { ctx, hooks, sheet, live_sheet: RefCell::new(None), images: RefCell::new(images), asked_images: RefCell::new(Default::default()), width };
         let settle_started = std::time::Instant::now();
         session.settle();
         if std::env::var_os("SEPIA_VERBOSE").is_some() {
@@ -2272,7 +2447,7 @@ impl Session {
         let tree = self.tree();
         let added = self.added_css();
         if added.is_empty() {
-            let page = Layout::new(fonts, &self.sheet, self.width).with_images(&self.images).build(&tree);
+            let page = Layout::new(fonts, &self.sheet, self.width).with_images(&self.images.borrow()).build(&tree);
             remember_geometry(&page);
             return page;
         }
@@ -2291,10 +2466,11 @@ impl Session {
                 extra.absolutize_urls(&base);
             }
             sheet.append(extra);
+            self.fetch_new_images(&sheet, &tree);
             *cache = Some((key, sheet));
         }
         let sheet = &cache.as_ref().expect("built above").1;
-        let page = Layout::new(fonts, sheet, self.width).with_images(&self.images).build(&tree);
+        let page = Layout::new(fonts, sheet, self.width).with_images(&self.images.borrow()).build(&tree);
         remember_geometry(&page);
         page
     }
@@ -2362,8 +2538,51 @@ fn added_css() -> String {
 impl Session {
     /// Images that arrived after the page was first shown.
     pub fn set_images(&mut self, images: ImageMap) {
-        self.images = images;
-        set_geometry_inputs(&self.sheet, &self.images, self.width);
+        let mut mine = self.images.borrow_mut();
+        // keep what was fetched for script-added CSS
+        let extra: Vec<(String, std::sync::Arc<crate::images::Bitmap>)> = mine.iter().filter(|(k, _)| !images.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        *mine = images;
+        mine.extend(extra);
+        set_geometry_inputs(&self.sheet, &mine, self.width);
+    }
+
+    /// Backgrounds and masks the CSS scripts added uses, not fetched yet:
+    /// through the page's path, in parallel, each URL once.
+    fn fetch_new_images(&self, sheet: &Stylesheet, tree: &Node) {
+        let wanted: Vec<String> = {
+            let have = self.images.borrow();
+            let asked = self.asked_images.borrow();
+            sheet.background_urls(tree).into_iter().filter(|u| !have.contains_key(u) && !asked.contains(u)).collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        self.asked_images.borrow_mut().extend(wanted.iter().cloned());
+        let mut got: Vec<(String, crate::images::Bitmap)> = Vec::new();
+        let mut remote: Vec<(String, Url)> = Vec::new();
+        for u in wanted {
+            if u.starts_with("data:") {
+                if let Some(b) = crate::images::decode_data_uri(&u) {
+                    got.push((u, b));
+                }
+            } else if let Some(url) = Url::parse(&u) {
+                remote.push((u, url));
+            }
+        }
+        if !remote.is_empty() {
+            let site = with(|st| st.url.as_ref().map(|u| crate::cookies::site_of(&u.host))).unwrap_or_default();
+            let urls: Vec<Url> = remote.iter().map(|(_, u)| u.clone()).collect();
+            let answers = with(|st| st.get_many(&urls, &site));
+            for ((key, _), answer) in remote.into_iter().zip(answers) {
+                if let Some(b) = answer.filter(|r| r.status < 400).and_then(|r| crate::images::decode(&r.body)) {
+                    got.push((key, b));
+                }
+            }
+        }
+        let mut images = self.images.borrow_mut();
+        for (k, b) in got {
+            images.insert(k, std::sync::Arc::new(b));
+        }
     }
 
     pub fn title(&self) -> Option<String> {
@@ -2380,13 +2599,24 @@ impl Session {
         with(|st| st.navigate.take().map(|target| (target, st.form.take())))
     }
 
+    /// The window's back (`-1`) / forward (`1`) button: true if the page took
+    /// it as a step in its own history (pushState entries, popstate).
+    pub fn history_step(&mut self, delta: i32) -> bool {
+        let call = if delta < 0 { "__sepia_history_back()" } else { "__sepia_history_forward()" };
+        let handled = self.ctx.eval(Source::from_bytes(call)).ok().map(|v| v.to_boolean()).unwrap_or(false);
+        if handled {
+            self.settle_for(Duration::from_millis(100));
+        }
+        handled
+    }
+
     /// Requests the page started that have not been answered and handed over yet.
     pub fn network_busy(&self) -> bool {
         with(|st| !st.inflight.is_empty() || !st.ready.is_empty())
     }
 
     pub fn next_timer_delay(&mut self) -> Option<Duration> {
-        let waiting = with(|st| !st.inflight.is_empty() || !st.ready.is_empty());
+        let waiting = with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.sockets.is_empty());
         let delay = self.ctx.eval(Source::from_bytes("__sepia_next_timer()")).ok().and_then(|v| v.as_number());
         let timer = delay.filter(|d| d.is_finite() && *d >= 0.0).map(|d| Duration::from_secs_f64((d / 1000.0).clamp(0.001, 86_400.0)));
         // requests in flight: look again soon (their answers are events too)
@@ -2415,13 +2645,14 @@ impl Session {
             PageEvent::Input { node, value } => format!("__sepia_input({node}, {})", json_string(value)),
             PageEvent::Key { node, key } => format!("__sepia_key({node}, {})", json_string(key)),
             PageEvent::Hash(hash) => format!("__sepia_hash({})", json_string(hash)),
+            PageEvent::History(delta) => format!("history.go({delta})"),
             PageEvent::Resize { width, height } => {
                 let width = if width.is_finite() { width.max(1.0) } else { self.width };
                 let height = if height.is_finite() { height.max(1.0) } else { 800.0 };
                 self.width = width;
                 self.sheet.viewport_width = width;
                 self.sheet.viewport_height = height;
-                set_geometry_inputs(&self.sheet, &self.images, self.width);
+                set_geometry_inputs(&self.sheet, &self.images.borrow(), self.width);
                 with(|st| st.dirty = true);
                 format!("__sepia_resize({width}, {height})")
             }
@@ -2437,7 +2668,10 @@ impl Session {
             });
             (st.dirty, st.navigate.take(), st.form.take(), st.jump.take(), focus, st.title.clone())
         });
-        Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, form, jump, focus }
+        let history = self.ctx.eval(Source::from_bytes("__sepia_history_position()")).ok()
+            .and_then(|v| v.as_number()).filter(|n| *n >= 0.0)
+            .map(|n| ((n as u64 >> 16) as usize, (n as u64 & 0xffff) as usize));
+        Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, form, jump, focus, history }
     }
 }
 
@@ -2976,6 +3210,23 @@ mod tests {
             Ok(_) => println!("SCRIPT OK"),
             Err(e) => println!("SCRIPT ERR: {e}"),
         }
+    }
+
+    #[test]
+    fn history_entries_walk_back_with_popstate() {
+        let mut s = run(
+            "<p id=o></p>",
+            "const seen = [];
+             addEventListener('popstate', e => { seen.push(JSON.stringify(e.state) + '@' + location.pathname); document.getElementById('o').textContent = seen.join(' '); });
+             history.pushState({ n: 1 }, '', '/one');
+             history.pushState({ n: 2 }, '', '/two');
+             document.getElementById('o').textContent = history.length + ' ' + location.pathname;",
+        );
+        assert!(text(&s).ends_with("3 /two"), "{} {:?}", text(&s), s.log());
+        assert!(s.history_step(-1));
+        assert!(text(&s).ends_with("{\"n\":1}@/one"), "{} {:?}", text(&s), s.log());
+        assert!(s.history_step(-1));
+        assert!(!s.history_step(-1), "past the first entry the window leaves the page");
     }
 
     #[test]

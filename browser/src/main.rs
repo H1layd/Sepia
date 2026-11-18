@@ -215,7 +215,7 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!("  {:<16} {}", "", "and XMLHttpRequest reach any site; cross-origin answers are read only if the server");
     println!("  {:<16} {}", "", "allows it (CORS: Access-Control-Allow-Origin; no preflight), no-cors gets an opaque");
     println!("  {:<16} {}", "", "answer; Referer and Origin as in a browser; script headers except forbidden ones");
-    println!("  {:<16} {}", "", "(User-Agent, Cookie, Origin, Sec-*…); sendBeacon posts; no WebSocket or workers;");
+    println!("  {:<16} {}", "", "(User-Agent, Cookie, Origin, Sec-*…); sendBeacon posts; WebSocket (ws/wss) through the same path with Origin, cookies and persona headers; no workers;");
     println!("  {:<16} {}", "", "cookies and storage in memory; navigator, language, Intl locale and clock as");
     println!("  {:<16} {}", "", "chosen in the settings; screen 1280x800; page viewport follows window size");
     println!("  {:<16} {}", "", "scripts and stylesheets a page inserts are fetched like its own (any origin),");

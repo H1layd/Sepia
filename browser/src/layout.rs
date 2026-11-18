@@ -572,6 +572,11 @@ impl<'a> Layout<'a> {
         };
         // a background image goes over the colour, under the content; placed at the end
         let bg_bitmap = if paints_background { style.bg_image.as_deref().and_then(|src| self.images.and_then(|m| m.get(src))).cloned() } else { None };
+        // a mask: the image's alpha in the background colour
+        let bg_bitmap = match (bg_bitmap, style.mask_tint) {
+            (Some(b), Some(c)) => Some(tinted_mask(&b, c)),
+            (b, _) => b,
+        };
         let bg_index = bg_bitmap.as_ref().map(|_| {
             self.page.draws.push(blank_draw());
             self.page.draws.len() - 1
@@ -1476,6 +1481,18 @@ fn percent_decode(s: &str) -> String {
 /// A draw that paints nothing (holds a place to fill in later).
 fn blank_draw() -> Draw {
     Draw::Rect { rect: Rect { x: 0.0, y: -1e9, w: 0.0, h: 0.0 }, color: Color { r: 0, g: 0, b: 0, a: 0 } }
+}
+
+thread_local! {
+    static TINTED: std::cell::RefCell<std::collections::HashMap<(usize, [u8; 4]), Arc<crate::images::Bitmap>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A mask image filled with `color`, made once per (image, colour).
+fn tinted_mask(bitmap: &Arc<crate::images::Bitmap>, color: Color) -> Arc<crate::images::Bitmap> {
+    let key = (Arc::as_ptr(bitmap) as usize, [color.r, color.g, color.b, color.a]);
+    TINTED.with(|t| {
+        t.borrow_mut().entry(key).or_insert_with(|| Arc::new(bitmap.tinted(key.1))).clone()
+    })
 }
 
 /// background-image: sized (auto/cover/contain/lengths), positioned, and cut
