@@ -298,6 +298,9 @@ pub struct Style {
     pub grid_span: GridSpan,
     pub grid_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
+    /// grid-column / grid-row as written (start, end): lines, names, spans
+    pub grid_column_lines: Option<(String, String)>,
+    pub grid_row_lines: Option<(String, String)>,
     /// custom properties in scope (inherited), last definition wins
     pub vars: Arc<crate::css::Vars>,
     /// font-family asks for a monospace face (inherited)
@@ -372,6 +375,8 @@ impl Default for Style {
             grid_span: GridSpan::Auto,
             grid_areas: None,
             grid_area: None,
+            grid_column_lines: None,
+            grid_row_lines: None,
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
             width_relative: false,
@@ -631,7 +636,8 @@ pub fn parse_length(value: &str, font_size: f32, percent_base: f32) -> Option<f3
             if kind == 0 {
                 return eval_calc(inner, font_size, percent_base);
             }
-            let args: Vec<f32> = split_args(inner).iter().map(|a| parse_length(a, font_size, percent_base)).collect::<Option<Vec<f32>>>()?;
+            // each argument is a calc sum (`clamp(3rem, 2rem + 3vw, 5rem)`)
+            let args: Vec<f32> = split_args(inner).iter().map(|a| parse_length(a, font_size, percent_base).or_else(|| eval_calc(a, font_size, percent_base))).collect::<Option<Vec<f32>>>()?;
             return match kind {
                 1 => args.into_iter().reduce(f32::min),
                 2 => args.into_iter().reduce(f32::max),
@@ -1611,7 +1617,21 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.grid_area = Some(value.to_string());
             }
         }
+        "grid-row" | "grid-row-start" | "grid-row-end" | "grid-column-start" | "grid-column-end" => {
+            let slot = if name.starts_with("grid-row") { &mut style.grid_row_lines } else { &mut style.grid_column_lines };
+            let pair = slot.get_or_insert_with(|| ("auto".to_string(), "auto".to_string()));
+            if name.ends_with("-start") {
+                pair.0 = value.trim().to_string();
+            } else if name.ends_with("-end") {
+                pair.1 = value.trim().to_string();
+            } else {
+                let (a, b) = value.split_once('/').unwrap_or((value, "auto"));
+                *pair = (a.trim().to_string(), b.trim().to_string());
+            }
+        }
         "grid-column" => {
+            let (a, b) = value.split_once('/').unwrap_or((value, "auto"));
+            style.grid_column_lines = (value.trim() != "auto").then(|| (a.trim().to_string(), b.trim().to_string()));
             let v = value.replace(' ', "");
             style.grid_span = if v == "1/-1" || v.ends_with("/-1") && v.starts_with('1') {
                 GridSpan::Full
@@ -1910,6 +1930,14 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn math_function_arguments_are_sums() {
+        let v = parse_length("clamp(3rem, 1rem + 10px, 5rem)", 16.0, 100.0).unwrap();
+        assert_eq!(v, 48.0);
+        assert_eq!(parse_length("min(100% - 20px, 50px)", 16.0, 100.0), Some(50.0));
+        assert_eq!(parse_length("max(10px, 100% - 20px)", 16.0, 100.0), Some(80.0));
+    }
 
     #[test]
     fn font_shorthand_weight_is_not_a_size() {

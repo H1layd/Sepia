@@ -2729,7 +2729,8 @@ impl<'a> Layout<'a> {
                 }
             }
         }
-        let columns = tracks.len().max(1);
+        let names = line_names(style.grid_columns.as_deref().unwrap_or(""));
+        let mut columns = tracks.len().max(1);
 
         // items and their places
         struct GridItem<'n> {
@@ -2743,6 +2744,8 @@ impl<'a> Layout<'a> {
             area: Option<String>,
             margin: (f32, f32),
             align: AlignItems,
+            /// explicit lines: (first track, span) across and down
+            fixed: (Option<(usize, usize)>, Option<(usize, usize)>),
         }
         let mut items: Vec<GridItem> = Vec::new();
         let (mut row, mut col) = (0usize, 0usize);
@@ -2753,6 +2756,7 @@ impl<'a> Layout<'a> {
         };
         for (child, via) in entries {
             let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
+            let mut fixed = (None, None);
             let (span, margin, align, area) = match &child.text {
                 Some(t) if t.trim().is_empty() => continue,
                 Some(_) => (1, (0.0, 0.0), style.flex.align, None),
@@ -2770,10 +2774,14 @@ impl<'a> Layout<'a> {
                         GridSpan::Span(n) => n.min(columns),
                         GridSpan::Full => columns,
                     };
+                    fixed = (
+                        s.grid_column_lines.as_ref().and_then(|l| grid_lines(l, &names, columns)),
+                        s.grid_row_lines.as_ref().and_then(|l| grid_lines(l, &[], usize::MAX / 4)),
+                    );
                     (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align), s.grid_area)
                 }
             };
-            items.push(GridItem { node: child, via, row: 0, col: 0, span, row_span: 1, area, margin, align });
+            items.push(GridItem { node: child, via, row: 0, col: 0, span, row_span: 1, area, margin, align, fixed });
         }
         if items.is_empty() {
             return 0.0;
@@ -2781,15 +2789,39 @@ impl<'a> Layout<'a> {
 
         // Named placements reserve their cells before automatic placement,
         // regardless of the order in which elements occur in the document.
+        // explicit lines past the template add implicit (auto) columns
+        let widest = items.iter().filter_map(|i| i.fixed.0.map(|(c, n)| c + n)).max().unwrap_or(0);
+        if widest > columns {
+            tracks.resize(widest, Track::Auto);
+            columns = widest;
+        }
         let mut occupied = std::collections::HashSet::new();
-        for item in &mut items {
+        let mut placed = vec![false; items.len()];
+        for (i, item) in items.iter_mut().enumerate() {
             if let Some(&(r0, c0, r1, c1)) = item.area.as_deref().and_then(|name| named.get(name)) {
                 item.row = r0; item.col = c0; item.span = c1 - c0; item.row_span = r1 - r0;
                 for r in r0..r1 { for c in c0..c1 { occupied.insert((r, c)); } }
+                placed[i] = true;
             }
         }
-        for item in &mut items {
-            if item.area.as_deref().is_some_and(|name| named.contains_key(name)) { continue; }
+        // then items with explicit lines (a fixed row and/or column)
+        for (i, item) in items.iter_mut().enumerate() {
+            if placed[i] || (item.fixed.0.is_none() && item.fixed.1.is_none()) { continue; }
+            let (c0, cs) = item.fixed.0.unwrap_or((usize::MAX, item.span));
+            let (r0, rs) = item.fixed.1.unwrap_or((usize::MAX, 1));
+            let free = |r: usize, c: usize, occ: &std::collections::HashSet<(usize, usize)>| (r..r + rs).all(|rr| (c..c + cs).all(|cc| !occ.contains(&(rr, cc))));
+            let (r, c) = match (r0 != usize::MAX, c0 != usize::MAX) {
+                (true, true) => (r0, c0),
+                (false, true) => ((0..).find(|&r| free(r, c0, &occupied)).unwrap_or(0), c0),
+                (true, false) => (r0, (0..columns.saturating_sub(cs) + 1).find(|&c| free(r0, c, &occupied)).unwrap_or(0)),
+                _ => unreachable!(),
+            };
+            item.row = r; item.col = c; item.span = cs.max(1); item.row_span = rs.max(1);
+            for rr in r..r + item.row_span { for cc in c..c + item.span { occupied.insert((rr, cc)); } }
+            placed[i] = true;
+        }
+        for (i, item) in items.iter_mut().enumerate() {
+            if placed[i] { continue; }
             loop {
                 if col + item.span > columns { row += 1; col = 0; }
                 if (col..col + item.span).all(|c| !occupied.contains(&(row, c))) { break; }
@@ -3044,6 +3076,105 @@ fn parse_tracks(value: &str, width: f32, gap: f32, font_size: f32) -> Vec<Track>
     tracks
 }
 
+/// Line names of a track list (`[a b] 1fr [c] 2fr`): entry i names the line
+/// before track i (the last one, the end line).
+fn line_names(value: &str) -> Vec<Vec<String>> {
+    let mut lines: Vec<Vec<String>> = vec![Vec::new()];
+    let (mut depth, mut in_name) = (0i32, false);
+    let (mut name, mut token) = (String::new(), String::new());
+    let end_token = |token: &mut String, lines: &mut Vec<Vec<String>>| {
+        if token.is_empty() {
+            return;
+        }
+        let tracks = match token.strip_prefix("repeat(").and_then(|t| t.strip_suffix(')')) {
+            Some(inner) => {
+                let (count, list) = inner.split_once(',').unwrap_or(("1", ""));
+                let per = list.split_whitespace().filter(|t| !t.starts_with('[') && !t.ends_with(']')).count().max(1);
+                count.trim().parse::<usize>().unwrap_or(1).min(64) * per
+            }
+            None => 1,
+        };
+        for _ in 0..tracks {
+            lines.push(Vec::new());
+        }
+        token.clear();
+    };
+    for c in value.chars() {
+        if in_name {
+            if c == ']' {
+                let last = lines.last_mut().expect("one line at least");
+                last.extend(name.split_whitespace().map(str::to_string));
+                name.clear();
+                in_name = false;
+            } else {
+                name.push(c);
+            }
+            continue;
+        }
+        match c {
+            '[' if depth == 0 => {
+                end_token(&mut token, &mut lines);
+                in_name = true;
+            }
+            '(' => { depth += 1; token.push(c); }
+            ')' => { depth -= 1; token.push(c); }
+            c if c.is_whitespace() && depth == 0 => end_token(&mut token, &mut lines),
+            c => token.push(c),
+        }
+    }
+    end_token(&mut token, &mut lines);
+    lines
+}
+
+/// `grid-column` / `grid-row` (start, end) against the template's lines:
+/// (first track, span), or None for automatic placement. Numbers count from
+/// 1 (negative from the end), `span N`, line names and `area` (its
+/// `area-start` / `area-end` lines).
+fn grid_lines(pair: &(String, String), names: &[Vec<String>], tracks: usize) -> Option<(usize, usize)> {
+    enum P { Auto, Span(usize), Line(usize) }
+    let lines = tracks + 1;
+    let find = |ident: &str, edge: &str| -> Option<usize> {
+        names.iter().position(|n| n.iter().any(|x| x == ident))
+            .or_else(|| names.iter().position(|n| n.iter().any(|x| *x == format!("{ident}-{edge}"))))
+    };
+    let part = |text: &str, edge: &str| -> P {
+        let t = text.trim();
+        if t.is_empty() || t == "auto" {
+            return P::Auto;
+        }
+        if let Some(rest) = t.strip_prefix("span") {
+            return P::Span(rest.trim().parse::<usize>().unwrap_or(1).max(1));
+        }
+        if let Ok(n) = t.parse::<i64>() {
+            return match n {
+                0 => P::Auto,
+                n if n > 0 => P::Line((n - 1) as usize),
+                n => P::Line((lines as i64 + n).max(0) as usize),
+            };
+        }
+        let ident = t.split_whitespace().next().unwrap_or(t);
+        find(ident, edge).map(P::Line).unwrap_or(P::Auto)
+    };
+    let start = part(&pair.0, "start");
+    // `grid-column: name` alone ends at the name's end line
+    let end = match (&start, pair.1.trim()) {
+        (_, e) if e != "auto" && !e.is_empty() => part(e, "end"),
+        (P::Line(_), _) if !pair.0.trim().starts_with(|c: char| c.is_ascii_digit() || c == '-') && !pair.0.trim().starts_with("span") => {
+            let ident = pair.0.split_whitespace().next().unwrap_or("");
+            find(&format!("{ident}-end"), "end").map(P::Line).unwrap_or(P::Auto)
+        }
+        _ => P::Auto,
+    };
+    match (start, end) {
+        (P::Line(s), P::Line(e)) if e != s => Some((s.min(e), (s.max(e) - s.min(e)).max(1))),
+        (P::Line(s), P::Line(_)) | (P::Line(s), P::Auto) => Some((s, 1)),
+        (P::Line(s), P::Span(n)) => Some((s, n)),
+        (P::Span(n), P::Line(e)) => Some((e.saturating_sub(n), n.min(e.max(1)))),
+        (P::Auto, P::Line(e)) => Some((e.saturating_sub(1), 1)),
+        _ => None,
+    }
+}
+
 impl InlineItem {
     fn clone_shallow(&self) -> InlineItem {
         InlineItem {
@@ -3253,6 +3384,29 @@ mod tests {
         let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
         let y = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { baseline, text, .. } if text.contains(w) => Some(*baseline), _ => None }).unwrap();
         assert_eq!(y("start"), y("Search"), "the growing item wrapped to a second line");
+    }
+
+    #[test]
+    fn grid_lines_by_number_and_name() {
+        let names = line_names("[full-start] 1fr [content-start] 2fr [content-end] 1fr [full-end]");
+        assert_eq!(names.len(), 4);
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(grid_lines(&pair("content", "auto"), &names, 3), Some((1, 1)));
+        assert_eq!(grid_lines(&pair("full", "auto"), &names, 3), Some((0, 3)));
+        assert_eq!(grid_lines(&pair("2", "-1"), &names, 3), Some((1, 2)));
+        assert_eq!(grid_lines(&pair("1", "span 2"), &names, 3), Some((0, 2)));
+        assert_eq!(grid_lines(&pair("auto", "auto"), &names, 3), None);
+    }
+
+    #[test]
+    fn named_grid_lines_place_items() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:grid;width:800px;grid-template-columns:[full-start] 100px [content-start] 1fr [content-end] 100px [full-end]'><p style='grid-column:content;margin:0'>middle</p><p style='grid-column:1;grid-row:1;margin:0'>left</p></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let pos = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(w) => Some((*x, *baseline)), _ => None }).unwrap();
+        assert!((pos("middle").0 - 100.0).abs() < 1.0, "{:?}", pos("middle"));
+        assert_eq!(pos("left").1, pos("middle").1, "both in the first row");
     }
 
     #[test]
