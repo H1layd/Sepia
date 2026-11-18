@@ -286,6 +286,8 @@ pub struct Layout<'a> {
     /// a flex row item laid out at the size the line gave it: its declared
     /// width (often 100%) yields to that size, margins included
     flex_main: Option<*const Node>,
+    /// a flex column item grown to this outer height (margins included)
+    flex_height: Option<(*const Node, f32)>,
     /// positioned ancestors (their padding boxes), innermost last: what
     /// `position: absolute` children are placed against
     containers: Vec<Container>,
@@ -322,7 +324,7 @@ fn out_of_flow(style: &Style) -> bool {
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
         crate::style::set_viewport(viewport_width, sheet.viewport_height);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, flex_height: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -464,7 +466,7 @@ impl<'a> Layout<'a> {
             style.width = Some((containing_width - style.margin.horizontal()).max(1.0));
             style.border_box = true;
         }
-        if self.blockify == Some(node as *const Node) && matches!(style.display, Display::Inline | Display::InlineBlock) && !matches!(node.tag.as_str(), "img" | "svg" | "input" | "select" | "textarea") {
+        if self.blockify == Some(node as *const Node) && matches!(style.display, Display::Inline | Display::InlineBlock) && !matches!(node.tag.as_str(), "img" | "svg" | "canvas" | "input" | "select" | "textarea") {
             style.display = match (style.display, style.inner) {
                 (Display::InlineBlock, Inner::Flex) => Display::Flex,
                 (Display::InlineBlock, Inner::Grid) => Display::Grid,
@@ -479,6 +481,13 @@ impl<'a> Layout<'a> {
             style.border_box = true;
             style.min_width = None;
             style.max_width = None;
+        }
+        if let Some((target, h)) = self.flex_height {
+            if target == node as *const Node && !self.measuring {
+                style.height = Some((h - style.margin.vertical()).max(0.0));
+                style.border_box = true;
+                style.min_height = None;
+            }
         }
 
         if style.display == Display::Table {
@@ -504,7 +513,7 @@ impl<'a> Layout<'a> {
             }
             return 0.0;
         }
-        let replaced = matches!(node.tag.as_str(), "img" | "svg");
+        let replaced = matches!(node.tag.as_str(), "img" | "svg" | "canvas");
         if replaced || matches!(style.display, Display::Inline | Display::InlineBlock) {
             // Inline elements at block level are laid out as their own line.
             self.last_margin_bottom = 0.0;
@@ -739,7 +748,7 @@ impl<'a> Layout<'a> {
                 self.place_out_of_flow(child, ancestors, cs, x, cursor + pending);
                 continue;
             }
-            if let Some(cs) = child_style.as_ref().filter(|cs| cs.float.is_some() && cs.display != Display::None && !matches!(child.tag.as_str(), "img" | "svg")) {
+            if let Some(cs) = child_style.as_ref().filter(|cs| cs.float.is_some() && cs.display != Display::None && !matches!(child.tag.as_str(), "img" | "svg" | "canvas")) {
                 if !items.is_empty() {
                     let used = self.layout_inline(&items, x, cursor, width);
                     items.clear();
@@ -883,7 +892,7 @@ impl<'a> Layout<'a> {
         // img and svg are replaced elements whatever their display says
         // form controls are inline-blocks even when a site says `display: inline`
         let control = matches!(node.tag.as_str(), "button" | "input" | "select" | "textarea");
-        if (style.display == Display::InlineBlock || control) && !matches!(node.tag.as_str(), "img" | "svg") {
+        if (style.display == Display::InlineBlock || control) && !matches!(node.tag.as_str(), "img" | "svg" | "canvas") {
             let mut node_ancestors: Vec<&Node> = ancestors.to_vec();
             node_ancestors.push(node);
             if let Some((page, baseline, w, h)) = self.make_atom(node, &node_ancestors, &style) {
@@ -942,6 +951,34 @@ impl<'a> Layout<'a> {
                     img: None,
                     owners: Vec::new(),
                 });
+                return;
+            }
+            "canvas" => {
+                // what scripts drew (canvas2d.rs), at the CSS size, else the bitmap's
+                let bitmap = node.attr("data-sepia-id")
+                    .and_then(|id| id.parse::<usize>().ok())
+                    .and_then(|id| self.images.and_then(|map| map.get(&crate::canvas2d::key(id))))
+                    .cloned();
+                let attr = |name: &str, fallback: f32| node.attr(name).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| *v >= 0.0).unwrap_or(fallback);
+                let (aw, ah) = (attr("width", 300.0), attr("height", 150.0));
+                let (w, h) = match (style.width.filter(|v| *v > 0.0), style.height.filter(|v| *v > 0.0)) {
+                    (Some(w), Some(h)) => (w, h),
+                    (Some(w), None) => (w, if aw > 0.0 { w * ah / aw } else { ah }),
+                    (None, Some(h)) => (if ah > 0.0 { h * aw / ah } else { aw }, h),
+                    (None, None) => (aw, ah),
+                };
+                if w >= 0.5 && h >= 0.5 {
+                    items.push(InlineItem {
+                        text: String::new(),
+                        style,
+                        href: href.clone(),
+                        br: false,
+                        image: false,
+                        own_background: None,
+                        img: Some(ImgBox { w: w.min(16384.0), h: h.min(16384.0), bitmap, alt: String::new(), atom: None }),
+                        owners: Vec::new(),
+                    });
+                }
                 return;
             }
             "img" => {
@@ -1585,6 +1622,7 @@ impl<'a> Layout<'a> {
             flow_width: self.flow_width,
             blockify: None,
             flex_main: None,
+            flex_height: None,
             containers: Vec::new(),
             exclusions: Vec::new(),
             page: Page::default(),
@@ -2148,6 +2186,10 @@ struct FlexItem<'n> {
     /// ancestors and parent style when the item comes from a `display:
     /// contents` child (None: the container's own)
     via: Option<(Vec<&'n Node>, Style)>,
+    /// max-width as an outer size (infinite without one)
+    max_outer: f32,
+    /// margin-left / margin-right: auto (they take the line's free space)
+    auto: (bool, bool),
 }
 
 impl<'n> FlexItem<'n> {
@@ -2255,6 +2297,7 @@ impl<'a> Layout<'a> {
         for (child, via) in entries {
             let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
             let mut fixed_outer = None;
+            let mut auto = (false, false);
             let (item_flex, margin_top, margin_bottom, right_chrome, min_outer) = match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
                 Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0, 0.0),
@@ -2269,6 +2312,7 @@ impl<'a> Layout<'a> {
                     }
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
                     let min_outer = s.min_width.map(|m| m + chrome + s.margin.horizontal()).unwrap_or(0.0);
+                    auto = s.margin_auto;
                     fixed_outer = s.width.map(|w| {
                         let w = s.max_width.map_or(w, |m| w.min(m));
                         w + chrome + s.margin.horizontal()
@@ -2277,7 +2321,7 @@ impl<'a> Layout<'a> {
                 }
             };
             let align = item_flex.align_self.unwrap_or(f.align);
-            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer, via });
+            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer, via, max_outer: f32::INFINITY, auto });
         }
         if reverse {
             items.reverse();
@@ -2301,6 +2345,9 @@ impl<'a> Layout<'a> {
                 None => {
                     let s = compute(item.node, Some(parent), self.sheet, anc, width);
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
+                    if let Some(m) = s.max_width {
+                        item.max_outer = m + chrome + s.margin.horizontal();
+                    }
                     (s.width.map(|w| w + chrome + s.margin.horizontal()),
                      chrome + s.margin.horizontal(), s.min_width.is_some())
                 }
@@ -2313,7 +2360,9 @@ impl<'a> Layout<'a> {
             }
             // min-width is a floor for both
             item.min = if explicit_min { item.min_outer } else { item.min.max(item.min_outer) };
-            item.basis = item.basis.max(item.min_outer);
+            // max-width caps the basis (and the min-content floor) too
+            item.basis = item.basis.min(item.max_outer).max(item.min_outer);
+            item.min = item.min.min(item.max_outer.max(item.min_outer));
         }
 
         // ----- lines -----------------------------------------------------------
@@ -2349,7 +2398,7 @@ impl<'a> Layout<'a> {
             } else if free > 0.0 {
                 let grow: f32 = items[line.clone()].iter().map(|i| i.flex.grow).sum();
                 for item in &mut items[line.clone()] {
-                    item.size = item.basis + if grow > 0.0 { free * item.flex.grow / grow } else { 0.0 };
+                    item.size = (item.basis + if grow > 0.0 { free * item.flex.grow / grow } else { 0.0 }).min(item.max_outer.max(item.basis));
                 }
             } else {
                 // Freeze items that reach their minimum, then redistribute the
@@ -2383,7 +2432,7 @@ impl<'a> Layout<'a> {
             // when measuring, everything packs to the start: centring a
             // line in a 100000px measuring box would read as a huge width
             let justify = if self.measuring { Justify::Start } else { f.justify };
-            let (mut pen, spacing) = match justify {
+            let (pen, spacing) = match justify {
                 Justify::Start => (0.0, 0.0),
                 Justify::End => (leftover, 0.0),
                 Justify::Center => (leftover / 2.0, 0.0),
@@ -2392,11 +2441,22 @@ impl<'a> Layout<'a> {
                 Justify::SpaceAround => (leftover / count as f32 / 2.0, leftover / count as f32),
                 Justify::SpaceEvenly => (leftover / (count + 1) as f32, leftover / (count + 1) as f32),
             };
+            // auto margins take the free space before justify-content does
+            let autos = items[line.clone()].iter().map(|i| i.auto.0 as u32 + i.auto.1 as u32).sum::<u32>();
+            let per_auto = if autos > 0 && !self.measuring && leftover > 0.0 { leftover / autos as f32 } else { 0.0 };
+            let (mut pen, spacing) = if per_auto > 0.0 { (0.0, 0.0) } else { (pen, spacing) };
             let laid: Vec<(Page, f32)> = items[line.clone()]
                 .iter()
                 .map(|item| { let (anc, parent) = item.ctx(ancestors, style); self.item_page_sized(item.node, anc, parent, item.size) })
                 .collect();
-            let line_h = laid.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
+            let mut line_h = laid.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
+            // a single-line container with a definite height: its one line is that tall
+            if lines.len() == 1 && !self.measuring {
+                let chrome = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
+                if let Some(h) = style.height.or(style.min_height) {
+                    line_h = line_h.max(h - chrome);
+                }
+            }
             for (item, (mut page, h)) in items[line.clone()].iter().zip(laid) {
                 if item.align == AlignItems::Stretch && h < line_h && item.node.text.is_none() {
                     stretch_box(&mut page, h, line_h - h, item.margin_top, item.margin_bottom);
@@ -2406,8 +2466,10 @@ impl<'a> Layout<'a> {
                     AlignItems::End => line_h - h,
                     AlignItems::Start | AlignItems::Stretch => 0.0,
                 };
+                if item.auto.0 { pen += per_auto; }
                 self.paste(page, x + pen, cursor + dy);
                 pen += item.size + gap + spacing;
+                if item.auto.1 { pen += per_auto; }
             }
             cursor += line_h;
             if n + 1 < lines.len() {
@@ -2440,8 +2502,31 @@ impl<'a> Layout<'a> {
             aligns.push(item.align);
         }
         let gaps = f.row_gap * (laid.len().saturating_sub(1)) as f32;
-        let content: f32 = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
-        let leftover = style.height.map(|h| (h - content).max(0.0)).unwrap_or(0.0);
+        let mut content: f32 = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
+        // the container's own height (or min-height), as a content box
+        let chrome = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
+        let target = style.height.or(style.min_height).map(|h| (h - chrome).max(0.0));
+        // flex-grow: growing items share the free space and are laid out again at their new height
+        let grow: f32 = items.iter().map(|i| i.flex.grow).sum();
+        if let (Some(t), false) = (target, self.measuring) {
+            let free = t - content;
+            if free > 0.5 && grow > 0.0 {
+                for (i, item) in items.iter().enumerate() {
+                    if item.flex.grow <= 0.0 || item.node.text.is_some() {
+                        continue;
+                    }
+                    let h = laid[i].1 + free * item.flex.grow / grow;
+                    let (anc, parent) = item.ctx(ancestors, style);
+                    let mut sub = self.sub_layout(false);
+                    sub.blockify = Some(item.node as *const Node);
+                    sub.flex_height = Some((item.node as *const Node, h));
+                    let got = sub.layout_block(item.node, anc, Some(parent), 0.0, 0.0, laid[i].2.max(1.0));
+                    laid[i] = (sub.page, got.max(h), laid[i].2);
+                }
+                content = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
+            }
+        }
+        let leftover = target.map(|h| (h - content).max(0.0)).unwrap_or(0.0);
         let count = laid.len();
         let justify = if self.measuring { Justify::Start } else { f.justify };
         let (mut pen, spacing) = match justify {
@@ -3127,6 +3212,37 @@ mod tests {
         let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
         let side = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("side") => Some(*x), _ => None }).unwrap();
         assert!(side > 400.0 && side < 460.0, "side column at {side}");
+    }
+
+    #[test]
+    fn column_flex_items_grow_into_min_height() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><section style='display:flex;flex-direction:column;min-height:600px'><div style='flex:1;display:flex;flex-direction:column;justify-content:center'>hero</div><div>logos</div></section></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let y = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { baseline, text, .. } if text.contains(w) => Some(*baseline), _ => None }).unwrap();
+        assert!(y("logos") > 560.0, "logos at {}", y("logos"));
+        assert!(y("hero") > 250.0 && y("hero") < 350.0, "hero at {}", y("hero"));
+    }
+
+    #[test]
+    fn auto_margins_push_flex_items_apart() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:flex;width:800px'><div>logo</div><div style='margin-left:auto'>login</div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let x = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("login") => Some(*x), _ => None }).unwrap();
+        assert!(x > 700.0, "login at {x}");
+    }
+
+    #[test]
+    fn flex_items_keep_their_max_width() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:flex;width:1200px'><header style='width:100%;max-width:400px'>a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h</header><div>second</div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 1200.0).build(&doc);
+        let x = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("second") => Some(*x), _ => None }).unwrap();
+        assert!((x - 400.0).abs() < 2.0, "second item at {x}, the first should stop at its 400px max-width");
     }
 
     #[test]

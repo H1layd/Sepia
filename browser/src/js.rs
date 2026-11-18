@@ -12,7 +12,7 @@
 //! * storage: cookies and localStorage/sessionStorage live in memory only,
 //!   cookies partitioned by site (see `cookies.rs`)
 //! * fingerprinting: navigator/screen report the same values for every
-//!   user, no canvas, WebGL, audio, battery, devices or high-resolution time
+//!   user, no WebGL, audio, battery, devices or high-resolution time (2D canvas: canvas2d.rs)
 //! * runaway code: loop and recursion limits stop a script, not the browser
 //!
 //! A `Session` owns one page: its DOM, its Boa context, its stylesheet and
@@ -651,6 +651,27 @@ thread_local! {
     static GEOMETRY_FONTS: std::cell::OnceCell<Fonts> = const { std::cell::OnceCell::new() };
 }
 
+/// A loaded image by its URL (as written in `src`, or absolute), for canvas drawImage.
+pub fn image_for(key: &str) -> Option<std::sync::Arc<crate::images::Bitmap>> {
+    if let Some(b) = SCRIPT_IMAGES.with(|m| m.borrow().get(key).cloned()) {
+        return Some(b);
+    }
+    GEOMETRY.with(|g| g.borrow().as_ref().and_then(|g| g.images.get(key).cloned()))
+}
+
+thread_local! {
+    /// images scripts loaded themselves (`new Image()`), by URL
+    static SCRIPT_IMAGES: RefCell<ImageMap> = RefCell::new(ImageMap::new());
+}
+
+fn arg_num(args: &[JsValue], i: usize, ctx: &mut Context) -> f32 {
+    args.get(i).and_then(|v| v.to_number(ctx).ok()).filter(|n| n.is_finite()).unwrap_or(0.0) as f32
+}
+
+fn with_fonts<R>(f: impl FnOnce(&Fonts) -> R) -> R {
+    GEOMETRY_FONTS.with(|fonts| f(fonts.get_or_init(Fonts::load)))
+}
+
 fn set_geometry_inputs(sheet: &Stylesheet, images: &ImageMap, width: f32) {
     GEOMETRY.with(|g| {
         *g.borrow_mut() = Some(Geometry {
@@ -892,7 +913,76 @@ macro_rules! native {
     };
 }
 
+fn register_canvas(ctx: &mut Context) {
+    use crate::canvas2d as cv;
+    native!(ctx, "__cv_init", 3, |_, a, ctx| {
+        cv::init(arg_id(a, 0).max(0) as usize, arg_num(a, 1, ctx) as u32, arg_num(a, 2, ctx) as u32);
+        with(|st| st.dirty = true);
+        Ok(JsValue::undefined())
+    });
+    // (id, path, evenodd, paint, paint transform, alpha, op)
+    native!(ctx, "__cv_fill", 7, |_, a, ctx| {
+        let (path, spec, t, op) = (arg_str(a, 1, ctx)?, arg_str(a, 3, ctx)?, arg_str(a, 4, ctx)?, arg_str(a, 6, ctx)?);
+        cv::fill(arg_id(a, 0).max(0) as usize, &path, a.get(2).map(|v| v.to_boolean()).unwrap_or(false), &spec, &t, arg_num(a, 5, ctx), &op);
+        with(|st| st.dirty = true);
+        Ok(JsValue::undefined())
+    });
+    // (id, path, paint, paint transform, alpha, op, width, cap, join, miter, dash, dash offset)
+    native!(ctx, "__cv_stroke", 12, |_, a, ctx| {
+        let (path, spec, t, op) = (arg_str(a, 1, ctx)?, arg_str(a, 2, ctx)?, arg_str(a, 3, ctx)?, arg_str(a, 5, ctx)?);
+        let (cap, join, dash) = (arg_str(a, 7, ctx)?, arg_str(a, 8, ctx)?, arg_str(a, 10, ctx)?);
+        cv::stroke(arg_id(a, 0).max(0) as usize, &path, &spec, &t, arg_num(a, 4, ctx), &op, arg_num(a, 6, ctx), &cap, &join, arg_num(a, 9, ctx), &dash, arg_num(a, 11, ctx));
+        with(|st| st.dirty = true);
+        Ok(JsValue::undefined())
+    });
+    native!(ctx, "__cv_clip", 2, |_, a, ctx| {
+        cv::clip(arg_id(a, 0).max(0) as usize, &arg_str(a, 1, ctx)?);
+        Ok(JsValue::undefined())
+    });
+    // (id, key, sx, sy, sw, sh, transform, alpha, op, smoothing)
+    native!(ctx, "__cv_image", 10, |_, a, ctx| {
+        let (key, t, op) = (arg_str(a, 1, ctx)?, arg_str(a, 6, ctx)?, arg_str(a, 8, ctx)?);
+        cv::draw_image(arg_id(a, 0).max(0) as usize, &key, arg_num(a, 2, ctx), arg_num(a, 3, ctx), arg_num(a, 4, ctx), arg_num(a, 5, ctx), &t, arg_num(a, 7, ctx), &op, a.get(9).map(|v| v.to_boolean()).unwrap_or(true));
+        with(|st| st.dirty = true);
+        Ok(JsValue::undefined())
+    });
+    // natural size of an image source: "w,h"
+    native!(ctx, "__cv_source_size", 1, |_, a, ctx| {
+        let (w, h) = cv::source_size(&arg_str(a, 0, ctx)?);
+        Ok(s(format!("{w},{h}")))
+    });
+    // (text, size, family, bold, italic) -> width
+    native!(ctx, "__cv_measure", 5, |_, a, ctx| {
+        let (text, family) = (arg_str(a, 0, ctx)?, arg_str(a, 2, ctx)?);
+        let size = arg_num(a, 1, ctx);
+        let (bold, italic) = (a.get(3).map(|v| v.to_boolean()).unwrap_or(false), a.get(4).map(|v| v.to_boolean()).unwrap_or(false));
+        Ok(JsValue::from(with_fonts(|f| cv::measure(f, &text, size, &family, bold, italic)) as f64))
+    });
+    // (id, text, x, y, size, family, bold, italic, maxWidth, paint, ctm, alpha, op)
+    native!(ctx, "__cv_text", 13, |_, a, ctx| {
+        let (text, family, spec, ctm, op) = (arg_str(a, 1, ctx)?, arg_str(a, 5, ctx)?, arg_str(a, 9, ctx)?, arg_str(a, 10, ctx)?, arg_str(a, 12, ctx)?);
+        let (x, y, size, max_w, alpha) = (arg_num(a, 2, ctx), arg_num(a, 3, ctx), arg_num(a, 4, ctx), arg_num(a, 8, ctx), arg_num(a, 11, ctx));
+        let (bold, italic) = (a.get(6).map(|v| v.to_boolean()).unwrap_or(false), a.get(7).map(|v| v.to_boolean()).unwrap_or(false));
+        let id = arg_id(a, 0).max(0) as usize;
+        with_fonts(|f| cv::text(f, id, &text, x, y, size, &family, bold, italic, max_w, &spec, &ctm, alpha, &op));
+        with(|st| st.dirty = true);
+        Ok(JsValue::undefined())
+    });
+    native!(ctx, "__cv_get", 5, |_, a, ctx| {
+        Ok(s(cv::get_image_data(arg_id(a, 0).max(0) as usize, arg_num(a, 1, ctx) as i32, arg_num(a, 2, ctx) as i32, arg_num(a, 3, ctx) as u32, arg_num(a, 4, ctx) as u32)))
+    });
+    // (id, bytes, dx, dy, w, h)
+    native!(ctx, "__cv_put", 6, |_, a, ctx| {
+        let bytes = arg_str(a, 1, ctx)?;
+        cv::put_image_data(arg_id(a, 0).max(0) as usize, &bytes, arg_num(a, 2, ctx) as i32, arg_num(a, 3, ctx) as i32, arg_num(a, 4, ctx) as u32, arg_num(a, 5, ctx) as u32);
+        with(|st| st.dirty = true);
+        Ok(JsValue::undefined())
+    });
+    native!(ctx, "__cv_png", 1, |_, a, _| Ok(s(cv::png_base64(arg_id(a, 0).max(0) as usize))));
+}
+
 fn register(ctx: &mut Context) {
+    register_canvas(ctx);
     native!(ctx, "__dom_kind", 1, |_, a, _| {
         let id = arg_id(a, 0);
         Ok(with(|st| match st.dom.valid(id) {
@@ -2449,6 +2539,11 @@ impl Session {
     }
 
     pub fn layout(&self, fonts: &Fonts) -> Page {
+        // what scripts drew on canvases since the last layout
+        let drawn = crate::canvas2d::take_dirty();
+        if !drawn.is_empty() {
+            self.images.borrow_mut().extend(drawn);
+        }
         let tree = self.tree();
         let added = self.added_css();
         if added.is_empty() {

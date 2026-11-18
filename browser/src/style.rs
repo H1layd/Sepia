@@ -851,6 +851,10 @@ pub fn compute(
     containing_width: f32,
 ) -> Style {
     let mut style = default_style(&node.tag);
+    // UA: `[popover]:not(:popover-open)` and `dialog:not([open])` are hidden
+    if (node.attr("popover").is_some() && node.attr("data-sepia-popover-open").is_none()) || (node.tag == "dialog" && node.attr("open").is_none()) {
+        style.display = Display::None;
+    }
     let parent_size = parent.map(|p| p.font_size).unwrap_or(16.0);
     if let Some(parent_style) = parent {
         let inherit = inherited(parent_style);

@@ -5,6 +5,7 @@
 //! own CSS parser and cascade, own block/inline layout, own software rasteriser.
 //! Own engine; no webview or browser driver.
 
+mod canvas2d;
 mod cookies;
 mod charset;
 mod css;
@@ -166,7 +167,7 @@ fn print_audit(chain: &Chain, resolver: Option<&resolver::Resolver>, timeout: f6
     println!();
     println!("absent by construction");
     for row in [
-        ("canvas / webgl", "not implemented: getContext() returns null, no audio, no devices"),
+        ("webgl", "not implemented: getContext('webgl') returns null; no audio; devices and geolocation refused"),
         ("webrtc", "not implemented: no UDP, no ICE, no local address exposure"),
         ("cache / profile", "no disk cache or cookie profile; a page keeps its static files (JS, CSS, fonts)
                    in memory while it is open, up to 64 MiB; explicit saves write files"),

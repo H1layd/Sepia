@@ -703,9 +703,20 @@
   classes.Dialog.prototype.showModal = function () { this.setAttribute('open', ''); };
   classes.Dialog.prototype.show = function () { this.setAttribute('open', ''); };
   classes.Dialog.prototype.close = function () { this.removeAttribute('open'); this.dispatchEvent(new Event('close')); };
-  // no canvas: it would be a fingerprinting surface
-  classes.Canvas.prototype.getContext = function () { return null; };
-  classes.Canvas.prototype.toDataURL = function () { return 'data:,'; };
+  // the Popover API: an element with a popover attribute stays hidden until shown
+  {
+    const P = HTMLElement.prototype, OPEN = 'data-sepia-popover-open';
+    const toggle = (el, open) => {
+      if (el.hasAttribute(OPEN) === open) return;
+      const old = open ? 'closed' : 'open', now = open ? 'open' : 'closed';
+      if (open) el.setAttribute(OPEN, ''); else el.removeAttribute(OPEN);
+      try { const ev = new Event('toggle'); ev.oldState = old; ev.newState = now; el.dispatchEvent(ev); } catch (e) {}
+    };
+    P.showPopover = function () { toggle(this, true); };
+    P.hidePopover = function () { toggle(this, false); };
+    P.togglePopover = function (force) { const open = force === undefined ? !this.hasAttribute(OPEN) : !!force; toggle(this, open); return open; };
+    Object.defineProperty(P, 'popover', { get() { const v = this.getAttribute('popover'); return v === null ? null : (v === 'manual' || v === 'hint' ? v : 'auto'); }, set(v) { if (v === null) this.removeAttribute('popover'); else this.setAttribute('popover', v); }, configurable: true });
+  }
 
   // the Node interface's constants, on the interface and on every node
   {
@@ -1367,6 +1378,74 @@
       });
       G.Intl[k] = P;
     }
+    // Intl.RelativeTimeFormat / DisplayNames, missing from the engine:
+    // English and Russian wording, others read as English
+    if (typeof G.Intl.RelativeTimeFormat !== 'function') {
+      const UNITS = ['second', 'minute', 'hour', 'day', 'week', 'month', 'quarter', 'year'];
+      const EN = { long: { second: 'second', minute: 'minute', hour: 'hour', day: 'day', week: 'week', month: 'month', quarter: 'quarter', year: 'year' },
+        short: { second: 'sec.', minute: 'min.', hour: 'hr.', day: 'day', week: 'wk.', month: 'mo.', quarter: 'qtr.', year: 'yr.' },
+        narrow: { second: 's', minute: 'm', hour: 'h', day: 'd', week: 'w', month: 'mo', quarter: 'q', year: 'y' } };
+      const EN_AUTO = { day: { '-1': 'yesterday', 0: 'today', 1: 'tomorrow' }, second: { 0: 'now' }, minute: { 0: 'this minute' }, hour: { 0: 'this hour' } };
+      for (const u of ['week', 'month', 'quarter', 'year']) EN_AUTO[u] = { '-1': 'last ' + u, 0: 'this ' + u, 1: 'next ' + u };
+      const RU = { second: ['секунду', 'секунды', 'секунд'], minute: ['минуту', 'минуты', 'минут'], hour: ['час', 'часа', 'часов'], day: ['день', 'дня', 'дней'],
+        week: ['неделю', 'недели', 'недель'], month: ['месяц', 'месяца', 'месяцев'], quarter: ['квартал', 'квартала', 'кварталов'], year: ['год', 'года', 'лет'] };
+      const RU_AUTO = { day: { '-2': 'позавчера', '-1': 'вчера', 0: 'сегодня', 1: 'завтра', 2: 'послезавтра' }, second: { 0: 'сейчас' },
+        year: { '-1': 'в прошлом году', 0: 'в этом году', 1: 'в следующем году' }, month: { '-1': 'в прошлом месяце', 0: 'в этом месяце', 1: 'в следующем месяце' },
+        week: { '-1': 'на прошлой неделе', 0: 'на этой неделе', 1: 'на следующей неделе' } };
+      const ruForm = n => { n = Math.abs(n); const t = n % 100, o = n % 10; if (!Number.isInteger(n)) return 1; if (t >= 11 && t <= 14) return 2; if (o === 1) return 0; if (o >= 2 && o <= 4) return 1; return 2; };
+      class RelativeTimeFormat {
+        constructor(locales, options = {}) {
+          const l = Array.isArray(locales) ? locales[0] : locales;
+          this.__locale = String(l || persona.language || 'en-US');
+          this.__ru = /^ru\b/i.test(this.__locale);
+          this.__numeric = options.numeric === 'auto' ? 'auto' : 'always';
+          this.__style = ['short', 'narrow'].includes(options.style) ? options.style : 'long';
+          this.__nf = new G.Intl.NumberFormat(this.__locale);
+        }
+        format(value, unit) {
+          value = Number(value);
+          if (!Number.isFinite(value)) throw new RangeError('Invalid value');
+          const u = String(unit).replace(/s$/, '');
+          if (!UNITS.includes(u)) throw new RangeError('Invalid unit argument for format() \'' + unit + '\'');
+          const past = value < 0 || Object.is(value, -0), n = Math.abs(value);
+          if (this.__numeric === 'auto') {
+            const word = (this.__ru ? RU_AUTO : EN_AUTO)[u]?.[String(value === 0 ? 0 : value)];
+            if (word) return word;
+          }
+          const num = this.__nf.format(n);
+          if (this.__ru) { const w = RU[u][ruForm(n)]; return past ? `${num} ${w} назад` : `через ${num} ${w}`; }
+          const base = EN[this.__style][u];
+          const w = this.__style === 'narrow' ? base : (this.__style === 'short' ? base : base + (n === 1 ? '' : 's'));
+          const phrase = this.__style === 'narrow' ? num + w : num + ' ' + w;
+          return past ? phrase + ' ago' : 'in ' + phrase;
+        }
+        formatToParts(value, unit) {
+          const text = this.format(value, unit), num = this.__nf.format(Math.abs(Number(value))), i = text.indexOf(num);
+          if (i < 0) return [{ type: 'literal', value: text }];
+          const parts = [];
+          if (i > 0) parts.push({ type: 'literal', value: text.slice(0, i) });
+          parts.push({ type: 'integer', value: num, unit: String(unit).replace(/s$/, '') });
+          if (i + num.length < text.length) parts.push({ type: 'literal', value: text.slice(i + num.length) });
+          return parts;
+        }
+        resolvedOptions() { return { locale: this.__locale, style: this.__style, numeric: this.__numeric, numberingSystem: 'latn' }; }
+        static supportedLocalesOf(l) { return (Array.isArray(l) ? l : l ? [l] : []).map(String); }
+      }
+      G.Intl.RelativeTimeFormat = RelativeTimeFormat;
+    }
+    if (typeof G.Intl.DisplayNames !== 'function') {
+      G.Intl.DisplayNames = class DisplayNames {
+        constructor(locales, options = {}) { this.__type = options.type || 'language'; this.__fallback = options.fallback || 'code'; this.__locale = String((Array.isArray(locales) ? locales[0] : locales) || 'en-US'); }
+        of(code) {
+          const names = { language: { en: 'English', ru: 'Russian', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', ja: 'Japanese', zh: 'Chinese', pt: 'Portuguese', uk: 'Ukrainian' },
+            region: { US: 'United States', GB: 'United Kingdom', RU: 'Russia', DE: 'Germany', FR: 'France', IT: 'Italy', ES: 'Spain', JP: 'Japan', CN: 'China', UA: 'Ukraine' } }[this.__type] || {};
+          const key = this.__type === 'region' ? String(code).toUpperCase() : String(code).split('-')[0].toLowerCase();
+          return names[key] ?? (this.__fallback === 'none' ? undefined : String(code));
+        }
+        resolvedOptions() { return { locale: this.__locale, type: this.__type, fallback: this.__fallback, style: 'long' }; }
+        static supportedLocalesOf(l) { return (Array.isArray(l) ? l : l ? [l] : []).map(String); }
+      };
+    }
     // the engine's NumberFormat knows plain decimals only: percent, currency
     // and units, non-finite numbers and formatToParts are done here
     function numberFormat(t, l, o, nt) {
@@ -1860,7 +1939,24 @@
     plugins: [], mimeTypes: [], clipboard: { writeText: () => Promise.reject(new Error('blocked')), readText: () => Promise.reject(new Error('blocked')) },
     // a POST sent in the background; the answer is never read
     sendBeacon: (url, data) => { try { sendLater(String(url), 'POST', data ?? '', data instanceof G.Blob && data.type ? { 'content-type': data.type } : null, () => {}, true); return true; } catch (e) { return false; } }, vibrate: () => false, share: () => Promise.reject(new Error('blocked')),
-    serviceWorker: undefined, geolocation: undefined, mediaDevices: undefined,
+    // present like in every browser, but nothing is granted: registration and
+    // device access are refused the way a browser refuses them
+    serviceWorker: {
+      controller: null, ready: new Promise(() => {}), oncontrollerchange: null, onmessage: null,
+      register: () => Promise.reject(new DOMException('Service workers are not supported.', 'SecurityError')),
+      getRegistration: () => Promise.resolve(undefined), getRegistrations: () => Promise.resolve([]),
+      startMessages() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    },
+    geolocation: {
+      getCurrentPosition(ok, fail) { if (typeof fail === 'function') setTimeout(() => fail({ code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 }), 0); },
+      watchPosition(ok, fail) { this.getCurrentPosition(ok, fail); return 0; }, clearWatch() {},
+    },
+    mediaDevices: {
+      enumerateDevices: () => Promise.resolve([]), getSupportedConstraints: () => ({}),
+      getUserMedia: () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError')),
+      getDisplayMedia: () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError')),
+      ondevicechange: null, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    },
   };
   if (persona.hints) {
     const h = persona.hints;
@@ -2637,8 +2733,400 @@
   Response.prototype.arrayBuffer = function () { return Promise.resolve(new G.TextEncoder().encode(this.__body).buffer); };
   Response.prototype.blob = function () { return Promise.resolve(new G.Blob([this.__body], { type: this.headers.get('content-type') || '' })); };
   Response.prototype.bodyUsed = false;
-  // there is no canvas to draw on, but paths can still be built
-  G.Path2D = class Path2D { constructor() {} addPath() {} closePath() {} moveTo() {} lineTo() {} bezierCurveTo() {} quadraticCurveTo() {} arc() {} arcTo() {} ellipse() {} rect() {} roundRect() {} };
+  // ----- <canvas> 2D (drawn natively by canvas2d.rs) ---------------------------
+  {
+    const ID = [1, 0, 0, 1, 0, 0];
+    const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+    const apply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+    const invert = m => { const det = m[0] * m[3] - m[1] * m[2]; if (!det) return null; return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det]; };
+    const num = v => { v = +v; return Number.isFinite(v) ? v : NaN; };
+    const ok = (...vs) => vs.every(v => Number.isFinite(+v));
+    const r3 = n => Math.round(n * 1000) / 1000;
+    const matrixFrom = m => m == null ? ID.slice() : Array.isArray(m) ? m.slice(0, 6) : [m.a ?? m.m11 ?? 1, m.b ?? m.m12 ?? 0, m.c ?? m.m21 ?? 0, m.d ?? m.m22 ?? 1, m.e ?? m.m41 ?? 0, m.f ?? m.m42 ?? 0];
+    const domMatrix = m => { const d = new G.DOMMatrix(); Object.assign(d, { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5], m11: m[0], m12: m[1], m21: m[2], m22: m[3], m41: m[4], m42: m[5], isIdentity: m.join() === ID.join() }); return d; };
+
+    // A path whose points are stored already transformed (`m` when added).
+    class Path2D {
+      constructor(src) {
+        this.__ops = []; this.__start = null; this.__last = null;
+        if (src instanceof Path2D) { this.__ops = src.__ops.slice(); this.__start = src.__start; this.__last = src.__last; }
+        else if (typeof src === 'string') this.__svg(src);
+      }
+      __m() { return ID; }
+      __pt(x, y) { return apply(this.__m(), x, y); }
+      __ensure(x, y) { if (!this.__last) this.moveTo(x, y); }
+      moveTo(x, y) { if (!ok(x, y)) return; const p = this.__pt(x, y); this.__ops.push('M', r3(p[0]), r3(p[1])); this.__start = this.__last = p; }
+      lineTo(x, y) { if (!ok(x, y)) return; if (!this.__last) return this.moveTo(x, y); const p = this.__pt(x, y); this.__ops.push('L', r3(p[0]), r3(p[1])); this.__last = p; }
+      quadraticCurveTo(cx, cy, x, y) { if (!ok(cx, cy, x, y)) return; this.__ensure(cx, cy); const c = this.__pt(cx, cy), p = this.__pt(x, y); this.__ops.push('Q', r3(c[0]), r3(c[1]), r3(p[0]), r3(p[1])); this.__last = p; }
+      bezierCurveTo(ax, ay, bx, by, x, y) { if (!ok(ax, ay, bx, by, x, y)) return; this.__ensure(ax, ay); const a = this.__pt(ax, ay), b = this.__pt(bx, by), p = this.__pt(x, y); this.__ops.push('C', r3(a[0]), r3(a[1]), r3(b[0]), r3(b[1]), r3(p[0]), r3(p[1])); this.__last = p; }
+      closePath() { if (this.__last) { this.__ops.push('Z'); this.__last = this.__start; } }
+      rect(x, y, w, h) { if (!ok(x, y, w, h)) return; this.moveTo(x, y); this.lineTo(x + w, y); this.lineTo(x + w, y + h); this.lineTo(x, y + h); this.closePath(); }
+      roundRect(x, y, w, h, radii = 0) {
+        if (!ok(x, y, w, h)) return;
+        let rs = Array.isArray(radii) ? radii : [radii];
+        rs = rs.map(r => typeof r === 'object' && r ? +(r.x ?? 0) : +r);
+        const [tl, tr, br, bl] = rs.length === 1 ? [rs[0], rs[0], rs[0], rs[0]] : rs.length === 2 ? [rs[0], rs[1], rs[0], rs[1]] : rs.length === 3 ? [rs[0], rs[1], rs[2], rs[1]] : rs;
+        const k = Math.min(1, Math.abs(w) / ((tl + tr) || 1), Math.abs(w) / ((bl + br) || 1), Math.abs(h) / ((tl + bl) || 1), Math.abs(h) / ((tr + br) || 1));
+        const [a, b, c, d] = [tl * k, tr * k, br * k, bl * k];
+        this.moveTo(x + a, y); this.lineTo(x + w - b, y); if (b) this.ellipse(x + w - b, y + b, b, b, 0, -Math.PI / 2, 0);
+        this.lineTo(x + w, y + h - c); if (c) this.ellipse(x + w - c, y + h - c, c, c, 0, 0, Math.PI / 2);
+        this.lineTo(x + d, y + h); if (d) this.ellipse(x + d, y + h - d, d, d, 0, Math.PI / 2, Math.PI);
+        this.lineTo(x, y + a); if (a) this.ellipse(x + a, y + a, a, a, 0, Math.PI, Math.PI * 1.5);
+        this.closePath();
+      }
+      arc(x, y, r, a0, a1, ccw) { if (r < 0) throw new DOMException('negative radius', 'IndexSizeError'); this.ellipse(x, y, r, r, 0, a0, a1, ccw); }
+      ellipse(cx, cy, rx, ry, rot, a0, a1, ccw) {
+        if (!ok(cx, cy, rx, ry, rot, a0, a1)) return;
+        if (rx < 0 || ry < 0) throw new DOMException('negative radius', 'IndexSizeError');
+        const TAU = Math.PI * 2;
+        let sweep;
+        if (!ccw) sweep = a1 - a0 >= TAU ? TAU : (((a1 - a0) % TAU) + TAU) % TAU;
+        else sweep = a0 - a1 >= TAU ? -TAU : -((((a0 - a1) % TAU) + TAU) % TAU);
+        const cr = Math.cos(rot), sr = Math.sin(rot);
+        const at = t => { const px = rx * Math.cos(t), py = ry * Math.sin(t); return [cx + px * cr - py * sr, cy + px * sr + py * cr]; };
+        const d = t => { const px = -rx * Math.sin(t), py = ry * Math.cos(t); return [px * cr - py * sr, px * sr + py * cr]; };
+        const s = at(a0);
+        if (this.__last) this.lineTo(s[0], s[1]); else this.moveTo(s[0], s[1]);
+        const n = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 2) - 1e-9));
+        const step = sweep / n, k = 4 / 3 * Math.tan(step / 4);
+        for (let i = 0; i < n; i++) {
+          const t0 = a0 + i * step, t1 = t0 + step;
+          const p0 = at(t0), p1 = at(t1), d0 = d(t0), d1 = d(t1);
+          this.bezierCurveTo(p0[0] + k * d0[0], p0[1] + k * d0[1], p1[0] - k * d1[0], p1[1] - k * d1[1], p1[0], p1[1]);
+        }
+      }
+      arcTo(x1, y1, x2, y2, r) {
+        if (!ok(x1, y1, x2, y2, r)) return;
+        if (r < 0) throw new DOMException('negative radius', 'IndexSizeError');
+        if (!this.__last) return this.moveTo(x1, y1);
+        const inv = invert(this.__m()); if (!inv) return;
+        const [x0, y0] = apply(inv, this.__last[0], this.__last[1]);
+        const v1 = [x0 - x1, y0 - y1], v2 = [x2 - x1, y2 - y1];
+        const l1 = Math.hypot(...v1), l2 = Math.hypot(...v2);
+        const cross = v1[0] * v2[1] - v1[1] * v2[0];
+        if (!l1 || !l2 || !r || Math.abs(cross) < 1e-9) return this.lineTo(x1, y1);
+        const angle = Math.acos(Math.max(-1, Math.min(1, (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2))));
+        const dist = r / Math.tan(angle / 2);
+        const t1 = [x1 + v1[0] / l1 * dist, y1 + v1[1] / l1 * dist], t2 = [x1 + v2[0] / l2 * dist, y1 + v2[1] / l2 * dist];
+        const bis = [v1[0] / l1 + v2[0] / l2, v1[1] / l1 + v2[1] / l2], bl = Math.hypot(...bis);
+        const cd = r / Math.sin(angle / 2);
+        const c = [x1 + bis[0] / bl * cd, y1 + bis[1] / bl * cd];
+        const s = Math.atan2(t1[1] - c[1], t1[0] - c[0]), e = Math.atan2(t2[1] - c[1], t2[0] - c[0]);
+        this.lineTo(t1[0], t1[1]);
+        this.ellipse(c[0], c[1], r, r, 0, s, e, cross > 0);
+      }
+      addPath(path, m) {
+        if (!(path instanceof Path2D)) return;
+        const t = mul(this.__m(), matrixFrom(m));
+        const ops = path.__ops; let i = 0;
+        while (i < ops.length) {
+          const op = ops[i++];
+          const n = op === 'M' || op === 'L' ? 2 : op === 'Q' ? 4 : op === 'C' ? 6 : 0;
+          const pts = ops.slice(i, i + n); i += n;
+          this.__ops.push(op);
+          for (let j = 0; j < pts.length; j += 2) { const p = apply(t, pts[j], pts[j + 1]); this.__ops.push(r3(p[0]), r3(p[1])); if (j + 2 === pts.length) this.__last = p; }
+          if (op === 'M') this.__start = this.__last;
+        }
+      }
+      // the path in device space, its points mapped by `m`
+      __emit(m) {
+        if (!m || m.join() === ID.join()) return this.__ops.join(' ');
+        const out = []; let i = 0; const ops = this.__ops;
+        while (i < ops.length) {
+          const op = ops[i++]; out.push(op);
+          const n = op === 'M' || op === 'L' ? 2 : op === 'Q' ? 4 : op === 'C' ? 6 : 0;
+          for (let j = 0; j < n; j += 2) { const p = apply(m, ops[i + j], ops[i + j + 1]); out.push(r3(p[0]), r3(p[1])); }
+          i += n;
+        }
+        return out.join(' ');
+      }
+      // SVG path data (`new Path2D('M0 0 L10 10')`)
+      __svg(d) {
+        const toks = String(d).match(/[a-zA-Z]|-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/g) || [];
+        let i = 0, cmd = '', cx = 0, cy = 0, sx = 0, sy = 0, px = 0, py = 0, prev = '';
+        const n = () => +toks[i++];
+        while (i < toks.length) {
+          if (/[a-zA-Z]/.test(toks[i])) cmd = toks[i++];
+          const rel = cmd === cmd.toLowerCase() && cmd !== 'z' ? 1 : 0, C = cmd.toUpperCase();
+          const ox = rel ? cx : 0, oy = rel ? cy : 0;
+          if (C === 'M') { cx = n() + ox; cy = n() + oy; this.moveTo(cx, cy); sx = cx; sy = cy; cmd = rel ? 'l' : 'L'; }
+          else if (C === 'L') { cx = n() + ox; cy = n() + oy; this.lineTo(cx, cy); }
+          else if (C === 'H') { cx = n() + ox; this.lineTo(cx, cy); }
+          else if (C === 'V') { cy = n() + oy; this.lineTo(cx, cy); }
+          else if (C === 'C') { const a = n() + ox, b = n() + oy; px = n() + ox; py = n() + oy; cx = n() + ox; cy = n() + oy; this.bezierCurveTo(a, b, px, py, cx, cy); }
+          else if (C === 'S') { const a = /[CS]/.test(prev) ? 2 * cx - px : cx, b = /[CS]/.test(prev) ? 2 * cy - py : cy; px = n() + ox; py = n() + oy; cx = n() + ox; cy = n() + oy; this.bezierCurveTo(a, b, px, py, cx, cy); }
+          else if (C === 'Q') { px = n() + ox; py = n() + oy; cx = n() + ox; cy = n() + oy; this.quadraticCurveTo(px, py, cx, cy); }
+          else if (C === 'T') { px = /[QT]/.test(prev) ? 2 * cx - px : cx; py = /[QT]/.test(prev) ? 2 * cy - py : cy; cx = n() + ox; cy = n() + oy; this.quadraticCurveTo(px, py, cx, cy); }
+          else if (C === 'A') { n(); n(); n(); n(); n(); cx = n() + ox; cy = n() + oy; this.lineTo(cx, cy); }
+          else if (C === 'Z') { this.closePath(); cx = sx; cy = sy; }
+          else { i++; }
+          prev = C;
+          if (i < toks.length && C === 'Z' && !/[a-zA-Z]/.test(toks[i])) i++;
+        }
+      }
+    }
+    G.Path2D = Path2D;
+
+    class CanvasGradient {
+      constructor(kind, geo) { this.__kind = kind; this.__geo = geo; this.__stops = []; }
+      addColorStop(o, c) { o = num(o); if (!(o >= 0 && o <= 1)) throw new DOMException('offset out of range', 'IndexSizeError'); this.__stops.push([o, String(c)]); this.__stops.sort((a, b) => a[0] - b[0]); }
+    }
+    class CanvasPattern {
+      constructor(key, rep) { this.__key = key; this.__rep = rep || 'repeat'; this.__m = ID; }
+      setTransform(m) { this.__m = matrixFrom(m); }
+    }
+    G.CanvasGradient = CanvasGradient; G.CanvasPattern = CanvasPattern;
+    class TextMetrics {}
+    G.TextMetrics = TextMetrics;
+    class ImageData {
+      constructor(a, b, c) {
+        if (a instanceof Uint8ClampedArray) { this.data = a; this.width = b; this.height = c ?? (a.length / 4 / b); }
+        else { this.width = a >>> 0; this.height = b >>> 0; this.data = new Uint8ClampedArray(this.width * this.height * 4); }
+        this.colorSpace = 'srgb';
+      }
+    }
+    G.ImageData = ImageData;
+
+    const parseFont = f => {
+      const out = { size: 10, family: 'sans-serif', bold: false, italic: false };
+      const m = String(f).match(/^\s*((?:(?:italic|oblique|normal|bold|bolder|lighter|small-caps|\d{3})\s+)*)(\d*\.?\d+)(px|pt|em|rem|%)?(?:\s*\/\s*\S+)?\s+(.+)$/i);
+      if (!m) return null;
+      const pre = m[1].toLowerCase();
+      out.italic = /italic|oblique/.test(pre);
+      out.bold = /bold|bolder|[6-9]00/.test(pre);
+      const n = +m[2], unit = (m[3] || 'px').toLowerCase();
+      out.size = unit === 'pt' ? n * 4 / 3 : unit === 'em' || unit === 'rem' ? n * 16 : unit === '%' ? n * 0.16 : n;
+      out.family = m[4].trim();
+      return out;
+    };
+
+    // the key and natural size of something drawImage takes
+    const sourceOf = img => {
+      if (!img) return null;
+      if (img.__offscreen) img = img.__offscreen;
+      if (img.__bitmapKey) return { key: img.__bitmapKey, w: img.width, h: img.height };
+      if (img instanceof classes.Canvas) { img.__surface(); return { key: 'sepia-canvas:' + img.__sepiaNode, w: img.width, h: img.height }; }
+      if (img instanceof classes.Image) {
+        for (const key of [img.getAttribute('src'), img.src]) {
+          if (!key) continue;
+          const [w, h] = __cv_source_size(key).split(',').map(Number);
+          if (w > 0) return { key, w, h };
+        }
+        return null;
+      }
+      return null;
+    };
+
+    const defaults = () => ({
+      m: ID.slice(), fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10,
+      globalAlpha: 1, globalCompositeOperation: 'source-over', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic',
+      direction: 'ltr', dash: [], lineDashOffset: 0, clips: [], imageSmoothingEnabled: true, imageSmoothingQuality: 'low',
+      shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none', letterSpacing: '0px', wordSpacing: '0px',
+      fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto',
+    });
+
+    class CanvasRenderingContext2D {
+      constructor(canvas) {
+        Object.defineProperty(this, 'canvas', { value: canvas, enumerable: true });
+        this.__s = defaults(); this.__stack = []; this.__path = this.__newPath();
+      }
+      get __id() { return this.canvas.__sepiaNode; }
+      __newPath() { const p = new Path2D(); const ctx = this; p.__m = function () { return ctx.__s.m; }; return p; }
+      __paint(style) {
+        const s = this.__s, m = s.m.map(r3).join(',');
+        if (style instanceof CanvasGradient) {
+          const stops = style.__stops.map(([o, c]) => o + ',' + c).join('|');
+          return [(style.__kind === 'r' ? 'r:' : 'l:') + style.__geo.join(',') + ';' + stops, m];
+        }
+        if (style instanceof CanvasPattern) return ['p:' + style.__key + ';' + style.__rep, mul(s.m, style.__m).map(r3).join(',')];
+        return ['c:' + style, m];
+      }
+      __scale() { const m = this.__s.m; return Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])); }
+      __fillPath(path, rule, style, op) {
+        this.canvas.__surface();
+        const [spec, t] = this.__paint(style ?? this.__s.fillStyle);
+        __cv_fill(this.__id, path, rule === 'evenodd', spec, t, this.__s.globalAlpha, op ?? this.__s.globalCompositeOperation);
+      }
+      __strokePath(path) {
+        this.canvas.__surface();
+        const s = this.__s, k = this.__scale(), [spec, t] = this.__paint(s.strokeStyle);
+        __cv_stroke(this.__id, path, spec, t, s.globalAlpha, s.globalCompositeOperation, s.lineWidth * k, s.lineCap, s.lineJoin, s.miterLimit, s.dash.map(d => d * k).join(','), s.lineDashOffset * k);
+      }
+      __rect(x, y, w, h) { const p = new Path2D(); p.rect(x, y, w, h); return p.__emit(this.__s.m); }
+
+      // state
+      save() { const s = this.__s; this.__stack.push({ ...s, m: s.m.slice(), dash: s.dash.slice(), clips: s.clips.slice() }); }
+      restore() { const prev = this.__stack.pop(); if (!prev) return; const clipChanged = prev.clips.length !== this.__s.clips.length; this.__s = prev; if (clipChanged) this.__applyClip(); }
+      reset() { this.__s = defaults(); this.__stack = []; this.__path = this.__newPath(); this.canvas.__surface(true); }
+      isContextLost() { return false; }
+      getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; }
+      __applyClip() { this.canvas.__surface(); __cv_clip(this.__id, this.__s.clips.join('#')); }
+
+      // transforms
+      setTransform(a, b, c, d, e, f) { this.__s.m = arguments.length >= 6 ? [a, b, c, d, e, f].map(Number) : matrixFrom(a); }
+      getTransform() { return domMatrix(this.__s.m); }
+      resetTransform() { this.__s.m = ID.slice(); }
+      transform(a, b, c, d, e, f) { if (ok(a, b, c, d, e, f)) this.__s.m = mul(this.__s.m, [a, b, c, d, e, f].map(Number)); }
+      translate(x, y) { if (ok(x, y)) this.__s.m = mul(this.__s.m, [1, 0, 0, 1, +x, +y]); }
+      scale(x, y) { if (ok(x, y)) this.__s.m = mul(this.__s.m, [+x, 0, 0, +y, 0, 0]); }
+      rotate(a) { if (ok(a)) { const c = Math.cos(a), s = Math.sin(a); this.__s.m = mul(this.__s.m, [c, s, -s, c, 0, 0]); } }
+
+      // rectangles
+      fillRect(x, y, w, h) { if (ok(x, y, w, h) && w && h) this.__fillPath(this.__rect(x, y, w, h), 'nonzero'); }
+      strokeRect(x, y, w, h) { if (ok(x, y, w, h)) this.__strokePath(this.__rect(x, y, w, h)); }
+      clearRect(x, y, w, h) { if (ok(x, y, w, h) && w && h) this.__fillPath(this.__rect(x, y, w, h), 'nonzero', '#000', 'clear'); }
+
+      // paths
+      beginPath() { this.__path = this.__newPath(); }
+      closePath() { this.__path.closePath(); }
+      moveTo(x, y) { this.__path.moveTo(x, y); }
+      lineTo(x, y) { this.__path.lineTo(x, y); }
+      quadraticCurveTo(a, b, x, y) { this.__path.quadraticCurveTo(a, b, x, y); }
+      bezierCurveTo(a, b, c, d, x, y) { this.__path.bezierCurveTo(a, b, c, d, x, y); }
+      arc(...a) { this.__path.arc(...a); }
+      arcTo(...a) { this.__path.arcTo(...a); }
+      ellipse(...a) { this.__path.ellipse(...a); }
+      rect(...a) { this.__path.rect(...a); }
+      roundRect(...a) { this.__path.roundRect(...a); }
+      __pathArg(a) { return a instanceof Path2D ? [a.__emit(this.__s.m), arguments[1]] : [this.__path.__emit(), a]; }
+      fill(a, b) { const [p, rule] = a instanceof Path2D ? [a.__emit(this.__s.m), b] : [this.__path.__emit(), a]; if (p) this.__fillPath(p, rule || 'nonzero'); }
+      stroke(a) { const p = a instanceof Path2D ? a.__emit(this.__s.m) : this.__path.__emit(); if (p) this.__strokePath(p); }
+      clip(a, b) { const [p, rule] = a instanceof Path2D ? [a.__emit(this.__s.m), b] : [this.__path.__emit(), a]; this.__s.clips = [...this.__s.clips, (rule || 'nonzero') + ';' + p]; this.__applyClip(); }
+      isPointInPath() { return false; }
+      isPointInStroke() { return false; }
+      drawFocusIfNeeded() {}
+      scrollPathIntoView() {}
+
+      // styles
+      setLineDash(list) { if (Array.isArray(list) && list.every(v => Number.isFinite(+v) && +v >= 0)) this.__s.dash = list.map(Number); }
+      getLineDash() { const d = this.__s.dash; return d.length % 2 ? d.concat(d) : d.slice(); }
+      createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient('l', [x0, y0, x1, y1].map(Number)); }
+      createRadialGradient(x0, y0, r0, x1, y1, r1) { if (r0 < 0 || r1 < 0) throw new DOMException('negative radius', 'IndexSizeError'); return new CanvasGradient('r', [x0, y0, r0, x1, y1, r1].map(Number)); }
+      createConicGradient(a, x, y) { const r = 1000; return new CanvasGradient('l', [x - r * Math.cos(a), y - r * Math.sin(a), x + r * Math.cos(a), y + r * Math.sin(a)]); }
+      createPattern(img, rep) { const src = sourceOf(img); return src ? new CanvasPattern(src.key, rep || 'repeat') : null; }
+
+      // text
+      __font() { return parseFont(this.__s.font) || parseFont('10px sans-serif'); }
+      measureText(text) {
+        const f = this.__font(), w = __cv_measure(String(text), f.size, f.family, f.bold, f.italic);
+        const m = new TextMetrics();
+        Object.assign(m, { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: f.size * 0.72, actualBoundingBoxDescent: f.size * 0.2,
+          fontBoundingBoxAscent: f.size * 0.92, fontBoundingBoxDescent: f.size * 0.24, emHeightAscent: f.size * 0.8, emHeightDescent: f.size * 0.2, hangingBaseline: f.size * 0.64, alphabeticBaseline: 0, ideographicBaseline: -f.size * 0.2 });
+        return m;
+      }
+      __text(text, x, y, max, style) {
+        if (!ok(x, y)) return;
+        this.canvas.__surface();
+        const s = this.__s, f = this.__font(); text = String(text).replace(/[\t\n\f\r]/g, ' ');
+        let w = __cv_measure(text, f.size, f.family, f.bold, f.italic);
+        if (max !== undefined && Number.isFinite(+max) && w > +max) w = +max;
+        const align = s.textAlign === 'start' ? (s.direction === 'rtl' ? 'right' : 'left') : s.textAlign === 'end' ? (s.direction === 'rtl' ? 'left' : 'right') : s.textAlign;
+        const dx = align === 'center' ? -w / 2 : align === 'right' ? -w : 0;
+        const b = s.textBaseline, size = f.size;
+        const dy = b === 'top' ? size * 0.8 : b === 'hanging' ? size * 0.7 : b === 'middle' ? size * 0.3 : b === 'bottom' || b === 'ideographic' ? -size * 0.2 : 0;
+        const [spec] = this.__paint(style);
+        __cv_text(this.__id, text, +x + dx, +y + dy, size, f.family, f.bold, f.italic, max === undefined ? 0 : +max, spec, s.m.map(r3).join(','), s.globalAlpha, s.globalCompositeOperation);
+      }
+      fillText(text, x, y, max) { this.__text(text, x, y, max, this.__s.fillStyle); }
+      strokeText(text, x, y, max) { this.__text(text, x, y, max, this.__s.strokeStyle); }
+
+      // images
+      drawImage(img, ...a) {
+        const src = sourceOf(img);
+        if (!src || !src.w || !src.h) return;
+        let sx = 0, sy = 0, sw = src.w, sh = src.h, dx, dy, dw, dh;
+        if (a.length >= 8) [sx, sy, sw, sh, dx, dy, dw, dh] = a.map(Number);
+        else if (a.length >= 4) { [dx, dy, dw, dh] = a.map(Number); }
+        else { [dx, dy] = a.map(Number); dw = sw; dh = sh; }
+        if (!ok(sx, sy, sw, sh, dx, dy, dw, dh) || !sw || !sh || !dw || !dh) return;
+        this.canvas.__surface();
+        const kx = dw / sw, ky = dh / sh;
+        const t = mul(this.__s.m, [kx, 0, 0, ky, dx - sx * kx, dy - sy * ky]);
+        __cv_image(this.__id, src.key, sx, sy, sw, sh, t.map(r3).join(','), this.__s.globalAlpha, this.__s.globalCompositeOperation, this.__s.imageSmoothingEnabled);
+      }
+      createImageData(w, h) { if (w instanceof ImageData) return new ImageData(w.width, w.height); return new ImageData(Math.abs(w), Math.abs(h)); }
+      getImageData(x, y, w, h) {
+        w = Math.abs(w | 0); h = Math.abs(h | 0);
+        if (!w || !h) throw new DOMException('zero size', 'IndexSizeError');
+        this.canvas.__surface();
+        const str = __cv_get(this.__id, x | 0, y | 0, w, h);
+        const data = new Uint8ClampedArray(str.length);
+        for (let i = 0; i < str.length; i++) data[i] = str.charCodeAt(i);
+        return new ImageData(data, w, h);
+      }
+      putImageData(img, dx, dy, ...dirty) {
+        if (!img || !img.data) return;
+        this.canvas.__surface();
+        const d = img.data, parts = [];
+        for (let i = 0; i < d.length; i += 8192) parts.push(String.fromCharCode.apply(null, Array.prototype.slice.call(d, i, i + 8192)));
+        __cv_put(this.__id, parts.join(''), dx | 0, dy | 0, img.width, img.height);
+      }
+    }
+    for (const key of Object.keys(defaults())) {
+      if (key === 'm' || key === 'dash' || key === 'clips') continue;
+      Object.defineProperty(CanvasRenderingContext2D.prototype, key, {
+        get() { return this.__s[key]; },
+        set(v) {
+          if (key === 'fillStyle' || key === 'strokeStyle') { if (!(v instanceof CanvasGradient || v instanceof CanvasPattern)) { v = String(v); if (!CSS.supports || v === '') return; } }
+          else if (key === 'font') { if (!parseFont(v)) return; v = String(v); }
+          else if (key === 'globalAlpha') { v = +v; if (!(v >= 0 && v <= 1)) return; }
+          else if (key === 'lineWidth' || key === 'miterLimit') { v = +v; if (!(v > 0) || !Number.isFinite(v)) return; }
+          else if (typeof this.__s[key] === 'number') { v = +v; if (!Number.isFinite(v)) return; }
+          this.__s[key] = v;
+        },
+        configurable: true, enumerable: true,
+      });
+    }
+    G.CanvasRenderingContext2D = CanvasRenderingContext2D;
+    G.OffscreenCanvasRenderingContext2D = CanvasRenderingContext2D;
+
+    const C = classes.Canvas.prototype;
+    const dim = (name, fallback) => ({
+      get() { const v = parseInt(this.getAttribute(name), 10); return v >= 0 ? v : fallback; },
+      set(v) { this.setAttribute(name, String(Math.max(0, +v | 0))); if (this.__ctx2d || this.__made) { this.__surface(true); if (this.__ctx2d) { this.__ctx2d.__s = defaults(); this.__ctx2d.__stack = []; this.__ctx2d.__path = this.__ctx2d.__newPath(); } } },
+      configurable: true,
+    });
+    Object.defineProperty(C, 'width', dim('width', 300));
+    Object.defineProperty(C, 'height', dim('height', 150));
+    // the bitmap behind the canvas, made (or cleared) on demand
+    C.__surface = function (fresh) {
+      const size = this.width + 'x' + this.height;
+      if (fresh || this.__made !== size) { __cv_init(this.__sepiaNode, this.width, this.height); this.__made = size; }
+    };
+    C.getContext = function (type) {
+      type = String(type).toLowerCase();
+      if (type === '2d') { if (!this.__ctx2d) { this.__ctx2d = new CanvasRenderingContext2D(this); this.__surface(); } return this.__ctx2d; }
+      return null;
+    };
+    C.toDataURL = function () { this.__surface(); return 'data:image/png;base64,' + __cv_png(this.__sepiaNode); };
+    C.toBlob = function (cb) {
+      const url = this.toDataURL(), bin = atob(url.slice(url.indexOf(',') + 1)), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      setTimeout(() => cb(new G.Blob([bytes], { type: 'image/png' })), 0);
+    };
+    C.captureStream = function () { return null; };
+    C.transferControlToOffscreen = function () { const o = new OffscreenCanvas(this.width, this.height); o.__offscreen = this; return o; };
+
+    class OffscreenCanvas extends EventTarget {
+      constructor(w, h) { super(); this.__offscreen = document.createElement('canvas'); this.__offscreen.width = w; this.__offscreen.height = h; }
+      get width() { return this.__offscreen.width; } set width(v) { this.__offscreen.width = v; }
+      get height() { return this.__offscreen.height; } set height(v) { this.__offscreen.height = v; }
+      getContext(t) { return this.__offscreen.getContext(t); }
+      convertToBlob() { return new Promise(res => this.__offscreen.toBlob(res)); }
+      transferToImageBitmap() { return { width: this.width, height: this.height, __bitmapKey: 'sepia-canvas:' + this.__offscreen.__sepiaNode, close() {} }; }
+    }
+    G.OffscreenCanvas = OffscreenCanvas;
+    G.ImageBitmap = class ImageBitmap {};
+    G.createImageBitmap = function (src) {
+      const s = sourceOf(src);
+      if (s) return Promise.resolve(Object.assign(new G.ImageBitmap(), { width: s.w, height: s.h, __bitmapKey: s.key, close() {} }));
+      if (src instanceof ImageData) {
+        const c = document.createElement('canvas'); c.width = src.width; c.height = src.height; c.getContext('2d').putImageData(src, 0, 0);
+        return Promise.resolve(Object.assign(new G.ImageBitmap(), { width: src.width, height: src.height, __bitmapKey: 'sepia-canvas:' + c.__sepiaNode, close() {} }));
+      }
+      return Promise.reject(new DOMException('The source image could not be decoded.', 'InvalidStateError'));
+    };
+  }
 
   Object.assign(G, {
     window: G, self: G, top: G, parent: G, frames: G, globalThis: G,

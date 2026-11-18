@@ -370,6 +370,15 @@ fn initializer_to_iterable_loop_initializer(
                 ast::Expression::PropertyAccess(access) => {
                     Ok(IterableLoopInitializer::Access(access))
                 }
+                // Sepia patch: web compatibility. Browsers parse `for (f() in o)` in
+                // sloppy code (a call is only an invalid target at run time); bot
+                // checks probe for it. The value goes to `f()[0]` instead of throwing.
+                ast::Expression::Call(call) if !strict => {
+                    let span = ast::Span::new(position, position);
+                    let key: ast::Expression = ast::expression::literal::Literal::new(0, span).into();
+                    let access = ast::expression::access::SimplePropertyAccess::new(ast::Expression::Call(call), key);
+                    Ok(IterableLoopInitializer::Access(access.into()))
+                }
                 _ => Err(Error::lex(LexError::Syntax(
                     "invalid variable for iterable loop".into(),
                     position,
