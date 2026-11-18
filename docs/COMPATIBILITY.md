@@ -17,10 +17,18 @@
 | `Intl.RelativeTimeFormat` (английский, русский), `Intl.DisplayNames` | The Verge: «not a constructor» в React |
 | `navigator.serviceWorker`, `geolocation`, `mediaDevices` — объекты, как в браузерах; регистрация и доступ к устройствам отклоняются | The Verge: `'serviceWorker' in navigator` и затем `undefined.register` ронял всё приложение; 0 → 3065 текстовых узлов, сходство 0 → 28,8 |
 
+| `new Image()` / `img.src` из скрипта: картинка качается и декодируется в фоне, затем `load`/`error`; `complete`, `naturalWidth/Height`, `decode()`; такие картинки видны и в раскладке, и в `drawImage` | тестовая страница: 1200×900, `onload` → `drawImage` на canvas, битая ссылка → `onerror` |
+| Шорткат `font`: число без единицы — насыщенность, не размер (`font: 300 16px …` давал 300px) | The Verge: пункты меню с текстом высотой 300px |
+
+Три случайные выборки после блока: сид 42 — медиана 55,1 (MDN 39,5 против
+эталона с рекламным баннером сверху); сид 7 — 32,3 (The Verge 0 → 23,2);
+сид 3 — 21,6. Больше половины провалов — защита от автоматики: ebay, ozon,
+stackoverflow (403), reuters (401), google (429), wildberries (498), капчи
+yandex и amazon, проверка servicepipe у tass.
+
 Не решено: yandex.ru/search показывает капчу; tass — проверка servicepipe;
 stripe — прокси закрывает CONNECT; у The Verge огромные буквы «RE» в
-главном блоке; `new Image()` не загружает картинку (нет `onload`,
-`naturalWidth`) — `drawImage` рисует только картинки, уже загруженные страницей.
+главном блоке (исправлено: `font: 300 …`).
 
 ## 18 ноября, вечер: проверка на случайном вебе (`web-audit.py --count 10 --seed 42`)
 

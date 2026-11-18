@@ -1451,7 +1451,9 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                     "x-large" => Some(24.0),
                     _ => None,
                 };
-                if let Some(px) = keyword_size.or_else(|| if size.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '.') { parse_length(size, font_size, font_size) } else { None }) {
+                // a bare number is a weight (`font: 300 16px …`), never a size
+                let unitless = size.parse::<f32>().is_ok();
+                if let Some(px) = keyword_size.or_else(|| if !unitless && size.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '.') { parse_length(size, font_size, font_size) } else { None }) {
                     style.font_size = px.max(4.0);
                     if let Some(line) = line {
                         apply(style, "line-height", line, containing_width);
@@ -1908,6 +1910,19 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn font_shorthand_weight_is_not_a_size() {
+        let doc = parse_document("<p style='font: 300 18px/1.2 Arial'>x</p><b style='font: 700 1.5rem Arial'>y</b>");
+        let sheet = Stylesheet::default();
+        let p = doc.find_first("p").unwrap();
+        let s = compute(p, Some(&default_style("body")), &sheet, &[&doc], 800.0);
+        assert_eq!(s.font_size, 18.0);
+        let b = doc.find_first("b").unwrap();
+        let s = compute(b, Some(&default_style("body")), &sheet, &[&doc], 800.0);
+        assert_eq!(s.font_size, 24.0);
+        assert!(s.bold);
+    }
 
     #[test]
     fn grid_areas_require_rectangles_and_equal_row_lengths() {

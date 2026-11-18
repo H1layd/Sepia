@@ -437,6 +437,7 @@ struct State {
     http_cache_bytes: usize,
     /// requests a page's fetch()/XHR started, answered on background threads
     inflight: Vec<Inflight>,
+    image_loads: Vec<ImageLoad>,
     /// answers ready without a trip (from the page's cache), waiting to be handed over
     ready: Vec<(u32, Result<crate::net::Response, String>)>,
     next_request: u32,
@@ -530,6 +531,14 @@ fn socket_thread(url: Url, page: Url, protocols: Vec<String>, net: (Chain, Optio
 }
 
 /// One request in flight: its id, whether its answer may be kept, and where it arrives.
+/// An image a script asked for (`img.src = …`), fetched and decoded off-thread.
+struct ImageLoad {
+    id: u32,
+    /// the src as written, and resolved
+    keys: (String, String),
+    rx: std::sync::mpsc::Receiver<Option<crate::images::Bitmap>>,
+}
+
 struct Inflight {
     id: u32,
     url: Url,
@@ -662,6 +671,13 @@ pub fn image_for(key: &str) -> Option<std::sync::Arc<crate::images::Bitmap>> {
 thread_local! {
     /// images scripts loaded themselves (`new Image()`), by URL
     static SCRIPT_IMAGES: RefCell<ImageMap> = RefCell::new(ImageMap::new());
+    /// script images not yet handed to layout
+    static NEW_SCRIPT_IMAGES: RefCell<Vec<(String, std::sync::Arc<crate::images::Bitmap>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Images scripts loaded since the last call, for layout.
+fn take_script_images() -> Vec<(String, std::sync::Arc<crate::images::Bitmap>)> {
+    NEW_SCRIPT_IMAGES.with(|n| std::mem::take(&mut *n.borrow_mut()))
 }
 
 fn arg_num(args: &[JsValue], i: usize, ctx: &mut Context) -> f32 {
@@ -1567,8 +1583,63 @@ fn register(ctx: &mut Context) {
         });
         Ok(id.map(JsValue::from).unwrap_or_else(JsValue::null))
     });
+    // an image for a script (img.src): fetched and decoded in the background -> id
+    // (its answer comes through __fetch_poll as [id, 200, "w,h", url] or [id, null, error])
+    native!(ctx, "__image_start", 1, |_, a, ctx| {
+        let raw = arg_str(a, 0, ctx)?;
+        let id = with(|st| -> Option<u32> {
+            let base = st.url.clone().or_else(|| st.net.as_ref().map(|n| n.origin.clone()));
+            let resolved = base.as_ref().and_then(|b| b.resolve(&raw)).map(|u| u.to_string()).unwrap_or_else(|| raw.clone());
+            st.next_request += 1;
+            let id = st.next_request;
+            let (tx, rx) = std::sync::mpsc::channel();
+            if raw.trim_start().starts_with("data:") {
+                let _ = tx.send(crate::images::decode_data_uri(raw.trim()));
+            } else {
+                let net = st.net.as_ref()?;
+                let url = Url::parse(&resolved).filter(|u| matches!(u.scheme.as_str(), "http" | "https"))?;
+                let site = crate::cookies::site_of(&net.origin.host);
+                let (chain, resolver, timeout) = (net.chain.clone(), net.resolver.clone(), net.timeout);
+                std::thread::spawn(move || {
+                    let r = fetch_in(&url, &chain, resolver.as_ref(), timeout, &PageRequest::get(&site));
+                    let bitmap = r.ok().filter(|r| r.status < 400).and_then(|r| crate::images::decode(&r.body));
+                    let _ = tx.send(bitmap);
+                });
+            }
+            st.image_loads.push(ImageLoad { id, keys: (raw.clone(), resolved), rx });
+            Some(id)
+        });
+        Ok(id.map(JsValue::from).unwrap_or_else(JsValue::null))
+    });
     // answers that arrived: [[id, status, text, url, headers], ...] or [id, null, error]
     native!(ctx, "__fetch_poll", 0, |_, _, ctx| {
+        let mut images_done: Vec<JsValue> = Vec::new();
+        let loads = with(|st| std::mem::take(&mut st.image_loads));
+        let mut waiting = Vec::new();
+        for load in loads {
+            match load.rx.try_recv() {
+                Ok(Some(bitmap)) => {
+                    let (w, h) = bitmap.natural_size();
+                    let bitmap = std::sync::Arc::new(bitmap);
+                    SCRIPT_IMAGES.with(|m| {
+                        let mut m = m.borrow_mut();
+                        m.insert(load.keys.0.clone(), bitmap.clone());
+                        m.insert(load.keys.1.clone(), bitmap.clone());
+                    });
+                    NEW_SCRIPT_IMAGES.with(|n| {
+                        let mut n = n.borrow_mut();
+                        n.push((load.keys.0.clone(), bitmap.clone()));
+                        n.push((load.keys.1.clone(), bitmap));
+                    });
+                    images_done.push(JsArray::from_iter([JsValue::from(load.id), JsValue::from(200), s(format!("{},{}", w.round(), h.round())), s(load.keys.1.clone()), s("")], ctx).into());
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    images_done.push(JsArray::from_iter([JsValue::from(load.id), JsValue::null(), s("image failed")], ctx).into());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => waiting.push(load),
+            }
+        }
+        with(|st| st.image_loads.extend(waiting));
         let done: Vec<(u32, Result<crate::net::Response, String>)> = with(|st| {
             let mut done = std::mem::take(&mut st.ready);
             let mut still = Vec::new();
@@ -1609,6 +1680,7 @@ fn register(ctx: &mut Context) {
             };
             rows.push(JsValue::from(row));
         }
+        rows.extend(images_done);
         Ok(JsArray::from_iter(rows, ctx).into())
     });
     native!(ctx, "__fetch", 5, |_, a, ctx| {
@@ -2540,7 +2612,8 @@ impl Session {
 
     pub fn layout(&self, fonts: &Fonts) -> Page {
         // what scripts drew on canvases since the last layout
-        let drawn = crate::canvas2d::take_dirty();
+        let mut drawn = crate::canvas2d::take_dirty();
+        drawn.extend(take_script_images());
         if !drawn.is_empty() {
             self.images.borrow_mut().extend(drawn);
         }
@@ -2712,11 +2785,11 @@ impl Session {
 
     /// Requests the page started that have not been answered and handed over yet.
     pub fn network_busy(&self) -> bool {
-        with(|st| !st.inflight.is_empty() || !st.ready.is_empty())
+        with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.image_loads.is_empty())
     }
 
     pub fn next_timer_delay(&mut self) -> Option<Duration> {
-        let waiting = with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.sockets.is_empty());
+        let waiting = with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.sockets.is_empty() || !st.image_loads.is_empty());
         let delay = self.ctx.eval(Source::from_bytes("__sepia_next_timer()")).ok().and_then(|v| v.as_number());
         let timer = delay.filter(|d| d.is_finite() && *d >= 0.0).map(|d| Duration::from_secs_f64((d / 1000.0).clamp(0.001, 86_400.0)));
         // requests in flight: look again soon (their answers are events too)

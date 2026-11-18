@@ -451,6 +451,7 @@
       const old = watch ? this.getAttribute(n) : null;
       __dom_set_attr(this.__sepiaNode, n, String(v));
       if (watch) this.attributeChangedCallback(n, old, String(v));
+      if (n === 'src' && this.__sepiaImgLoad) this.__sepiaImgLoad();
     }
     removeAttribute(n) { __dom_remove_attr(this.__sepiaNode, String(n)); }
     hasAttribute(n) { return __dom_get_attr(this.__sepiaNode, String(n)) !== null; }
@@ -2733,6 +2734,54 @@
   Response.prototype.arrayBuffer = function () { return Promise.resolve(new G.TextEncoder().encode(this.__body).buffer); };
   Response.prototype.blob = function () { return Promise.resolve(new G.Blob([this.__body], { type: this.headers.get('content-type') || '' })); };
   Response.prototype.bodyUsed = false;
+  // ----- <img> loading from scripts: fetched and decoded natively, then load/error
+  {
+    const I = classes.Image.prototype;
+    const knownSize = el => {
+      for (const key of [el.getAttribute('src'), el.src]) {
+        if (!key) continue;
+        const [w, h] = __cv_source_size(key).split(',').map(Number);
+        if (w > 0) return [w, h];
+      }
+      return null;
+    };
+    const fire = (el, type) => { try { el.dispatchEvent(new Event(type)); } catch (e) {} for (const f of el.__sepiaDecoders || []) f(type === 'load'); el.__sepiaDecoders = []; };
+    I.__sepiaImgLoad = function () {
+      const el = this, src = el.getAttribute('src'), token = (el.__sepiaToken = (el.__sepiaToken || 0) + 1);
+      el.__sepiaNatural = null; el.__sepiaDone = false;
+      if (!src || !src.trim()) { el.__sepiaDone = true; return; }
+      const known = knownSize(el);
+      if (known) { el.__sepiaNatural = known; setTimeout(() => { if (el.__sepiaToken === token) { el.__sepiaDone = true; fire(el, 'load'); } }, 0); return; }
+      let id = null;
+      try { id = __image_start(src); } catch (e) {}
+      if (id === null) { setTimeout(() => { if (el.__sepiaToken === token) { el.__sepiaDone = true; fire(el, 'error'); } }, 0); return; }
+      G.__sepia_await(id, row => {
+        if (el.__sepiaToken !== token) return;
+        el.__sepiaDone = true;
+        if (row[1] === null) { fire(el, 'error'); return; }
+        el.__sepiaNatural = String(row[2]).split(',').map(Number);
+        fire(el, 'load');
+      });
+    };
+    const natural = el => el.__sepiaNatural || knownSize(el) || [0, 0];
+    Object.defineProperty(I, 'complete', { get() { return !this.getAttribute('src') || this.__sepiaDone === true || (this.__sepiaToken === undefined && !!knownSize(this)) || (this.__sepiaToken === undefined); }, configurable: true });
+    Object.defineProperty(I, 'naturalWidth', { get() { return natural(this)[0]; }, configurable: true });
+    Object.defineProperty(I, 'naturalHeight', { get() { return natural(this)[1]; }, configurable: true });
+    Object.defineProperty(I, 'currentSrc', { get() { return this.getAttribute('src') ? this.src : ''; }, configurable: true });
+    for (const [name, i] of [['width', 0], ['height', 1]]) {
+      Object.defineProperty(I, name, {
+        get() { const a = parseInt(this.getAttribute(name), 10); if (a >= 0) return a; const r = this.getBoundingClientRect(); return Math.round(r[name]) || natural(this)[i]; },
+        set(v) { this.setAttribute(name, String(v >>> 0)); },
+        configurable: true,
+      });
+    }
+    I.decode = function () {
+      if (this.complete && natural(this)[0] > 0) return Promise.resolve();
+      if (this.complete) return Promise.reject(new DOMException('The source image cannot be decoded.', 'EncodingError'));
+      return new Promise((ok, fail) => { (this.__sepiaDecoders ||= []).push(good => good ? ok() : fail(new DOMException('The source image cannot be decoded.', 'EncodingError'))); });
+    };
+  }
+
   // ----- <canvas> 2D (drawn natively by canvas2d.rs) ---------------------------
   {
     const ID = [1, 0, 0, 1, 0, 0];
