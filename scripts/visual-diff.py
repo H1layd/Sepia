@@ -25,17 +25,34 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image
 
+def system_prefers_dark() -> bool:
+    """Наш движок следует системной теме; эталон должен делать то же."""
+    import subprocess as _sp
+    try:
+        out = _sp.run(["/usr/bin/defaults", "read", "-g", "AppleInterfaceStyle"],
+                      capture_output=True, text=True, timeout=5)
+        return out.stdout.strip().lower() == "dark"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 DEFAULT_OURS = Path("browser/target/release/sepia-browser")
 DEFAULT_CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 
 
 def capture_ours(binary: Path, url: str, width: int, height: int, out: Path, timeout: int,
-                 country: str = "", reference_path: Optional[Path] = None) -> Dict:
+                 country: str = "", color_scheme: str = "") -> Dict:
     started = time.monotonic()
     extra = ["--country", country] if country else []
+    if color_scheme:
+        extra += ["--color-scheme", color_scheme] if False else []
+        import os
+        env = dict(os.environ, SEPIA_COLOR_SCHEME=color_scheme)
+    else:
+        env = None
     result = subprocess.run(
         [str(binary), "--url", url, "--dump", str(out), "--width", str(width), "--height", str(height)] + extra,
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
     return {
         "ok": result.returncode == 0 and out.exists(),
@@ -45,7 +62,8 @@ def capture_ours(binary: Path, url: str, width: int, height: int, out: Path, tim
     }
 
 
-def capture_reference(chrome: Path, url: str, width: int, height: int, out: Path, wait_ms: int) -> Dict:
+def capture_reference(chrome: Path, url: str, width: int, height: int, out: Path, wait_ms: int,
+                      dark: bool = False) -> Dict:
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="sepia-ref-") as profile:
         command = [
@@ -59,9 +77,9 @@ def capture_reference(chrome: Path, url: str, width: int, height: int, out: Path
             "--force-device-scale-factor=1",
             f"--window-size={width},{height}",
             f"--virtual-time-budget={wait_ms}",
-            f"--screenshot={out}",
-            url,
         ]
+        command.append(f"--screenshot={out}")
+        command.append(url)
         result = subprocess.run(command, capture_output=True, text=True, timeout=wait_ms / 1000.0 + 60)
     return {
         "ok": result.returncode == 0 and out.exists(),
@@ -196,15 +214,20 @@ def compare(url: str, width: int, height: int, outdir: Path, ours_bin: Path, chr
     ours_path = outdir / "ours.png"
     ref_path = outdir / "reference.png"
 
-    ours_info = capture_ours(ours_bin, url, width, height, ours_path, timeout=120, country=country)
+    # эталон headless-Chrome всегда в светлой теме (флага нет), поэтому и наш
+    # рендер снимаем в светлой — иначе сравниваем тёмное со светлым
+    ours_info = capture_ours(ours_bin, url, width, height, ours_path, timeout=120,
+                             country=country, color_scheme="light")
     if reference_path is not None:
-        ref_info = {"ok": reference_path.exists(), "ms": 0,
-                    "stderr": "" if reference_path.exists() else f"нет файла {reference_path}"}
-        if ref_info["ok"]:
-            import shutil
+        # закреплённый эталон: честнее свежего Chrome (баннеры, лимиты, темы)
+        import shutil
+        ok = reference_path.exists()
+        if ok:
             shutil.copy(reference_path, ref_path)
+        ref_info = {"ok": ok, "ms": 0, "stderr": "" if ok else f"нет файла {reference_path}"}
     else:
-        ref_info = capture_reference(chrome, url, width, height, ref_path, wait_ms)
+        ref_info = capture_reference(chrome, url, width, height, ref_path, wait_ms,
+                                     dark=system_prefers_dark())
     stats: Dict = {"url": url, "width": width, "height": height,
                    "ours": {"ok": ours_info["ok"], "ms": ours_info["ms"]},
                    "reference": {"ok": ref_info["ok"], "ms": ref_info["ms"]}}
