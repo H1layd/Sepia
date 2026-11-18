@@ -47,6 +47,7 @@ class Scenario:
     max_ms: int = 15_000        # бюджет загрузки и вёрстки
     must_contain: List[str] = field(default_factory=list)
     click: Optional[tuple] = None   # (x, y) и куда должно привести
+    click_link: str = ""            # найти ссылку с этим href и кликнуть по центру
     click_expect: str = ""
     # визуальная проверка по PNG: сколько пикселей отличается от фона
     min_ink: float = 0.004      # 0.4%: страница не пустая
@@ -74,7 +75,8 @@ SCENARIOS: List[Scenario] = [
              min_text=200, min_links=50, max_ms=25_000, tags=["spa"]),
     Scenario("selfclick", "https://en.wikipedia.org/wiki/Web_browser",
              min_text=1500, min_links=300, max_ms=20_000,
-             click=(470, 497), click_expect="Application_software",
+             # клик по тексту ссылки, а не по заученной точке: раскладка меняется
+             click_link="Application_software", click_expect="Application_software",
              tags=["interaction"]),
 ]
 
@@ -162,6 +164,21 @@ def run_scenario(binary: Path, scenario: Scenario, outdir: Path) -> Dict[str, An
     elapsed = 0
     fields: Dict[str, Any] = {}
     stdout = ""
+
+    if scenario.click_link:
+        listing, _, lcode, _ = _run(binary, base + ["--click", "-1,-1", "--text"],
+                                    scenario.max_ms / 1000.0 + 30)
+        boxes = re.findall(r"link (\d+),(\d+) (\d+)x(\d+) (\S+)", listing)
+        target = next((b for b in boxes if scenario.click_link in b[4]), None)
+        if target is None:
+            checks.append(Check("клик", False, f"ссылка «{scenario.click_link}» не найдена среди {len(boxes)}", critical=True))
+            elapsed = 0
+            fields = {}
+            stdout = listing
+        else:
+            x0, y0, w, h = (int(v) for v in target[:4])
+            scenario.click = (x0 + w // 2, y0 + h // 2)
+            checks.append(Check("координаты", True, f"центр ссылки {scenario.click} из {len(boxes)} ссылок"))
 
     if scenario.click:
         x, y = scenario.click
