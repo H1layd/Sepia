@@ -716,6 +716,13 @@ pub fn natural_size(svg: &Node) -> (f32, f32) {
 /// Render an `<svg>` element to a bitmap of `width`×`height` device pixels.
 /// `current` is what `currentColor` means (the text colour around it).
 pub fn render_node(svg: &Node, width: usize, height: usize, current: Color) -> Bitmap {
+    render_node_styled(svg, width, height, current, None, None)
+}
+
+/// `render_node` with the CSS `fill` / `stroke` the `<svg>` element got from
+/// the page's stylesheet (octicons: `.octicon { fill: currentColor }`): they
+/// replace the SVG defaults; attributes inside still win.
+pub fn render_node_styled(svg: &Node, width: usize, height: usize, current: Color, fill: Option<Option<Color>>, stroke: Option<Option<Color>>) -> Bitmap {
     let (width, height) = (width.clamp(1, 2048), height.clamp(1, 2048));
     let mut renderer = Renderer { canvas: Canvas { w: width, h: height, px: vec![[0.0; 4]; width * height] }, root: svg };
     let view = match viewbox(svg) {
@@ -730,8 +737,8 @@ pub fn render_node(svg: &Node, width: usize, height: usize, current: Color) -> B
         }
     };
     let paint = Paint {
-        fill: Some(Color::BLACK),
-        stroke: None,
+        fill: fill.unwrap_or(Some(Color::BLACK)),
+        stroke: stroke.unwrap_or(None),
         stroke_width: 1.0,
         even_odd: false,
         opacity: 1.0,

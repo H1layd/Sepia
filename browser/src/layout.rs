@@ -464,7 +464,7 @@ impl<'a> Layout<'a> {
             style.width = Some((containing_width - style.margin.horizontal()).max(1.0));
             style.border_box = true;
         }
-        if self.blockify == Some(node as *const Node) && matches!(style.display, Display::Inline | Display::InlineBlock) && node.tag != "img" && !matches!(node.tag.as_str(), "input" | "select" | "textarea") {
+        if self.blockify == Some(node as *const Node) && matches!(style.display, Display::Inline | Display::InlineBlock) && !matches!(node.tag.as_str(), "img" | "svg" | "input" | "select" | "textarea") {
             style.display = match (style.display, style.inner) {
                 (Display::InlineBlock, Inner::Flex) => Display::Flex,
                 (Display::InlineBlock, Inner::Grid) => Display::Grid,
@@ -880,7 +880,8 @@ impl<'a> Layout<'a> {
             self.place_out_of_flow(node, ancestors, &style, x, y);
             return;
         }
-        if style.display == Display::InlineBlock && node.tag != "img" {
+        // img and svg are replaced elements whatever their display says
+        if style.display == Display::InlineBlock && !matches!(node.tag.as_str(), "img" | "svg") {
             let mut node_ancestors: Vec<&Node> = ancestors.to_vec();
             node_ancestors.push(node);
             if let Some((page, baseline, w, h)) = self.make_atom(node, &node_ancestors, &style) {
@@ -914,7 +915,7 @@ impl<'a> Layout<'a> {
                     return;
                 }
                 let scale = 3.0f32.min(1024.0 / w.max(h));
-                let mut bitmap = crate::svg::render_node(node, (w * scale).round() as usize, (h * scale).round() as usize, style.color);
+                let mut bitmap = crate::svg::render_node_styled(node, (w * scale).round() as usize, (h * scale).round() as usize, style.color, style.svg_fill, style.svg_stroke);
                 bitmap.natural = Some((w, h));
                 items.push(InlineItem {
                     text: String::new(),
@@ -2197,6 +2198,33 @@ impl<'a> Layout<'a> {
         self.page.text.extend(page.text);
     }
 
+    /// The children a flex or grid container lays out: its own, with each
+    /// `display: contents` child replaced by that child's children (which keep
+    /// it as their ancestor and inherit from it). None when there is none.
+    fn contents_children<'n>(&self, node: &'n Node, ancestors: &[&'n Node], style: &Style, width: f32) -> Option<Vec<(&'n Node, Vec<&'n Node>, Style)>> {
+        let any = node.children.iter().any(|c| c.text.is_none() && compute(c, Some(style), self.sheet, ancestors, width).contents);
+        if !any {
+            return None;
+        }
+        let mut out = Vec::new();
+        fn walk<'n>(layout: &Layout, node: &'n Node, ancestors: &[&'n Node], style: &Style, width: f32, out: &mut Vec<(&'n Node, Vec<&'n Node>, Style)>, depth: usize) {
+            for child in &node.children {
+                if child.text.is_none() && depth < 32 {
+                    let s = compute(child, Some(style), layout.sheet, ancestors, width);
+                    if s.contents && s.display != Display::None {
+                        let mut chain = ancestors.to_vec();
+                        chain.push(child);
+                        walk(layout, child, &chain, &s, width, out, depth + 1);
+                        continue;
+                    }
+                }
+                out.push((child, ancestors.to_vec(), style.clone()));
+            }
+        }
+        walk(self, node, ancestors, style, width, &mut out, 0);
+        Some(out)
+    }
+
     /// The flexbox subset: `flex-direction`, `flex-wrap`, `justify-content`,
     /// `align-items`, `gap`, `flex-grow` / `flex-shrink` / `flex-basis`.
     /// Items are measured (max- and min-content), sized along the main axis,
@@ -2602,6 +2630,8 @@ impl<'a> Layout<'a> {
         // items and their places
         struct GridItem<'n> {
             node: &'n Node,
+            /// for a child of a `display: contents` element: its ancestors and parent style
+            via: Option<(Vec<&'n Node>, Style)>,
             row: usize,
             col: usize,
             span: usize,
@@ -2612,17 +2642,23 @@ impl<'a> Layout<'a> {
         }
         let mut items: Vec<GridItem> = Vec::new();
         let (mut row, mut col) = (0usize, 0usize);
-        for child in &node.children {
+        let expanded = self.contents_children(node, ancestors, style, width);
+        let entries: Vec<(&Node, Option<(Vec<&Node>, Style)>)> = match expanded {
+            Some(list) => list.into_iter().map(|(n, chain, parent)| (n, Some((chain, parent)))).collect(),
+            None => node.children.iter().map(|c| (c, None)).collect(),
+        };
+        for (child, via) in entries {
+            let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
             let (span, margin, align, area) = match &child.text {
                 Some(t) if t.trim().is_empty() => continue,
                 Some(_) => (1, (0.0, 0.0), style.flex.align, None),
                 None => {
-                    let s = compute(child, Some(style), self.sheet, ancestors, width);
+                    let s = compute(child, Some(parent), self.sheet, anc, width);
                     if s.display == Display::None {
                         continue;
                     }
                     if out_of_flow(&s) {
-                        self.place_out_of_flow(child, ancestors, &s, x, y);
+                        self.place_out_of_flow(child, anc, &s, x, y);
                         continue;
                     }
                     let span = match s.grid_span {
@@ -2633,7 +2669,7 @@ impl<'a> Layout<'a> {
                     (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align), s.grid_area)
                 }
             };
-            items.push(GridItem { node: child, row: 0, col: 0, span, row_span: 1, area, margin, align });
+            items.push(GridItem { node: child, via, row: 0, col: 0, span, row_span: 1, area, margin, align });
         }
         if items.is_empty() {
             return 0.0;
@@ -2668,8 +2704,9 @@ impl<'a> Layout<'a> {
         let mut auto_min = vec![0.0f32; columns];
         for item in items.iter().filter(|i| i.span == 1) {
             if matches!(tracks[item.col], Track::Auto | Track::MinMax(_, MaxTrack::Auto)) {
-                let (wide, _) = self.item_page(item.node, ancestors, style, 100_000.0, true);
-                let (narrow, _) = self.item_page(item.node, ancestors, style, 1.0, true);
+                let (anc, parent) = match &item.via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
+                let (wide, _) = self.item_page(item.node, anc, parent, 100_000.0, true);
+                let (narrow, _) = self.item_page(item.node, anc, parent, 1.0, true);
                 auto_need[item.col] = auto_need[item.col].max(self.extent(&wide));
                 auto_min[item.col] = auto_min[item.col].max(self.extent(&narrow));
             }
@@ -2747,7 +2784,8 @@ impl<'a> Layout<'a> {
         let mut row_h = vec![0.0f32; rows];
         for item in &items {
             let w = col_x[item.col + item.span] - col_x[item.col] - col_gap;
-            let (page, h) = self.item_page(item.node, ancestors, style, w.max(1.0), false);
+            let (anc, parent) = match &item.via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
+            let (page, h) = self.item_page(item.node, anc, parent, w.max(1.0), false);
             if item.row_span == 1 { row_h[item.row] = row_h[item.row].max(h); }
             laid.push((page, h));
         }
@@ -3100,6 +3138,16 @@ mod tests {
         let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
         let xs: Vec<f32> = page.draws.iter().filter_map(|d| match d { Draw::Text { x, text, .. } if !text.contains("text") => Some(*x), _ => None }).collect();
         assert!(xs.iter().all(|x| *x > 650.0), "caption lines start at {xs:?}");
+    }
+
+    #[test]
+    fn svg_icons_with_a_display_stay_pictures() {
+        let fonts = fonts();
+        let doc = parse_document("<head><style>.i{display:inline-block;fill:currentColor} b{display:flex}</style></head><body><b><svg class=i viewBox='0 0 16 16' width=16 height=16><circle cx=8 cy=8 r=7></circle></svg>x</b><p><svg class=i viewBox='0 0 16 16' width=20 height=20><circle cx=8 cy=8 r=7></circle></svg></p></body>");
+        let sheet = crate::css::Stylesheet::parse(".i{display:inline-block;fill:currentColor} b{display:flex}");
+        let page = Layout::new(&fonts, &sheet, 400.0).build(&doc);
+        let pictures = page.draws.iter().filter(|d| matches!(d, Draw::Image { rect, .. } if rect.w >= 15.0)).count();
+        assert_eq!(pictures, 2, "both icons drawn as pictures");
     }
 
     #[test]

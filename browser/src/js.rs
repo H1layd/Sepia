@@ -3213,6 +3213,19 @@ mod tests {
     }
 
     #[test]
+    fn handler_attributes_run_like_listeners() {
+        let mut s = run(
+            "<html><body onload=\"document.getElementById('o').textContent += 'load '\"><div onclick=\"document.getElementById('o').textContent += 'div '\"><a id=a href='/x' onclick=\"document.getElementById('o').textContent += 'a '; return false\">go</a></div><p id=o></p></body></html>",
+            "",
+        );
+        let a = s.tree();
+        let id: usize = find_id(&a, "a").unwrap().attr("data-sepia-id").unwrap().parse().unwrap();
+        let outcome = s.handle(PageEvent::Click { node: id, href: Some("/x".into()) }, &Fonts::load());
+        assert!(text(&s).ends_with("load a div "), "{} {:?}", text(&s), s.log());
+        assert!(outcome.navigate.is_none(), "return false cancels the link");
+    }
+
+    #[test]
     fn history_entries_walk_back_with_popstate() {
         let mut s = run(
             "<p id=o></p>",

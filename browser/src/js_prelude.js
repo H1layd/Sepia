@@ -120,6 +120,37 @@
   const eventClass = (name, Base, fields) => { G[name] = { [name]: class extends Base { constructor(t, i = {}) { super(t, i); for (const [k, d] of Object.entries(fields)) this[k] = i[k] ?? (typeof d === 'function' ? d() : d); } } }[name]; };
   class SubmitEvent extends Event { constructor(t, i = {}) { super(t, i); this.submitter = i.submitter ?? null; } }
 
+  // HTML event handler attributes: compiled once per element, attribute text
+  // and type; body's window events (load, resize, popstate…) belong to the window
+  const handlerCache = new WeakMap();
+  const bodyWindowEvents = new Set(['load', 'unload', 'beforeunload', 'pagehide', 'pageshow', 'resize', 'hashchange', 'popstate', 'message', 'online', 'offline', 'storage', 'focus', 'blur', 'error']);
+  function attributeHandler(target, type) {
+    let el = target;
+    if (target === G) {
+      if (!bodyWindowEvents.has(type)) return null;
+      el = typeof document !== 'undefined' && document.body;
+    }
+    if (!el || typeof el.getAttribute !== 'function' || el.__sepiaNode === undefined) return null;
+    const code = el.getAttribute('on' + type);
+    if (!code) return null;
+    let byType = handlerCache.get(el);
+    if (!byType) { byType = new Map(); handlerCache.set(el, byType); }
+    const hit = byType.get(type);
+    if (hit && hit.code === code) return hit.fn;
+    let fn;
+    try {
+      const form = el.closest && el.closest('form');
+      // the handler's scope: the element, its form, the document (as browsers do)
+      fn = Function('event', '__el', '__form', `with (document) { with (__form || {}) { with (__el) { return (function (event) { ${code}\n }).call(this, event); } } }`);
+      const bound = function (event) { return fn.call(this, event, el, form); };
+      byType.set(type, { code, fn: bound });
+      return bound;
+    } catch (err) {
+      log('handler attribute on' + type, String(err));
+      byType.set(type, { code, fn: null });
+      return null;
+    }
+  }
   class EventTarget {
     constructor() { Object.defineProperty(this, '__l', { value: {}, writable: true }); }
     // objects made without the constructor (Object.create(EventTarget.prototype)) get theirs on first use
@@ -148,12 +179,15 @@
     }
     __fire(e) {
       e.currentTarget = this;
-      const handler = this['on' + e.type];
+      let handler = this['on' + e.type];
+      // a handler written as an HTML attribute (<a onclick="…">, <body onload="…">)
+      if (typeof handler !== 'function') handler = attributeHandler(this, e.type);
       const list = (this.__l[e.type] || []).slice();
       if (typeof handler === 'function') list.unshift({ fn: handler });
       for (const l of list) {
         try {
-          if (typeof l.fn === 'function') l.fn.call(this, e); else if (l.fn && l.fn.handleEvent) l.fn.handleEvent(e);
+          if (typeof l.fn === 'function') { const r = l.fn.call(this, e); if (l.fn === handler && r === false && e.cancelable !== false) e.preventDefault(); }
+          else if (l.fn && l.fn.handleEvent) l.fn.handleEvent(e);
         } catch (err) { log('listener error:', String(err), String(err && err.stack || '')); }
         if (l.once) this.removeEventListener(e.type, l.fn);
         if (e.__stopNow) break;
@@ -2689,19 +2723,9 @@
     if (!el) { if (href) __page_navigate(href); return; }
     for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) el.dispatchEvent(new MouseEvent(type, { bubbles: true }));
     const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+    // handler attributes (onclick="…") run inside dispatch, return false cancels
     const go = el.dispatchEvent(click);
-    // inline handler attributes (`<button onclick="...">`) never go through
-    // addEventListener, so run them here the way a browser would
-    let inline = true;
-    const handler = el.getAttribute && el.getAttribute('onclick');
-    if (handler) {
-      try {
-        inline = Function('event', handler).call(el, click) !== false;
-      } catch (err) {
-        inline = true;
-      }
-    }
-    if (!go || !inline) return;
+    if (!go) return;
     // default actions
     const button = el.closest('button, input[type=submit]');
     if (button && button.disabled) return;

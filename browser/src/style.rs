@@ -220,8 +220,14 @@ pub struct Style {
     pub width: Option<f32>,
     /// the width depends on the container (a percentage): not a size of its own when measuring content
     pub width_relative: bool,
+    /// CSS `fill` / `stroke` for SVG (inherited): None = not set,
+    /// Some(None) = `none`, Some(Some(c)) = a colour (currentColor resolved)
+    pub svg_fill: Option<Option<Color>>,
+    pub svg_stroke: Option<Option<Color>>,
     /// display: table-caption (laid out as a block, at its table's width)
     pub caption: bool,
+    /// display: contents — no box of its own; its children take its place
+    pub contents: bool,
     pub height: Option<f32>,
     pub line_height: LineHeight,
     /// extra px after every character (inherited)
@@ -369,7 +375,10 @@ impl Default for Style {
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
             width_relative: false,
+            svg_fill: None,
+            svg_stroke: None,
             caption: false,
+            contents: false,
             dark: false,
             family: None,
         }
@@ -827,6 +836,8 @@ pub fn inherited(parent: &Style) -> Style {
     style.vars = parent.vars.clone();
     style.monospace = parent.monospace;
     style.dark = parent.dark;
+    style.svg_fill = parent.svg_fill;
+    style.svg_stroke = parent.svg_stroke;
     style.family = parent.family.clone();
     style.pre = parent.pre;
     style
@@ -946,6 +957,22 @@ pub fn compute(
     style.transparent |= style.opacity == 0.0;
     if node.tag == "html" {
         ROOT_FONT.with(|r| r.set(style.font_size.clamp(4.0, 200.0)));
+    }
+    if style.contents {
+        // no box: nothing of its own to draw or to take room
+        style.margin = Edges::default();
+        style.padding = Edges::default();
+        style.border = Edges::default();
+        style.border_width = 0.0;
+        style.background = None;
+        style.gradient = None;
+        style.bg_image = None;
+        style.shadow = None;
+        style.width = None;
+        style.height = None;
+        style.min_width = None;
+        style.min_height = None;
+        style.max_width = None;
     }
     if style.masked {
         // the mask image is drawn in the box's background colour; without a
@@ -1308,6 +1335,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
     match name {
         "display" => {
             style.caption = value == "table-caption";
+            style.contents = value == "contents";
             style.display = match value {
                 "none" => Display::None,
                 "flex" => Display::Flex,
@@ -1799,6 +1827,18 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 for side in sides(name.trim_end_matches("-style")) {
                     set_border(style, side, Some(0.0), None);
                 }
+            }
+        }
+        "fill" | "stroke" => {
+            let paint = if value.eq_ignore_ascii_case("none") {
+                Some(None)
+            } else if value.eq_ignore_ascii_case("currentcolor") {
+                Some(Some(style.color))
+            } else {
+                parse_color(value).map(Some)
+            };
+            if paint.is_some() {
+                if name == "fill" { style.svg_fill = paint; } else { style.svg_stroke = paint; }
             }
         }
         "width" => {
