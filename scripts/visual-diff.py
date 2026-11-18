@@ -30,7 +30,7 @@ DEFAULT_CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chr
 
 
 def capture_ours(binary: Path, url: str, width: int, height: int, out: Path, timeout: int,
-                 country: str = "") -> Dict:
+                 country: str = "", reference_path: Optional[Path] = None) -> Dict:
     started = time.monotonic()
     extra = ["--country", country] if country else []
     result = subprocess.run(
@@ -190,14 +190,21 @@ def composite(ref: Image.Image, ours: Image.Image, mask_ref: np.ndarray, mask_ou
 
 
 def compare(url: str, width: int, height: int, outdir: Path, ours_bin: Path, chrome: Path, wait_ms: int,
-            country: str = "") -> Dict:
+            country: str = "", reference_path: Optional[Path] = None) -> Dict:
     site = url.split("//", 1)[-1].split("/", 1)[0].replace(".", "-")
     outdir.mkdir(parents=True, exist_ok=True)
     ours_path = outdir / "ours.png"
     ref_path = outdir / "reference.png"
 
     ours_info = capture_ours(ours_bin, url, width, height, ours_path, timeout=120, country=country)
-    ref_info = capture_reference(chrome, url, width, height, ref_path, wait_ms)
+    if reference_path is not None:
+        ref_info = {"ok": reference_path.exists(), "ms": 0,
+                    "stderr": "" if reference_path.exists() else f"нет файла {reference_path}"}
+        if ref_info["ok"]:
+            import shutil
+            shutil.copy(reference_path, ref_path)
+    else:
+        ref_info = capture_reference(chrome, url, width, height, ref_path, wait_ms)
     stats: Dict = {"url": url, "width": width, "height": height,
                    "ours": {"ok": ours_info["ok"], "ms": ours_info["ms"]},
                    "reference": {"ok": ref_info["ok"], "ms": ref_info["ms"]}}
@@ -268,11 +275,13 @@ def main() -> int:
     parser.add_argument("--chrome", type=Path, default=DEFAULT_CHROME)
     parser.add_argument("--wait", type=int, default=8000, help="virtual time for the reference, ms")
     parser.add_argument("--country", default="", help="persona country for our render (RU, US, ...)")
+    parser.add_argument("--reference", type=Path, default=None,
+                        help="готовый эталон PNG вместо свежего снимка Chrome (стабильность)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     stats = compare(args.url, args.width, args.height, args.out, args.ours, args.chrome, args.wait,
-                    country=args.country)
+                    country=args.country, reference_path=args.reference)
     (args.out / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2))
     if args.json:
         print(json.dumps(stats, ensure_ascii=False, indent=2))
