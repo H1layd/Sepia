@@ -78,6 +78,9 @@ def capture_reference(chrome: Path, url: str, width: int, height: int, out: Path
             f"--window-size={width},{height}",
             f"--virtual-time-budget={wait_ms}",
         ]
+        if dark:
+            # headless Chrome follows the macOS appearance; say it outright
+            command.append("--force-dark-mode")
         command.append(f"--screenshot={out}")
         command.append(url)
         result = subprocess.run(command, capture_output=True, text=True, timeout=wait_ms / 1000.0 + 60)
@@ -214,10 +217,12 @@ def compare(url: str, width: int, height: int, outdir: Path, ours_bin: Path, chr
     ours_path = outdir / "ours.png"
     ref_path = outdir / "reference.png"
 
-    # эталон headless-Chrome всегда в светлой теме (флага нет), поэтому и наш
-    # рендер снимаем в светлой — иначе сравниваем тёмное со светлым
+    # эталон Chrome снимается в системной теме (dark=system_prefers_dark()
+    # ниже), и наш рендер — в той же, иначе сравниваем тёмное со светлым
+    # (закреплённые эталоны тоже сняты в системной теме)
+    scheme = "dark" if system_prefers_dark() else "light"
     ours_info = capture_ours(ours_bin, url, width, height, ours_path, timeout=120,
-                             country=country, color_scheme="light")
+                             country=country, color_scheme=scheme)
     if reference_path is not None:
         # закреплённый эталон: честнее свежего Chrome (баннеры, лимиты, темы)
         import shutil

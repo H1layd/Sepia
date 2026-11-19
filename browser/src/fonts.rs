@@ -28,13 +28,14 @@ use crate::layout::Fonts;
 /// Fallback faces, tried in order for a codepoint the primary face lacks.
 /// Paths that do not exist on this machine are dropped at start-up.
 const FALLBACK_FACES: &[(&str, u32)] = &[
-    // macOS
-    ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", 0),
+    // macOS, in CoreText's cascade order (what Chrome draws there): the
+    // system face first, its symbol companions, CJK, Arial Unicode last
+    ("/System/Library/Fonts/SFNS.ttf", 0),
     ("/System/Library/Fonts/Apple Symbols.ttf", 0),
     ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
     ("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0),
     ("/System/Library/Fonts/CJKSymbolsFallback.ttc", 0),
-    ("/System/Library/Fonts/SFNS.ttf", 0),
+    ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", 0),
     // Linux
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
     ("/usr/share/fonts/TTF/DejaVuSans.ttf", 0),

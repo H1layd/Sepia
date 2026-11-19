@@ -409,9 +409,18 @@ pub fn default_style(tag: &str) -> Style {
             style.margin = Edges::all(8.0);
         }
         "html" | "div" | "section" | "article" | "header" | "footer" | "main"
-        | "nav" | "aside" | "figure" | "figcaption" | "form" | "fieldset" | "address"
-        | "blockquote" | "dl" | "dt" | "dd" | "caption" | "#document" => {
+        | "nav" | "aside" | "figcaption" | "form" | "fieldset" | "address"
+        | "dl" | "dt" | "caption" | "#document" => {
             style.display = Display::Block;
+        }
+        "blockquote" | "figure" => {
+            style.display = Display::Block;
+            style.margin.left = 40.0;
+            style.margin.right = 40.0;
+        }
+        "dd" => {
+            style.display = Display::Block;
+            style.margin.left = 40.0;
         }
         "p" => {
             style.display = Display::Block;
@@ -485,8 +494,6 @@ pub fn default_style(tag: &str) -> Style {
             style.family = Some(Arc::from("monospace"));
             style.font_size = 14.0;
             style.margin = Edges { top: 13.0, right: 0.0, bottom: 13.0, left: 0.0 };
-            style.background = Some(Color::rgb(245, 245, 245));
-            style.padding = Edges::all(8.0);
         }
         "small" => style.font_size = 13.0,
         "big" => style.font_size = 20.0,
@@ -901,6 +908,7 @@ pub fn compute(
         style.hidden = inherit.hidden;
         style.transparent = inherit.transparent;
         style.vars = inherit.vars.clone();
+        style.dark = inherit.dark;
         style.monospace = style.monospace || inherit.monospace;
         if style.family.is_none() {
             style.family = inherit.family.clone();
@@ -955,6 +963,28 @@ pub fn compute(
         style.vars = Arc::new(scope);
     }
     let mut explicit_color = false;
+    // the page's own block margins: UA ones are only a default (in em, below)
+    let mut page_margin = (false, false);
+    for (d, _) in &declarations {
+        match d.name.as_str() {
+            "margin" | "margin-block" => page_margin = (true, true),
+            "margin-top" | "margin-block-start" => page_margin.0 = true,
+            "margin-bottom" | "margin-block-end" => page_margin.1 = true,
+            _ => {}
+        }
+    }
+    // color-scheme first: light-dark() anywhere in this element's rules
+    // (even in a declaration written before it) picks its side by it
+    for (declaration, shared) in declarations.iter().rev().filter(|(d, _)| d.name == "color-scheme") {
+        if let Some(value) = crate::css::substitute_in(&declaration.value, &style.vars, *shared) {
+            let words: Vec<String> = value.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+            if words.iter().any(|w| w == "inherit" || w == "initial" || w == "unset" || w == "revert") {
+                continue;
+            }
+            style.dark = words.iter().any(|w| w == "dark") && (crate::css::system_dark() || !words.iter().any(|w| w == "light"));
+            break;
+        }
+    }
     let base = if node.tag == "html" { Some(viewport_height()) } else { parent.and_then(|p| p.height) };
     PERCENT_HEIGHT_BASE.with(|b| b.set(base));
     for (declaration, shared) in declarations.iter().filter(|(d, _)| !d.name.starts_with("--")) {
@@ -967,6 +997,14 @@ pub fn compute(
                 continue;
             }
             if keyword == "initial" || keyword == "unset" || keyword == "revert" {
+                // `initial` (and `unset` on a property that does not inherit)
+                // is the property's initial value, not the UA default:
+                // `button { background-color: initial }` is transparent
+                if keyword != "revert" {
+                    if let Some(initial) = initial_value(&declaration.name, keyword == "unset") {
+                        apply(&mut style, &declaration.name, initial, containing_width);
+                    }
+                }
                 continue;
             }
             if declaration.name == "font-size" {
@@ -986,6 +1024,19 @@ pub fn compute(
             }
             let value: std::borrow::Cow<str> = if value.contains("light-dark(") { light_dark(&value, style.dark).into() } else { value };
             apply(&mut style, &declaration.name, &value, containing_width);
+        }
+    }
+    // UA block margins are in em of the element's own font size (h2 is
+    // 0.83em), and a list inside a list has none
+    if let Some(factor) = ua_block_margin_em(&node.tag) {
+        let nested = matches!(node.tag.as_str(), "ul" | "ol" | "menu" | "dir")
+            && ancestors.iter().any(|a| matches!(a.tag.as_str(), "ul" | "ol" | "menu" | "dir"));
+        let m = if nested { 0.0 } else { factor * style.font_size };
+        if !page_margin.0 {
+            style.margin.top = m;
+        }
+        if !page_margin.1 {
+            style.margin.bottom = m;
         }
     }
     // a scheme switched to dark here gives the dark default text colour
@@ -1088,6 +1139,19 @@ fn presentational_hints(node: &Node, style: &mut Style, containing_width: f32) {
 }
 
 /// The user-agent font size of `tag` as a fraction of its parent's.
+/// The user agent's block margins, in em (Chrome's html.css).
+fn ua_block_margin_em(tag: &str) -> Option<f32> {
+    Some(match tag {
+        "p" | "ul" | "ol" | "menu" | "dir" | "dl" | "blockquote" | "figure" | "pre" | "h3" => 1.0,
+        "h1" => 0.67,
+        "h2" => 0.83,
+        "h4" => 1.33,
+        "h5" => 1.67,
+        "h6" => 2.33,
+        _ => return None,
+    })
+}
+
 fn ua_font_ratio(tag: &str) -> Option<f32> {
     Some(match tag {
         "h1" => 2.0,
@@ -1124,6 +1188,28 @@ fn font_size_value(value: &str, parent: f32) -> Option<f32> {
 }
 
 /// `property: inherit` (form controls use `font: inherit` to drop their UA font).
+/// The CSS initial value of a property that does not inherit (what
+/// `initial` and `unset` reset it to); None leaves the cascade as it is.
+fn initial_value(name: &str, unset: bool) -> Option<&'static str> {
+    Some(match name {
+        "background" | "background-color" => "transparent",
+        "background-image" => "none",
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style" | "border-width"
+        | "border-block" | "border-inline" | "outline" | "box-shadow" | "text-shadow" | "transform" | "float" | "max-width" | "max-height" | "text-decoration" | "text-decoration-line" => "none",
+        "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "margin-block" | "margin-inline"
+        | "padding" | "padding-top" | "padding-right" | "padding-bottom" | "padding-left" | "padding-block" | "padding-inline"
+        | "border-radius" | "min-width" | "min-height" | "flex-grow" | "gap" | "row-gap" | "column-gap" => "0",
+        "width" | "height" | "top" | "right" | "bottom" | "left" | "inset" | "flex-basis" | "z-index" => "auto",
+        "display" => "inline",
+        "position" => "static",
+        "opacity" | "flex-shrink" => "1",
+        "overflow" | "overflow-x" | "overflow-y" => "visible",
+        // inherited properties: `unset` means inherit, which they already do
+        "font-weight" | "font-style" if !unset => "normal",
+        _ => return None,
+    })
+}
+
 fn inherit_property(style: &mut Style, parent: &Style, name: &str) {
     match name {
         "font" => {
@@ -2160,6 +2246,46 @@ mod tests {
         assert_eq!(parse_length("2em", 16.0, 500.0), Some(32.0));
         assert_eq!(parse_length("50%", 16.0, 500.0), Some(250.0));
         assert_eq!(parse_length("bogus", 16.0, 500.0), None);
+    }
+
+    #[test]
+    fn ua_block_margins_are_em_and_nested_lists_have_none() {
+        let doc = crate::dom::parse_document("<ol><li><ul class=t><li>x</li></ul></li></ol><h2 style='font-size:10px'>h</h2><p style='margin-top:3px'>p</p>");
+        let sheet = Stylesheet::default();
+        let ol = doc.find_first("ol").unwrap();
+        let li = ol.find_first("li").unwrap();
+        let ul = li.find_first("ul").unwrap();
+        let ol_style = compute(ol, None, &sheet, &[&doc], 800.0);
+        assert_eq!(ol_style.margin.top, 16.0);
+        let inner = compute(ul, Some(&ol_style), &sheet, &[&doc, ol, li], 800.0);
+        assert_eq!((inner.margin.top, inner.margin.bottom), (0.0, 0.0), "a list in a list");
+        let h2 = doc.find_first("h2").unwrap();
+        let h = compute(h2, None, &sheet, &[&doc], 800.0);
+        assert!((h.margin.top - 8.3).abs() < 0.01, "0.83em of 10px, got {}", h.margin.top);
+        let p = doc.find_first("p").unwrap();
+        let ps = compute(p, None, &sheet, &[&doc], 800.0);
+        assert_eq!((ps.margin.top, ps.margin.bottom), (3.0, 16.0));
+    }
+
+    #[test]
+    fn color_scheme_applies_to_light_dark_written_before_it() {
+        let doc = crate::dom::parse_document("<div style='background-color: light-dark(#fff, #000); color-scheme: dark'>x</div>");
+        let div = doc.find_first("div").unwrap();
+        let st = compute(div, None, &Stylesheet::default(), &[&doc], 800.0);
+        assert_eq!(st.background, Some(Color::rgb(0, 0, 0)));
+    }
+
+    #[test]
+    fn initial_is_the_initial_value_not_the_ua_default() {
+        let doc = crate::dom::parse_document("<button style='background-color: initial; padding: initial'>b</button><div style='color-scheme: dark'><p>x</p></div>");
+        let b = doc.find_first("button").unwrap();
+        let st = compute(b, None, &Stylesheet::default(), &[&doc], 800.0);
+        assert!(st.background.map_or(true, |c| c.a == 0), "{:?}", st.background);
+        assert_eq!(st.padding.left, 0.0);
+        let div = doc.find_first("div").unwrap();
+        let ds = compute(div, None, &Stylesheet::default(), &[&doc], 800.0);
+        let p = div.find_first("p").unwrap();
+        assert!(compute(p, Some(&ds), &Stylesheet::default(), &[&doc, div], 800.0).dark, "the scheme inherits");
     }
 
     #[test]

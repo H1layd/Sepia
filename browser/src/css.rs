@@ -680,7 +680,7 @@ impl Media {
                             continue;
                         }
                     }
-                    if feature == "color" || feature == "hover" || feature == "pointer" {
+                    if feature == "color" || feature == "pointer" || feature == "any-pointer" {
                         continue;
                     }
                     result = Media::Never;
@@ -698,20 +698,36 @@ impl Media {
                     },
                     None => result = Media::Never,
                 },
-                // a light screen, no motion preferences, a fine pointer, no hover
+                // the scheme the user picked
                 "prefers-color-scheme" if (value == "dark") != system_dark() => result = Media::Never,
-                "prefers-reduced-motion" | "prefers-contrast" | "orientation" | "pointer" | "any-pointer"
-                | "prefers-color-scheme" | "min-resolution" | "max-resolution" | "-webkit-min-device-pixel-ratio"
-                | "display-mode" | "forced-colors" | "scripting" => {
-                    if name == "scripting" && value != "none" {
-                        result = Media::Never;
-                    }
-                    if name == "forced-colors" && value == "active" {
+                "prefers-color-scheme" => {}
+                // a desktop browser tab as Chrome reports it: no accessibility
+                // preferences, a landscape window, a mouse, 1x pixels; each
+                // feature holds only for that value, so `prefers-contrast: more`
+                // and `orientation: portrait` stay off
+                _ => {
+                    let holds = match name {
+                        "prefers-reduced-motion" | "prefers-contrast" | "prefers-reduced-transparency" | "prefers-reduced-data" => value == "no-preference",
+                        "orientation" => value == "landscape",
+                        "pointer" | "any-pointer" => value == "fine",
+                        "hover" | "any-hover" => value != "hover",
+                        "display-mode" => value == "browser",
+                        "forced-colors" | "inverted-colors" => value == "none",
+                        "scripting" => value == "none",
+                        "min-resolution" | "-webkit-min-device-pixel-ratio" | "min--moz-device-pixel-ratio" => {
+                            let v = value.trim_end_matches("dppx").trim_end_matches('x');
+                            match (v.parse::<f32>(), value.strip_suffix("dpi").and_then(|d| d.trim().parse::<f32>().ok())) {
+                                (_, Some(dpi)) => dpi <= 96.0,
+                                (Ok(r), _) => r <= 1.0,
+                                _ => true,
+                            }
+                        }
+                        _ => true,
+                    };
+                    if !holds {
                         result = Media::Never;
                     }
                 }
-                "hover" | "any-hover" if value == "hover" => result = Media::Never,
-                _ => {}
             }
         }
         let dimensions = Media::Both(
@@ -1271,7 +1287,8 @@ pub fn parse_declarations(body: &str) -> Vec<Declaration> {
                 value = value.trim().to_string();
                 important = true;
             }
-            if value.is_empty() {
+            // `--x: ;` is a valid custom property (the empty "space toggle")
+            if value.is_empty() && !name.starts_with("--") {
                 continue;
             }
             // custom properties keep their case; everything else is case-insensitive
@@ -1432,6 +1449,9 @@ pub trait VarLookup {
 impl VarLookup for [(String, String)] {
     fn resolved(&self, name: &str, active: &mut Vec<String>) -> Option<String> {
         let raw = self.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str())?;
+        if raw.trim().eq_ignore_ascii_case("initial") {
+            return None;
+        }
         if active.iter().any(|a| a == name) {
             return None;
         }
@@ -1486,6 +1506,10 @@ impl VarLookup for Vars {
             }
             scope = scope.parent.as_deref()?;
         };
+        // `initial` is the guaranteed-invalid value: var() takes its fallback
+        if raw.trim().eq_ignore_ascii_case("initial") {
+            return None;
+        }
         if let Some(done) = scope.memo.lock().ok().and_then(|m| m.get(name).cloned()) {
             return done;
         }
@@ -1747,10 +1771,30 @@ mod tests {
     }
 
     #[test]
+    fn space_toggle_custom_properties() {
+        let decls = parse_declarations("--on: ; --off: initial");
+        assert_eq!(decls.len(), 2, "an empty custom property is kept");
+        let vars = vec![("--on".to_string(), "".to_string()), ("--off".to_string(), "initial".to_string())];
+        assert_eq!(substitute_vars("var(--on) blue", &vars).unwrap().trim(), "blue");
+        assert_eq!(substitute_vars("var(--off, red)", &vars).unwrap(), "red");
+    }
+
+    #[test]
     fn media_queries_without_spaces_around_and() {
         let q = Media::parse("(min-width:601px)and (max-width:1279.98px)");
         assert!(q.matches_viewport(1200.0, 800.0) && !q.matches_viewport(1400.0, 800.0));
         assert!(Media::parse("screen and(max-width:700px)").matches_viewport(600.0, 800.0));
+    }
+
+    #[test]
+    fn preference_media_features_hold_for_one_value() {
+        let on = |q: &str| Media::parse(q).matches_viewport(1280.0, 800.0);
+        assert!(on("(prefers-reduced-motion: no-preference)") && !on("(prefers-reduced-motion: reduce)"));
+        assert!(!on("(prefers-contrast: more)") && on("(prefers-contrast: no-preference)"));
+        assert!(on("(orientation: landscape)") && !on("(orientation: portrait)"));
+        assert!(on("(pointer: fine)") && !on("(pointer: coarse)"));
+        assert!(!on("(display-mode: standalone)") && !on("(min-resolution: 2dppx)") && on("(min-resolution: 1dppx)"));
+        assert!(!on("(-webkit-min-device-pixel-ratio: 1.5)"));
     }
 
     #[test]
