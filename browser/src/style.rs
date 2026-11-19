@@ -906,6 +906,10 @@ pub fn compute(
 
     presentational_hints(node, &mut style, containing_width);
 
+    // the root's own `rem` is the initial size, not what it computed last time
+    if node.tag == "html" {
+        ROOT_FONT.with(|r| r.set(16.0));
+    }
     let matched = sheet.matching(node, ancestors);
     let inline: Vec<Declaration> = node.attr("style").map(parse_declarations).unwrap_or_default();
     // (declaration, from a stylesheet: its text lives as long as the layout)
@@ -2015,6 +2019,17 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn root_rem_is_the_initial_size() {
+        let doc = parse_document("<html style='font-size: 1.2rem'><body><p style='font-size: 2rem'>x</p></body></html>");
+        let sheet = Stylesheet::default();
+        let html = doc.find_first("html").unwrap();
+        for _ in 0..3 {
+            let s = compute(html, None, &sheet, &[&doc], 800.0);
+            assert!((s.font_size - 19.2).abs() < 0.01, "{}", s.font_size);
+        }
+    }
 
     #[test]
     fn logical_properties_map_to_physical_ones() {

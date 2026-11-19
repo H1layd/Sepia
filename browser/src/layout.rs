@@ -444,7 +444,7 @@ impl<'a> Layout<'a> {
             self.last_margin_bottom = 0.0;
             let style = parent.map(crate::style::inherited).unwrap_or_default();
             let items = vec![InlineItem {
-                text: collapse_ws(&text),
+                text: styled_text(&text, &style),
                 style,
                 href: None,
                 br: false,
@@ -857,26 +857,7 @@ impl<'a> Layout<'a> {
         items: &mut Vec<InlineItem>,
     ) {
         if let Some(text) = &node.text {
-            let collapsed = if parent_style.pre { text.clone() } else { collapse_ws(text) };
-            let collapsed = match parent_style.text_transform {
-                TextTransform::None => collapsed,
-                TextTransform::Upper => collapsed.to_uppercase(),
-                TextTransform::Lower => collapsed.to_lowercase(),
-                TextTransform::Capitalize => {
-                    let mut out = String::with_capacity(collapsed.len());
-                    let mut start = true;
-                    for c in collapsed.chars() {
-                        if start && c.is_alphabetic() {
-                            out.extend(c.to_uppercase());
-                            start = false;
-                        } else {
-                            out.push(c);
-                            start = c.is_whitespace();
-                        }
-                    }
-                    out
-                }
-            };
+            let collapsed = styled_text(text, parent_style);
             if !collapsed.is_empty() {
                 items.push(InlineItem {
                     text: collapsed,
@@ -3250,6 +3231,31 @@ fn image_size(node: &Node, style: &Style, bitmap: Option<&Bitmap>) -> Option<(f3
 
 fn default_for(node: &Node) -> Style {
     crate::style::default_style(&node.tag)
+}
+
+/// A text node's characters as its style shows them: white space collapsed
+/// (unless `pre`) and `text-transform` applied.
+fn styled_text(text: &str, style: &Style) -> String {
+    let collapsed = if style.pre { text.to_string() } else { collapse_ws(text) };
+    match style.text_transform {
+        TextTransform::None => collapsed,
+        TextTransform::Upper => collapsed.to_uppercase(),
+        TextTransform::Lower => collapsed.to_lowercase(),
+        TextTransform::Capitalize => {
+            let mut out = String::with_capacity(collapsed.len());
+            let mut start = true;
+            for c in collapsed.chars() {
+                if start && c.is_alphabetic() {
+                    out.extend(c.to_uppercase());
+                    start = false;
+                } else {
+                    out.push(c);
+                    start = c.is_whitespace();
+                }
+            }
+            out
+        }
+    }
 }
 
 pub fn collapse_ws(text: &str) -> String {

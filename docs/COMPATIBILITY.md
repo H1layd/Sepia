@@ -26,6 +26,9 @@
 | Строки grid растягиваются до заданной высоты/`min-height` (`align-content: normal`), `align-items` центрирует в них | Netlify: заголовок героя по центру, как в Chrome |
 | Логические свойства → физические: `margin-inline`, `padding-block`, `inline-size`, `max-inline-size`, `inset-inline-start`, `border-inline` и др. (Tailwind v4 пишет через них даже `mx-auto`) | Netlify: заголовок переносится по `max-inline-size: 27rem`; web.dev 37,5 → 63,4; GitHub: тексты коммитов в таблице файлов |
 | `order` у элементов flex и grid (стабильная сортировка перед размещением) | тест `order_rearranges_flex_items`; раскладка Primer у GitHub задаёт его колонкам |
+| `rem` в `font-size` самого `<html>` — от исходных 16px, а не от размера, посчитанного в прошлый раз (он раздувался с каждым проходом) | css-tricks: корень 22,7 → 19,2 px, меню 40,8 → 31,2 px |
+| `text-transform` у текста прямо внутри flex/grid-контейнера | css-tricks: меню «ARTICLES ALMANAC…» в верхнем регистре |
+| Веб-шрифты с осями `wght`/`opsz` рисуются (swash) и меряются с насыщенностью текста (400/700), а не с начальной гранью | css-tricks: заголовок NewTitle был тончайшим, стал жирным, как в Chrome; 9,3 → 18,3 |
 
 Проверка на регрессии после этих правок: сид 42 — медиана 55,1 → 60,4; сид 3 —
 web.dev 37,5 → 63,4, spiegel 43,2 → 47,8. GitHub в одном прогоне дал 46 из-за

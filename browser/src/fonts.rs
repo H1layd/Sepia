@@ -158,13 +158,43 @@ pub enum Glyph<'f> {
 static OPSZ_FACES: Mutex<Vec<(usize, &'static [u8])>> = Mutex::new(Vec::new());
 
 thread_local! {
-    static OPSZ_CACHE: std::cell::RefCell<HashMap<(usize, char, u32), f32>> = std::cell::RefCell::new(HashMap::new());
+    static OPSZ_CACHE: std::cell::RefCell<HashMap<(usize, char, u32, u16), f32>> = std::cell::RefCell::new(HashMap::new());
+    /// the weight the text being walked asks for (set by for_each_glyph_in):
+    /// variable faces draw and measure at it
+    static WEIGHT: std::cell::Cell<u16> = const { std::cell::Cell::new(400) };
+}
+
+/// The variations a variable face is drawn with at `size`: `opsz` = size,
+/// `wght` = the text's weight (400 or 700), each clamped to the face's axis.
+fn variations(bytes: &[u8], size: f32) -> Vec<(ttf_parser::Tag, f32)> {
+    let Ok(face) = ttf_parser::Face::parse(bytes, 0) else { return Vec::new() };
+    let weight = WEIGHT.with(|w| w.get()) as f32;
+    face.variation_axes().into_iter().filter_map(|a| {
+        let want = if a.tag == ttf_parser::Tag::from_bytes(b"opsz") {
+            size
+        } else if a.tag == ttf_parser::Tag::from_bytes(b"wght") {
+            weight
+        } else {
+            return None;
+        };
+        Some((a.tag, want.clamp(a.min_value, a.max_value)))
+    }).collect()
+}
+
+/// A web font with `wght` / `opsz` axes is drawn (by swash) and measured at
+/// the text's weight and size, not at its default instance.
+pub fn register_variable(font: &Font, bytes: &[u8]) {
+    register_opsz_or_wght(font, bytes);
 }
 
 /// Remember `bytes` as the file of `font` if it has an `opsz` axis.
 fn register_opsz(font: &Font, bytes: &[u8]) {
+    register_opsz_or_wght(font, bytes);
+}
+
+fn register_opsz_or_wght(font: &Font, bytes: &[u8]) {
     let Ok(face) = ttf_parser::Face::parse(bytes, 0) else { return };
-    if !face.variation_axes().into_iter().any(|a| a.tag == ttf_parser::Tag::from_bytes(b"opsz")) {
+    if !face.variation_axes().into_iter().any(|a| a.tag == ttf_parser::Tag::from_bytes(b"opsz") || a.tag == ttf_parser::Tag::from_bytes(b"wght")) {
         return;
     }
     let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
@@ -176,14 +206,14 @@ fn register_opsz(font: &Font, bytes: &[u8]) {
 fn opsz_advance(font: &Font, ch: char, size: f32) -> Option<f32> {
     let key = font.file_hash();
     let bytes = OPSZ_FACES.lock().ok()?.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)?;
-    let cache_key = (key, ch, size.to_bits());
+    let cache_key = (key, ch, size.to_bits(), WEIGHT.with(|w| w.get()));
     if let Some(v) = OPSZ_CACHE.with(|c| c.borrow().get(&cache_key).copied()) {
         return Some(v);
     }
     let mut face = ttf_parser::Face::parse(bytes, 0).ok()?;
-    let tag = ttf_parser::Tag::from_bytes(b"opsz");
-    let axis = face.variation_axes().into_iter().find(|a| a.tag == tag)?;
-    face.set_variation(tag, size.clamp(axis.min_value, axis.max_value));
+    for (tag, value) in variations(bytes, size) {
+        face.set_variation(tag, value);
+    }
     let gid = face.glyph_index(ch)?;
     let advance = face.glyph_hor_advance(gid)? as f32 * size / face.units_per_em() as f32;
     OPSZ_CACHE.with(|c| c.borrow_mut().insert(cache_key, advance));
@@ -192,7 +222,7 @@ fn opsz_advance(font: &Font, ch: char, size: f32) -> Option<f32> {
 
 thread_local! {
     static SWASH: std::cell::RefCell<swash::scale::ScaleContext> = std::cell::RefCell::new(swash::scale::ScaleContext::new());
-    static SWASH_CACHE: std::cell::RefCell<HashMap<(usize, char, u32), Option<(i32, i32, usize, usize, std::rc::Rc<Vec<u8>>)>>> = std::cell::RefCell::new(HashMap::new());
+    static SWASH_CACHE: std::cell::RefCell<HashMap<(usize, char, u32, u16), Option<(i32, i32, usize, usize, std::rc::Rc<Vec<u8>>)>>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// A glyph of a variable face (one fontdue cannot draw), rendered by swash at
@@ -201,7 +231,7 @@ thread_local! {
 pub fn variable_glyph(font: &Font, ch: char, size: f32) -> Option<(i32, i32, usize, usize, std::rc::Rc<Vec<u8>>)> {
     let key = font.file_hash();
     let bytes = OPSZ_FACES.lock().ok()?.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)?;
-    let cache_key = (key, ch, size.to_bits());
+    let cache_key = (key, ch, size.to_bits(), WEIGHT.with(|w| w.get()));
     if let Some(hit) = SWASH_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
         return hit;
     }
@@ -213,7 +243,8 @@ pub fn variable_glyph(font: &Font, ch: char, size: f32) -> Option<(i32, i32, usi
         }
         SWASH.with(|ctx| {
             let mut ctx = ctx.borrow_mut();
-            let mut scaler = ctx.builder(face).size(size).variations(&[("opsz", size)]).hint(false).build();
+            let vars: Vec<swash::Setting<f32>> = variations(bytes, size).into_iter().map(|(tag, v)| swash::Setting { tag: u32::from_be_bytes(tag.to_bytes()), value: v }).collect();
+            let mut scaler = ctx.builder(face).size(size).variations(vars.into_iter()).hint(false).build();
             let image = swash::scale::Render::new(&[swash::scale::Source::Outline])
                 .format(swash::zeno::Format::Alpha)
                 .render(&mut scaler, gid)?;
@@ -306,7 +337,11 @@ pub fn load_web_font(key: &str, bytes: &[u8]) -> Option<&'static Font> {
     };
     let font = sfnt
         .filter(|b| b.starts_with(&[0, 1, 0, 0]) || b.starts_with(b"OTTO") || b.starts_with(b"true") || b.starts_with(b"ttcf"))
-        .and_then(|b| Font::from_bytes(b, FontSettings::default()).ok())
+        .and_then(|b| {
+            let font = Font::from_bytes(b.as_slice(), FontSettings::default()).ok()?;
+            register_variable(&font, &b);
+            Some(font)
+        })
         .map(|f| &*Box::leak(Box::new(f)));
     cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), font);
     font
@@ -463,6 +498,7 @@ impl Fonts {
     /// for default-emoji codepoints and anything followed by U+FE0F.
     /// Joiners and variation selectors are zero-width and produce nothing.
     pub fn for_each_glyph_in<'f>(&'f self, family: Option<&str>, text: &str, bold: bool, italic: bool, mut f: impl FnMut(Glyph<'f>)) {
+        WEIGHT.with(|w| w.set(if bold { 700 } else { 400 }));
         let primary = self.pick_family(family, bold, italic);
         let mut chars = text.chars().peekable();
         let mut after_emoji = false;
