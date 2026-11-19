@@ -275,6 +275,9 @@ pub struct Layout<'a> {
     pending_indent: f32,
     /// bottom margin of the block laid out last, for collapsing with what follows
     last_margin_bottom: f32,
+    /// the border box of the block `layout_box` laid out last (its children
+    /// come before it): how wide a sized float or inline-block really is
+    last_box: Option<Rect>,
     /// bottom margin of the last block child, escaping its parent
     trailing_margin: f32,
     /// the element whose background became the canvas (not painted again)
@@ -324,6 +327,32 @@ struct Container {
     h: Option<f32>,
     /// (draws, links, boxes) ranges to move, and where their bottom edge goes: `bottom` and box height
     bottom_fixes: Vec<(std::ops::Range<usize>, std::ops::Range<usize>, std::ops::Range<usize>, f32, f32)>,
+    /// absolute children sized by this box's height (`height: 100%`,
+    /// `top: 0; bottom: 0`) while it was not yet known: (element address, static
+    /// x, static y), placed once the box's height is
+    deferred: Vec<(usize, f32, f32)>,
+}
+
+/// The path from `root` down to the element at address `id` (the document
+/// does not change during a layout): (its ancestors below `root`, the element).
+fn find_by_id<'n>(root: &'n Node, id: usize) -> Option<(Vec<&'n Node>, &'n Node)> {
+    fn walk<'n>(node: &'n Node, want: usize, path: &mut Vec<&'n Node>) -> Option<&'n Node> {
+        for child in &node.children {
+            if child as *const Node as usize == want {
+                return Some(child);
+            }
+            if !child.children.is_empty() {
+                path.push(child);
+                if let Some(found) = walk(child, want, path) {
+                    return Some(found);
+                }
+                path.pop();
+            }
+        }
+        None
+    }
+    let mut path = Vec::new();
+    walk(root, id, &mut path).map(|found| (path, found))
 }
 
 fn out_of_flow(style: &Style) -> bool {
@@ -333,7 +362,7 @@ fn out_of_flow(style: &Style) -> bool {
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
         crate::style::set_viewport(viewport_width, sheet.viewport_height);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), pending_indent: 0.0, last_margin_bottom: 0.0, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, flex_height: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), pending_indent: 0.0, last_margin_bottom: 0.0, last_box: None, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, flex_height: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -635,7 +664,7 @@ impl<'a> Layout<'a> {
                 }
                 None => None,
             };
-            self.containers.push(Container { x: box_x + b.left, y: box_y + b.top, w: outer_width - b.left - b.right, h: known_h, bottom_fixes: Vec::new() });
+            self.containers.push(Container { x: box_x + b.left, y: box_y + b.top, w: outer_width - b.left - b.right, h: known_h, bottom_fixes: Vec::new(), deferred: Vec::new() });
         }
         let first_draw = shadow_index.or(fill_index).unwrap_or(self.page.draws.len());
         let (first_link, first_box) = (self.page.links.len(), self.page.boxes.len());
@@ -706,6 +735,7 @@ impl<'a> Layout<'a> {
         }
         let total = content_height + chrome_h;
         let rect = Rect { x: box_x, y: box_y, w: outer_width, h: total };
+        self.last_box = Some(rect);
         for index in [shadow_index, fill_index].into_iter().flatten() {
             if let Draw::Shadow { rect: r, .. } | Draw::Fill { rect: r, .. } = &mut self.page.draws[index] {
                 *r = rect;
@@ -745,10 +775,34 @@ impl<'a> Layout<'a> {
             self.clip(first_child_draw, first_child_link, rect, style.clip_x, style.clip_y);
         }
         if positioned {
-            if let Some(container) = self.containers.pop() {
+            if let Some(mut container) = self.containers.pop() {
                 let inner_h = total - b.top - b.bottom;
-                for (draws, links, boxes, bottom, h) in container.bottom_fixes {
+                for (draws, links, boxes, bottom, h) in std::mem::take(&mut container.bottom_fixes) {
                     self.shift(draws, links, boxes, 0.0, inner_h - bottom - h);
+                }
+                // its height is known now: place the children waiting for it
+                let deferred = std::mem::take(&mut container.deferred);
+                if !deferred.is_empty() {
+                    container.h = Some(inner_h);
+                    self.containers.push(container);
+                    for (id, sx, sy) in deferred {
+                        if let Some((path, child)) = find_by_id(node, id) {
+                            // styles down the path, inheriting from this box
+                            let mut anc: Vec<&Node> = ancestors2.to_vec();
+                            let mut parent_style = style.clone();
+                            for step in path {
+                                parent_style = compute(step, Some(&parent_style), self.sheet, &anc, outer_width);
+                                anc.push(step);
+                            }
+                            let cs = compute(child, Some(&parent_style), self.sheet, &anc, outer_width);
+                            self.place_out_of_flow(child, &anc, &cs, sx, sy);
+                        }
+                    }
+                    if let Some(container) = self.containers.pop() {
+                        for (draws, links, boxes, bottom, h) in container.bottom_fixes {
+                            self.shift(draws, links, boxes, 0.0, inner_h - bottom - h);
+                        }
+                    }
                 }
             }
         }
@@ -1652,6 +1706,7 @@ impl<'a> Layout<'a> {
             opacity_slots: Vec::new(),
             pending_indent: 0.0,
             last_margin_bottom: 0.0,
+            last_box: None,
             trailing_margin: 0.0,
             canvas_node: None,
             flow_width: self.flow_width,
@@ -1812,6 +1867,14 @@ impl<'a> Layout<'a> {
             Some(c) if !fixed => (c.x, c.y, c.w, c.h),
             _ => (0.0, 0.0, self.viewport_width, if fixed || self.containers.is_empty() { Some(crate::style::viewport_height()) } else { None }),
         };
+        // sized by a containing block whose height is not known yet: wait for it
+        let needs_h = style.height.is_none() && (style.height_percent.is_some() || (style.top.is_some() && style.bottom.is_some()));
+        if needs_h && cb_h.is_none() && !fixed {
+            if let Some(container) = self.containers.last_mut() {
+                container.deferred.push((node as *const Node as usize, static_x, static_y));
+                return;
+            }
+        }
         let mut style = style.clone();
         // heights against the containing block, now that it is known
         if let (None, Some(h)) = (style.height, cb_h) {
@@ -2743,11 +2806,13 @@ impl<'a> Layout<'a> {
         sub.flow_width = outer_w;
         let mut height = sub.layout_box(content, &content_ancestors, &style, 0.0, 0.0, outer_w);
         let width = if style.width.is_some() {
-            // the real outer width of a sized box
-            sub.page.draws.iter().find_map(|d| match d {
+            // the real outer width of a sized box: its own box, not the first
+            // fill drawn, which may be an absolutely placed child wider than
+            // it (a 400% tile in a 1/6 cell)
+            sub.last_box.filter(|_| content.text.is_none()).map(|rect| rect.x + rect.w + style.margin.right).or_else(|| sub.page.draws.iter().find_map(|d| match d {
                 Draw::Fill { rect, .. } | Draw::Edges { rect, .. } => Some(rect.x + rect.w + style.margin.right),
                 _ => None,
-            }).unwrap_or_else(|| {
+            })).unwrap_or_else(|| {
                 let chrome = style.padding.horizontal() + style.border.left + style.border.right;
                 style.width.map(|w| if style.border_box { w } else { w + chrome }).unwrap_or(outer_w) + style.margin.horizontal()
             })
@@ -3817,6 +3882,32 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(after > 100.0 && after < 125.0, "absolutes take no room: {after}");
+    }
+
+    #[test]
+    fn floats_are_as_wide_as_their_box_and_absolute_children_fill_them() {
+        // a 1/6 tile whose absolute child spans 4 tiles, then three empty
+        // tiles, then a fifth tile: all on one row (ria.ru's grid)
+        let doc = parse_document(
+            "<body style='margin:0'><div style='position:relative;width:600px'>\
+               <div style='width:16.666%;float:left;position:relative'><div style='padding-top:100px'></div>\
+                 <div id=big style='position:absolute;top:0;left:0;width:400%;height:100%;background:#9cf'></div></div>\
+               <div style='width:16.666%;float:left'><div style='padding-top:100px'></div></div>\
+               <div style='width:16.666%;float:left'><div style='padding-top:100px'></div></div>\
+               <div style='width:16.666%;float:left'><div style='padding-top:100px'></div></div>\
+               <div style='width:16.666%;float:left;position:relative'><div style='padding-top:100px'></div>\
+                 <div style='position:absolute;top:0;left:0;right:0;bottom:0;background:#fc9'></div></div>\
+             </div></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let fills: Vec<Rect> = page.draws.iter().filter_map(|d| match d { Draw::Fill { rect, color: Some(_), .. } => Some(*rect), _ => None }).collect();
+        let big = fills.iter().find(|r| (r.w - 400.0).abs() < 1.0).expect("the 400% tile");
+        assert!((big.h - 100.0).abs() < 1.0, "height: 100% of the float: {big:?}");
+        let side = fills.iter().find(|r| (r.w - 100.0).abs() < 1.0).expect("the fifth tile");
+        assert!((side.x - 400.0).abs() < 1.0 && side.y.abs() < 1.0, "fifth tile on the first row: {side:?}");
+        assert!((side.h - 100.0).abs() < 1.0, "top:0;bottom:0 fills it: {side:?}");
     }
 
     #[test]
