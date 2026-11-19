@@ -482,6 +482,19 @@ impl<'a> Layout<'a> {
             style.min_width = None;
             style.max_width = None;
         }
+        // aspect-ratio: a box without a height takes it from its width
+        // (not while measuring widths: the 100000px probe would make it huge)
+        if let (None, Some(ratio), false) = (style.height, style.aspect_ratio, matches!(node.tag.as_str(), "img" | "svg" | "canvas" | "video") || (self.measuring && style.width.is_none())) {
+            let chrome_w = style.padding.horizontal() + style.border.left + style.border.right;
+            let h = match style.width {
+                Some(w) => w / ratio,
+                None => {
+                    let outer = (containing_width - style.margin.horizontal()).max(0.0);
+                    if style.border_box { outer / ratio } else { (outer - chrome_w).max(0.0) / ratio }
+                }
+            };
+            style.height = Some(h);
+        }
         if let Some((target, h)) = self.flex_height {
             if target == node as *const Node && !self.measuring {
                 style.height = Some((h - style.margin.vertical()).max(0.0));
@@ -913,7 +926,8 @@ impl<'a> Layout<'a> {
             "svg" => {
                 // inline SVG: drawn in the surrounding text colour (currentColor)
                 let (nw, nh) = crate::svg::natural_size(node);
-                let attr_px = |name: &str| node.attr(name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v > 0.0);
+                // width="1em", "24px", "24": lengths relative to the text around
+                let attr_px = |name: &str| node.attr(name).filter(|v| !v.trim().ends_with('%')).and_then(|v| crate::style::parse_length(v.trim(), style.font_size, self.flow_width)).filter(|v| *v > 0.0);
                 let w = style.width.or_else(|| attr_px("width"));
                 let h = style.height.or_else(|| attr_px("height"));
                 let (w, h) = match (w, h) {
@@ -2930,6 +2944,17 @@ impl<'a> Layout<'a> {
             let extra = (h - used).max(0.0) / item.row_span as f32;
             for row in &mut row_h[item.row..item.row + item.row_span] { *row += extra; }
         }
+        // a grid with a definite height stretches its rows to fill it (align-content: normal)
+        if !self.measuring {
+            let chrome = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
+            if let Some(h) = style.height.or(style.min_height).map(|h| h - chrome) {
+                let used = row_h.iter().sum::<f32>() + row_gap * rows.saturating_sub(1) as f32;
+                if h > used + 0.5 && rows > 0 {
+                    let extra = (h - used) / rows as f32;
+                    for r in &mut row_h { *r += extra; }
+                }
+            }
+        }
         let mut row_y = vec![0.0f32; rows + 1];
         for r in 0..rows {
             row_y[r + 1] = row_y[r] + row_h[r] + if r + 1 < rows { row_gap } else { 0.0 };
@@ -3407,6 +3432,26 @@ mod tests {
         let pos = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(w) => Some((*x, *baseline)), _ => None }).unwrap();
         assert!((pos("middle").0 - 100.0).abs() < 1.0, "{:?}", pos("middle"));
         assert_eq!(pos("left").1, pos("middle").1, "both in the first row");
+    }
+
+    #[test]
+    fn aspect_ratio_gives_boxes_a_height() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='aspect-ratio: 16 / 9; background: red'></div><p>after</p></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let y = page.draws.iter().find_map(|d| match d { Draw::Text { baseline, text, .. } if text.contains("after") => Some(*baseline), _ => None }).unwrap();
+        assert!(y > 450.0 && y < 500.0, "800 wide at 16:9 is 450 tall; text at {y}");
+    }
+
+    #[test]
+    fn svg_sizes_in_em_follow_the_text() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0;font-size:20px'><p><svg width='1.5em' height='1em' viewBox='0 0 16 16'><rect width='16' height='16'/></svg>x</p></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let img = page.draws.iter().find_map(|d| match d { Draw::Image { rect, .. } => Some(*rect), _ => None }).unwrap();
+        assert_eq!((img.w, img.h), (30.0, 20.0));
     }
 
     #[test]

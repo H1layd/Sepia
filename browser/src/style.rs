@@ -300,6 +300,8 @@ pub struct Style {
     pub grid_area: Option<String>,
     /// grid-column / grid-row as written (start, end): lines, names, spans
     pub grid_column_lines: Option<(String, String)>,
+    /// aspect-ratio: width / height
+    pub aspect_ratio: Option<f32>,
     pub grid_row_lines: Option<(String, String)>,
     /// custom properties in scope (inherited), last definition wins
     pub vars: Arc<crate::css::Vars>,
@@ -376,6 +378,7 @@ impl Default for Style {
             grid_areas: None,
             grid_area: None,
             grid_column_lines: None,
+            aspect_ratio: None,
             grid_row_lines: None,
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
@@ -1348,7 +1351,77 @@ fn parse_grid_areas(value: &str) -> Option<Vec<Vec<String>>> {
     Some(rows)
 }
 
+/// Logical properties (`margin-inline`, `padding-block`, `inline-size`,
+/// `inset-inline-start`…) as the physical ones they mean in horizontal,
+/// left-to-right writing. None when `name` is not one.
+fn logical(name: &str, value: &str) -> Option<Vec<(String, String)>> {
+    let pair = |a: &str, b: &str| -> Vec<(String, String)> {
+        let parts: Vec<String> = split_space(value);
+        let first = parts.first().cloned().unwrap_or_default();
+        let second = parts.get(1).cloned().unwrap_or_else(|| first.clone());
+        vec![(a.to_string(), first), (b.to_string(), second)]
+    };
+    let one = |n: &str| vec![(n.to_string(), value.to_string())];
+    Some(match name {
+        "inline-size" => one("width"),
+        "block-size" => one("height"),
+        "min-inline-size" => one("min-width"),
+        "max-inline-size" => one("max-width"),
+        "min-block-size" => one("min-height"),
+        "max-block-size" => one("max-height"),
+        "margin-inline" => pair("margin-left", "margin-right"),
+        "margin-block" => pair("margin-top", "margin-bottom"),
+        "margin-inline-start" => one("margin-left"),
+        "margin-inline-end" => one("margin-right"),
+        "margin-block-start" => one("margin-top"),
+        "margin-block-end" => one("margin-bottom"),
+        "padding-inline" => pair("padding-left", "padding-right"),
+        "padding-block" => pair("padding-top", "padding-bottom"),
+        "padding-inline-start" => one("padding-left"),
+        "padding-inline-end" => one("padding-right"),
+        "padding-block-start" => one("padding-top"),
+        "padding-block-end" => one("padding-bottom"),
+        "inset-inline" => pair("left", "right"),
+        "inset-block" => pair("top", "bottom"),
+        "inset-inline-start" => one("left"),
+        "inset-inline-end" => one("right"),
+        "inset-block-start" => one("top"),
+        "inset-block-end" => one("bottom"),
+        "border-inline" => vec![("border-left".into(), value.into()), ("border-right".into(), value.into())],
+        "border-block" => vec![("border-top".into(), value.into()), ("border-bottom".into(), value.into())],
+        "border-inline-start" => one("border-left"),
+        "border-inline-end" => one("border-right"),
+        "border-block-start" => one("border-top"),
+        "border-block-end" => one("border-bottom"),
+        "border-inline-width" => pair("border-left-width", "border-right-width"),
+        "border-block-width" => pair("border-top-width", "border-bottom-width"),
+        "border-inline-color" => pair("border-left-color", "border-right-color"),
+        "border-block-color" => pair("border-top-color", "border-bottom-color"),
+        "border-inline-start-width" => one("border-left-width"),
+        "border-inline-end-width" => one("border-right-width"),
+        "border-block-start-width" => one("border-top-width"),
+        "border-block-end-width" => one("border-bottom-width"),
+        "border-inline-start-color" => one("border-left-color"),
+        "border-inline-end-color" => one("border-right-color"),
+        "border-block-start-color" => one("border-top-color"),
+        "border-block-end-color" => one("border-bottom-color"),
+        "border-start-start-radius" => one("border-top-left-radius"),
+        "border-start-end-radius" => one("border-top-right-radius"),
+        "border-end-start-radius" => one("border-bottom-left-radius"),
+        "border-end-end-radius" => one("border-bottom-right-radius"),
+        "overflow-inline" => one("overflow-x"),
+        "overflow-block" => one("overflow-y"),
+        _ => return None,
+    })
+}
+
 fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
+    if let Some(physical) = logical(name, value) {
+        for (n, v) in physical {
+            apply(style, &n, &v, containing_width);
+        }
+        return;
+    }
     let value = value.trim();
     let font_size = style.font_size;
     match name {
@@ -1616,6 +1689,14 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 && !value.chars().next().unwrap().is_ascii_digit() {
                 style.grid_area = Some(value.to_string());
             }
+        }
+        "aspect-ratio" => {
+            let v = value.replace("auto", "");
+            let (a, b) = v.split_once('/').unwrap_or((v.as_str(), "1"));
+            style.aspect_ratio = match (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
+                (Ok(a), Ok(b)) if a > 0.0 && b > 0.0 => Some(a / b),
+                _ => None,
+            };
         }
         "grid-row" | "grid-row-start" | "grid-row-end" | "grid-column-start" | "grid-column-end" => {
             let slot = if name.starts_with("grid-row") { &mut style.grid_row_lines } else { &mut style.grid_column_lines };
@@ -1930,6 +2011,17 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn logical_properties_map_to_physical_ones() {
+        let doc = parse_document("<div style='margin-inline: auto; padding-block: 4px 8px; max-inline-size: 300px; inset-inline-start: 5px'>x</div>");
+        let sheet = Stylesheet::default();
+        let d = doc.find_first("div").unwrap();
+        let s = compute(d, Some(&default_style("body")), &sheet, &[&doc], 800.0);
+        assert_eq!(s.margin_auto, (true, true));
+        assert_eq!((s.padding.top, s.padding.bottom), (4.0, 8.0));
+        assert_eq!(s.max_width, Some(300.0));
+    }
 
     #[test]
     fn math_function_arguments_are_sums() {
