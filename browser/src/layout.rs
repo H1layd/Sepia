@@ -309,10 +309,19 @@ struct Exclusion {
 /// The padding box of a positioned element while its children are laid out.
 /// Its height is known only at the end, so absolutes anchored by `bottom`
 /// are moved into place then.
+/// How far a run may pass the line's end and still fit: widths measured
+/// for shrink-to-fit boxes add up again with float error (Chrome lays out in
+/// 1/64 px units and does not wrap on such crumbs).
+const FIT_SLACK: f32 = 0.5;
+
 struct Container {
     x: f32,
     y: f32,
     w: f32,
+    /// its padding-box height when known before its children are laid out
+    /// (a declared height, or padding alone around only positioned children):
+    /// what `height: 50%` and `top: 0; bottom: 0` of an absolute child resolve against
+    h: Option<f32>,
     /// (draws, links, boxes) ranges to move, and where their bottom edge goes: `bottom` and box height
     bottom_fixes: Vec<(std::ops::Range<usize>, std::ops::Range<usize>, std::ops::Range<usize>, f32, f32)>,
 }
@@ -606,7 +615,24 @@ impl<'a> Layout<'a> {
 
         let positioned = style.position != crate::style::Position::Static;
         if positioned {
-            self.containers.push(Container { x: box_x + b.left, y: box_y + b.top, w: outer_width - b.left - b.right, bottom_fixes: Vec::new() });
+            let pad_v = style.padding.vertical();
+            let known_h = match style.height {
+                Some(h) => Some(if style.border_box { (h - b.top - b.bottom).max(0.0) } else { h + pad_v }),
+                // `padding-top: 56%` boxes whose content is all positioned (aspect-ratio boxes)
+                None if pad_v > 0.0 => {
+                    let with_node = ancestors2;
+                    let only_positioned = node.children.iter().all(|c| match &c.text {
+                        Some(t) => t.trim().is_empty(),
+                        None => {
+                            let cs = compute(c, Some(style), self.sheet, with_node, outer_width);
+                            cs.display == Display::None || out_of_flow(&cs)
+                        }
+                    });
+                    only_positioned.then(|| pad_v.max(style.min_height.unwrap_or(0.0)))
+                }
+                None => None,
+            };
+            self.containers.push(Container { x: box_x + b.left, y: box_y + b.top, w: outer_width - b.left - b.right, h: known_h, bottom_fixes: Vec::new() });
         }
         let first_draw = shadow_index.or(fill_index).unwrap_or(self.page.draws.len());
         let (first_link, first_box) = (self.page.links.len(), self.page.boxes.len());
@@ -1136,7 +1162,7 @@ impl<'a> Layout<'a> {
                 } else {
                     0.0
                 };
-                if line_width + space + w > lw - indent && line_width > 0.0 && !item.style.nowrap {
+                if line_width + space + w > lw - indent + FIT_SLACK && line_width > 0.0 && !item.style.nowrap {
                     self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                     indent = 0.0;
@@ -1156,7 +1182,7 @@ impl<'a> Layout<'a> {
                 need_space = false;
             } else if item.image {
                 let advance = self.text_width(&item.text, &item.style);
-                if line_width + advance > lw - indent && line_width > 0.0 && !item.style.nowrap {
+                if line_width + advance > lw - indent + FIT_SLACK && line_width > 0.0 && !item.style.nowrap {
                     self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                     indent = 0.0;
@@ -1192,7 +1218,7 @@ impl<'a> Layout<'a> {
                         piece = format!(" {piece}");
                         piece_width += self.text_width(" ", &item.style);
                     }
-                    if line_width + piece_width > lw - indent && line_width > 0.0 && !item.style.nowrap {
+                    if line_width + piece_width > lw - indent + FIT_SLACK && line_width > 0.0 && !item.style.nowrap {
                         self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                         indent = 0.0;
@@ -1269,8 +1295,19 @@ impl<'a> Layout<'a> {
         let top_gap = if explicit { (line_box - (ascent + descent)) / 2.0 } else { 0.0 };
         // Images sit on the baseline; an inline-block puts its own baseline
         // there. Tall ones push the baseline down, deep ones the line's bottom.
-        let above = line.iter().filter_map(|(_, item)| item.img.as_ref().map(|i| i.atom.as_ref().map(|a| a.1).unwrap_or(i.h))).fold(0.0f32, f32::max);
-        let below = line.iter().filter_map(|(_, item)| item.img.as_ref().and_then(|i| i.atom.as_ref().map(|a| i.h - a.1))).fold(0.0f32, f32::max);
+        // vertical-align: `middle` centres a box half an x-height above the
+        // baseline; `top`/`bottom` hang it from the text's top or bottom
+        let x_half = size * 0.25;
+        let raise = |item: &InlineItem, h: f32, base: f32| -> f32 {
+            match item.style.valign {
+                Some(VAlign::Middle) => h / 2.0 + x_half,
+                Some(VAlign::Top) => ascent,
+                Some(VAlign::Bottom) => (h - descent).max(0.0),
+                _ => base,
+            }
+        };
+        let above = line.iter().filter_map(|(_, item)| item.img.as_ref().map(|i| raise(item, i.h, i.atom.as_ref().map(|a| a.1).unwrap_or(i.h)))).fold(0.0f32, f32::max);
+        let below = line.iter().filter_map(|(_, item)| item.img.as_ref().map(|i| i.h - raise(item, i.h, i.atom.as_ref().map(|a| a.1).unwrap_or(i.h)))).fold(0.0f32, f32::max);
         let lift = (above - ascent - top_gap.max(0.0)).max(0.0);
         let sink = (below - (line_box - top_gap.max(0.0) - ascent)).max(0.0);
         let line_height = line_box + lift + sink;
@@ -1319,7 +1356,7 @@ impl<'a> Layout<'a> {
                 }
                 if let Some(atom) = &img.atom {
                     let (page, atom_baseline) = (&atom.0, atom.1);
-                    let (dx, dy) = (pen_x, baseline - atom_baseline);
+                    let (dx, dy) = (pen_x, baseline - raise(item, img.h, atom_baseline));
                     for draw in &page.draws {
                         let mut draw = draw.clone();
                         translate(&mut draw, dx, dy);
@@ -1345,7 +1382,7 @@ impl<'a> Layout<'a> {
                     self.page.content_right = self.page.content_right.max(pen_x);
                     continue;
                 }
-                let rect = Rect { x: pen_x, y: baseline - img.h, w: img.w, h: img.h };
+                let rect = Rect { x: pen_x, y: baseline - raise(item, img.h, img.h), w: img.w, h: img.h };
                 self.page.draws.push(Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() });
                 if let Some(href) = &item.href {
                     self.page.links.push(link(rect, href));
@@ -1768,11 +1805,20 @@ impl<'a> Layout<'a> {
             return;
         }
         let fixed = style.position == crate::style::Position::Fixed;
-        let (cb_x, cb_y, cb_w) = match self.containers.last() {
-            Some(c) if !fixed => (c.x, c.y, c.w),
-            _ => (0.0, 0.0, self.viewport_width),
+        let (cb_x, cb_y, cb_w, cb_h) = match self.containers.last() {
+            Some(c) if !fixed => (c.x, c.y, c.w, c.h),
+            _ => (0.0, 0.0, self.viewport_width, if fixed || self.containers.is_empty() { Some(crate::style::viewport_height()) } else { None }),
         };
         let mut style = style.clone();
+        // heights against the containing block, now that it is known
+        if let (None, Some(h)) = (style.height, cb_h) {
+            if let Some(p) = style.height_percent {
+                style.height = Some(h * p);
+            } else if let (Some(t), Some(bm)) = (style.top, style.bottom) {
+                style.height = Some((h - t - bm - style.margin.vertical()).max(0.0));
+                style.border_box = true;
+            }
+        }
         if style.width.is_none() {
             if let (Some(l), Some(r)) = (style.left, style.right) {
                 style.width = Some((cb_w - l - r - style.margin.horizontal()).max(1.0));
@@ -1857,9 +1903,13 @@ impl<'a> Layout<'a> {
         // ----- rows and cells on the grid ---------------------------------
         let mut table_ancestors: Vec<&Node> = ancestors.to_vec();
         table_ancestors.push(node);
+        // cells straight in the table (no row): CSS wraps them in an anonymous row
+        let anon_row: Node;
         let mut rows: Vec<(&Node, Vec<&Node>, Style)> = Vec::new();
+        let mut loose_cells = false;
         for child in node.children.iter().filter(|c| c.text.is_none()) {
             let child_style = compute(child, Some(style), self.sheet, &table_ancestors, avail);
+            loose_cells |= child_style.display == Display::Cell;
             match child_style.display {
                 Display::Row => rows.push((child, table_ancestors.clone(), child_style)),
                 Display::RowGroup => {
@@ -1874,6 +1924,10 @@ impl<'a> Layout<'a> {
                 }
                 _ => {}
             }
+        }
+        if rows.is_empty() && loose_cells {
+            anon_row = Node { tag: "#anon-row".into(), attrs: Vec::new(), children: node.children.clone(), text: None };
+            rows.push((&anon_row, table_ancestors.clone(), style.clone()));
         }
         if rows.is_empty() {
             // no rows: CSS wraps the content in an anonymous row and cell, so the
@@ -1923,7 +1977,10 @@ impl<'a> Layout<'a> {
         let mut taken: Vec<usize> = Vec::new();
         for (r, (row, row_ancestors, row_style)) in rows.iter().enumerate() {
             let mut cell_ancestors = row_ancestors.clone();
-            cell_ancestors.push(row);
+            // an anonymous row is no element: selectors see the table as the parent
+            if row.tag != "#anon-row" {
+                cell_ancestors.push(row);
+            }
             let mut col = 0usize;
             for cell in row.children.iter().filter(|c| c.text.is_none()) {
                 let mut cell_style = compute(cell, Some(row_style), self.sheet, &cell_ancestors, avail);
@@ -2120,7 +2177,7 @@ impl<'a> Layout<'a> {
             }
             let slack = (ch - content_box_h).max(0.0);
             let shift = match cell.style.valign.unwrap_or(VAlign::Middle) {
-                VAlign::Top => 0.0,
+                VAlign::Top | VAlign::Baseline => 0.0,
                 VAlign::Middle => slack / 2.0,
                 VAlign::Bottom => slack,
             };
@@ -3510,6 +3567,28 @@ mod tests {
         let (l, m, r) = (pos("left"), pos("mid"), pos("right"));
         assert_eq!(l.1, r.1, "contents children wrapped to new lines");
         assert!(l.0 < m.0 && m.0 < r.0, "{l:?} {m:?} {r:?}");
+    }
+
+    #[test]
+    fn absolute_heights_resolve_against_a_padding_box() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='position:relative;padding-top:300px;width:200px'><div style='position:absolute;top:0;left:0;width:100%;height:200%;background:red'></div></div><div style='position:relative;height:100px'><div style='position:absolute;top:10px;bottom:10px;left:0;width:10px;background:blue'></div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let fills: Vec<Rect> = page.draws.iter().filter_map(|d| match d { Draw::Rect { rect, .. } | Draw::Fill { rect, .. } => Some(*rect), _ => None }).collect();
+        assert!(fills.iter().any(|r| (r.h - 600.0).abs() < 1.0), "200% of a 300px padding box: {fills:?}");
+        assert!(fills.iter().any(|r| (r.h - 80.0).abs() < 1.0), "top/bottom 10px in 100px: {fills:?}");
+    }
+
+    #[test]
+    fn cells_without_rows_share_one_row() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:table'><div style='display:table-cell'>one</div><div style='display:table-cell'>two</div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let pos = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(w) => Some((*x, *baseline)), _ => None }).unwrap();
+        assert_eq!(pos("one").1, pos("two").1, "cells on one line");
+        assert!(pos("one").0 < pos("two").0);
     }
 
     #[test]

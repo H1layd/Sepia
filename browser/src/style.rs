@@ -171,6 +171,7 @@ impl Default for Flex {
 /// `vertical-align` / `valign`, as far as table cells use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VAlign {
+    Baseline,
     Top,
     Middle,
     Bottom,
@@ -304,6 +305,8 @@ pub struct Style {
     pub aspect_ratio: Option<f32>,
     /// `order` of a flex or grid item
     pub order: i32,
+    /// `height: N%` as a fraction, for when the base is only known at layout
+    pub height_percent: Option<f32>,
     pub grid_row_lines: Option<(String, String)>,
     /// custom properties in scope (inherited), last definition wins
     pub vars: Arc<crate::css::Vars>,
@@ -382,6 +385,7 @@ impl Default for Style {
             grid_column_lines: None,
             aspect_ratio: None,
             order: 0,
+            height_percent: None,
             grid_row_lines: None,
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
@@ -864,6 +868,11 @@ pub fn compute(
     containing_width: f32,
 ) -> Style {
     let mut style = default_style(&node.tag);
+    // UA: a closed <details> shows only its <summary>
+    if node.tag != "summary" && ancestors.last().is_some_and(|p| p.tag == "details" && p.attr("open").is_none()) {
+        style.display = Display::None;
+        return style;
+    }
     // UA: `[popover]:not(:popover-open)` and `dialog:not([open])` are hidden
     if (node.attr("popover").is_some() && node.attr("data-sepia-popover-open").is_none()) || (node.tag == "dialog" && node.attr("open").is_none()) {
         style.display = Display::None;
@@ -1317,7 +1326,8 @@ fn parse_shadow(value: &str, font_size: f32) -> Option<Shadow> {
 
 fn parse_valign(value: &str) -> Option<VAlign> {
     match value {
-        "top" | "text-top" | "baseline" => Some(VAlign::Top),
+        "baseline" => Some(VAlign::Baseline),
+        "top" | "text-top" => Some(VAlign::Top),
         "middle" | "center" => Some(VAlign::Middle),
         "bottom" | "text-bottom" => Some(VAlign::Bottom),
         _ => None,
@@ -1971,7 +1981,10 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             style.width = parse_length(value, font_size, containing_width);
             style.width_relative = value.contains('%') || value.contains("vw");
         }
-        "height" => style.height = height_length(value, font_size),
+        "height" => {
+            style.height = height_length(value, font_size);
+            style.height_percent = value.trim().strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()).map(|p| p / 100.0);
+        }
         "line-height" => {
             style.line_height = if value == "normal" {
                 LineHeight::Normal
@@ -2021,6 +2034,19 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn closed_details_show_only_the_summary() {
+        let doc = parse_document("<details><summary>s</summary><p>hidden</p></details><details open><summary>t</summary><p>shown</p></details>");
+        let sheet = Stylesheet::default();
+        let ds: Vec<&Node> = doc.children.iter().filter(|n| n.tag == "details").collect();
+        let p0 = ds[0].find_first("p").unwrap();
+        let p1 = ds[1].find_first("p").unwrap();
+        let body = default_style("body");
+        assert_eq!(compute(p0, Some(&body), &sheet, &[&doc, ds[0]], 800.0).display, Display::None);
+        assert_ne!(compute(p1, Some(&body), &sheet, &[&doc, ds[1]], 800.0).display, Display::None);
+        assert_ne!(compute(ds[0].find_first("summary").unwrap(), Some(&body), &sheet, &[&doc, ds[0]], 800.0).display, Display::None);
+    }
 
     #[test]
     fn box_shorthands_keep_calc_with_spaces_whole() {

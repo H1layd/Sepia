@@ -2737,6 +2737,28 @@
   Response.prototype.arrayBuffer = function () { return Promise.resolve(new G.TextEncoder().encode(this.__body).buffer); };
   Response.prototype.blob = function () { return Promise.resolve(new G.Blob([this.__body], { type: this.headers.get('content-type') || '' })); };
   Response.prototype.bodyUsed = false;
+  // <details>: `open` reflects the attribute; a click on its summary toggles it
+  Object.defineProperty(classes.Details.prototype, 'open', {
+    get() { return this.hasAttribute('open'); },
+    set(v) {
+      const was = this.hasAttribute('open');
+      if (v) this.setAttribute('open', ''); else this.removeAttribute('open');
+      if (was !== !!v) setTimeout(() => { const ev = new Event('toggle'); ev.oldState = was ? 'open' : 'closed'; ev.newState = v ? 'open' : 'closed'; this.dispatchEvent(ev); }, 0);
+    },
+    configurable: true,
+  });
+  document.addEventListener('click', e => {
+    if (e.defaultPrevented) return;
+    const t = e.target && e.target.nodeType === 1 ? e.target : e.target && e.target.parentElement;
+    const summary = t && t.closest ? t.closest('summary') : null;
+    const details = summary && summary.parentElement;
+    if (details && details.tagName === 'DETAILS' && [...details.children].find(c => c.tagName === 'SUMMARY') === summary) {
+      // exclusive accordions: <details name="x"> close their siblings
+      const name = details.getAttribute('name');
+      if (!details.open && name) for (const other of document.querySelectorAll('details[name]')) if (other !== details && other.getAttribute('name') === name) other.open = false;
+      details.open = !details.open;
+    }
+  });
   // ----- Web Animations API ----------------------------------------------------
   {
     const toFrames = kf => {
