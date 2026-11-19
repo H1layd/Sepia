@@ -624,7 +624,8 @@ pub fn system_dark() -> bool {
 
 impl Media {
     pub fn parse(text: &str) -> Media {
-        let text = text.trim().to_ascii_lowercase();
+        // minifiers drop the spaces: `(min-width:601px)and (max-width:1279px)`
+        let text = text.trim().to_ascii_lowercase().replace(")and", ") and").replace(" and(", " and (").replace(")or", ") or").replace("not(", "not (");
         if text.is_empty() {
             return Media::All;
         }
@@ -1684,6 +1685,13 @@ mod tests {
         assert_eq!(substitute_vars("var(--pad)", &vars).unwrap(), "4px 8px");
         assert_eq!(substitute_vars("var(--missing, red)", &vars).unwrap(), "red");
         assert!(substitute_vars("var(--missing)", &vars).is_none());
+    }
+
+    #[test]
+    fn media_queries_without_spaces_around_and() {
+        let q = Media::parse("(min-width:601px)and (max-width:1279.98px)");
+        assert!(q.matches_viewport(1200.0, 800.0) && !q.matches_viewport(1400.0, 800.0));
+        assert!(Media::parse("screen and(max-width:700px)").matches_viewport(600.0, 800.0));
     }
 
     #[test]
