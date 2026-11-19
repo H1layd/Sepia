@@ -2204,6 +2204,7 @@ struct FlexItem<'n> {
     max_outer: f32,
     /// margin-left / margin-right: auto (they take the line's free space)
     auto: (bool, bool),
+    order: i32,
 }
 
 impl<'n> FlexItem<'n> {
@@ -2312,6 +2313,7 @@ impl<'a> Layout<'a> {
             let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
             let mut fixed_outer = None;
             let mut auto = (false, false);
+            let mut order = 0;
             let (item_flex, margin_top, margin_bottom, right_chrome, min_outer) = match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
                 Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0, 0.0),
@@ -2327,6 +2329,7 @@ impl<'a> Layout<'a> {
                     let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
                     let min_outer = s.min_width.map(|m| m + chrome + s.margin.horizontal()).unwrap_or(0.0);
                     auto = s.margin_auto;
+                    order = s.order;
                     fixed_outer = s.width.map(|w| {
                         let w = s.max_width.map_or(w, |m| w.min(m));
                         w + chrome + s.margin.horizontal()
@@ -2335,8 +2338,10 @@ impl<'a> Layout<'a> {
                 }
             };
             let align = item_flex.align_self.unwrap_or(f.align);
-            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer, via, max_outer: f32::INFINITY, auto });
+            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer, via, max_outer: f32::INFINITY, auto, order });
         }
+        // `order` first (stable: equal orders keep document order)
+        items.sort_by_key(|i| i.order);
         if reverse {
             items.reverse();
         }
@@ -2760,6 +2765,7 @@ impl<'a> Layout<'a> {
             align: AlignItems,
             /// explicit lines: (first track, span) across and down
             fixed: (Option<(usize, usize)>, Option<(usize, usize)>),
+            order: i32,
         }
         let mut items: Vec<GridItem> = Vec::new();
         let (mut row, mut col) = (0usize, 0usize);
@@ -2771,6 +2777,7 @@ impl<'a> Layout<'a> {
         for (child, via) in entries {
             let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
             let mut fixed = (None, None);
+            let mut order = 0;
             let (span, margin, align, area) = match &child.text {
                 Some(t) if t.trim().is_empty() => continue,
                 Some(_) => (1, (0.0, 0.0), style.flex.align, None),
@@ -2788,6 +2795,7 @@ impl<'a> Layout<'a> {
                         GridSpan::Span(n) => n.min(columns),
                         GridSpan::Full => columns,
                     };
+                    order = s.order;
                     fixed = (
                         s.grid_column_lines.as_ref().and_then(|l| grid_lines(l, &names, columns)),
                         s.grid_row_lines.as_ref().and_then(|l| grid_lines(l, &[], usize::MAX / 4)),
@@ -2795,7 +2803,7 @@ impl<'a> Layout<'a> {
                     (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align), s.grid_area)
                 }
             };
-            items.push(GridItem { node: child, via, row: 0, col: 0, span, row_span: 1, area, margin, align, fixed });
+            items.push(GridItem { node: child, via, row: 0, col: 0, span, row_span: 1, area, margin, align, fixed, order });
         }
         if items.is_empty() {
             return 0.0;
@@ -2803,6 +2811,7 @@ impl<'a> Layout<'a> {
 
         // Named placements reserve their cells before automatic placement,
         // regardless of the order in which elements occur in the document.
+        items.sort_by_key(|i| i.order);
         // explicit lines past the template add implicit (auto) columns
         let widest = items.iter().filter_map(|i| i.fixed.0.map(|(c, n)| c + n)).max().unwrap_or(0);
         if widest > columns {
@@ -3432,6 +3441,16 @@ mod tests {
         let pos = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(w) => Some((*x, *baseline)), _ => None }).unwrap();
         assert!((pos("middle").0 - 100.0).abs() < 1.0, "{:?}", pos("middle"));
         assert_eq!(pos("left").1, pos("middle").1, "both in the first row");
+    }
+
+    #[test]
+    fn order_rearranges_flex_items() {
+        let fonts = fonts();
+        let doc = parse_document("<body style='margin:0'><div style='display:flex'><div style='order:2'>second</div><div>first</div></div></body>");
+        let sheet = crate::css::Stylesheet::default();
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let x = |w: &str| page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains(w) => Some(*x), _ => None }).unwrap();
+        assert!(x("first") < x("second"));
     }
 
     #[test]

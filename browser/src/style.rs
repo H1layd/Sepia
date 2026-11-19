@@ -302,6 +302,8 @@ pub struct Style {
     pub grid_column_lines: Option<(String, String)>,
     /// aspect-ratio: width / height
     pub aspect_ratio: Option<f32>,
+    /// `order` of a flex or grid item
+    pub order: i32,
     pub grid_row_lines: Option<(String, String)>,
     /// custom properties in scope (inherited), last definition wins
     pub vars: Arc<crate::css::Vars>,
@@ -379,6 +381,7 @@ impl Default for Style {
             grid_area: None,
             grid_column_lines: None,
             aspect_ratio: None,
+            order: 0,
             grid_row_lines: None,
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
@@ -1690,6 +1693,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.grid_area = Some(value.to_string());
             }
         }
+        "order" => style.order = value.parse::<i32>().unwrap_or(0),
         "aspect-ratio" => {
             let v = value.replace("auto", "");
             let (a, b) = v.split_once('/').unwrap_or((v.as_str(), "1"));

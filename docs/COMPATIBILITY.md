@@ -25,6 +25,7 @@
 | `aspect-ratio` у блоков без высоты | Netlify: блок героя получил высоту как в Chrome |
 | Строки grid растягиваются до заданной высоты/`min-height` (`align-content: normal`), `align-items` центрирует в них | Netlify: заголовок героя по центру, как в Chrome |
 | Логические свойства → физические: `margin-inline`, `padding-block`, `inline-size`, `max-inline-size`, `inset-inline-start`, `border-inline` и др. (Tailwind v4 пишет через них даже `mx-auto`) | Netlify: заголовок переносится по `max-inline-size: 27rem`; web.dev 37,5 → 63,4; GitHub: тексты коммитов в таблице файлов |
+| `order` у элементов flex и grid (стабильная сортировка перед размещением) | тест `order_rearranges_flex_items`; раскладка Primer у GitHub задаёт его колонкам |
 
 Проверка на регрессии после этих правок: сид 42 — медиана 55,1 → 60,4; сид 3 —
 web.dev 37,5 → 63,4, spiegel 43,2 → 47,8. GitHub в одном прогоне дал 46 из-за
