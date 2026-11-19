@@ -309,7 +309,7 @@ fn finish(
     fetch: Option<ImageFetch>,
     defer_images: bool,
 ) -> (Loaded, Option<Session>, Option<LateImages>) {
-    let document = dom::parse_document(&html);
+    let document = dom::complete_document(dom::parse_document(&html));
     let script_count = count_scripts(&document);
     let mut icon = None;
     let title = {

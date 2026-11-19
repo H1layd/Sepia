@@ -151,6 +151,77 @@ pub fn parse_document(source: &str) -> Node {
     root
 }
 
+/// A page as the HTML parser leaves it in a browser: one `<html>` holding a
+/// `<head>` and a `<body>`, created when the source leaves them out (scripts
+/// expect `document.documentElement` and `document.body`). Metadata before
+/// the first content goes to the head, the rest to the body.
+pub fn complete_document(mut doc: Node) -> Node {
+    let is_meta = |n: &Node| matches!(n.tag.as_str(), "meta" | "title" | "link" | "style" | "script" | "base" | "noscript" | "template")
+        || n.text.as_deref().is_some_and(|t| t.trim().is_empty())
+        || n.tag == "#comment";
+    // everything under one <html>
+    let html_at = doc.children.iter().position(|n| n.tag == "html");
+    let mut html = match html_at {
+        Some(i) => {
+            let mut html = doc.children.remove(i);
+            // stray nodes outside <html> (before or after it) belong inside it
+            let outside: Vec<Node> = doc.children.drain(..).filter(|n| n.tag != "#comment").collect();
+            let (before, after): (Vec<Node>, Vec<Node>) = {
+                let mut b = Vec::new();
+                let mut a = Vec::new();
+                for (k, n) in outside.into_iter().enumerate() {
+                    if k < i { b.push(n) } else { a.push(n) }
+                }
+                (b, a)
+            };
+            let mut kids = before;
+            kids.append(&mut html.children);
+            kids.extend(after);
+            html.children = kids;
+            html
+        }
+        None => {
+            let mut html = Node::element("html");
+            html.children = std::mem::take(&mut doc.children);
+            html
+        }
+    };
+    let has_body = html.children.iter().any(|n| matches!(n.tag.as_str(), "body" | "frameset"));
+    let has_head = html.children.iter().any(|n| n.tag == "head");
+    if !has_head || !has_body {
+        let mut head = None;
+        let mut body = None;
+        let mut leading: Vec<Node> = Vec::new();
+        let mut rest: Vec<Node> = Vec::new();
+        let mut in_content = false;
+        for n in std::mem::take(&mut html.children) {
+            match n.tag.as_str() {
+                "head" => head = Some(n),
+                "body" | "frameset" => { in_content = true; body = Some(n); }
+                _ if body.is_some() => {
+                    // after </body>: into the body, as the parser does
+                    if let Some(b) = body.as_mut() { b.children.push(n); }
+                }
+                _ if !in_content && is_meta(&n) && head.is_none() => leading.push(n),
+                _ => { in_content = true; rest.push(n); }
+            }
+        }
+        let mut head = head.unwrap_or_else(|| Node::element("head"));
+        if !leading.is_empty() {
+            head.children.extend(leading);
+        }
+        let mut body = body.unwrap_or_else(|| Node::element("body"));
+        if !rest.is_empty() {
+            let mut kids = rest;
+            kids.append(&mut body.children);
+            body.children = kids;
+        }
+        html.children = vec![head, body];
+    }
+    doc.children.push(html);
+    doc
+}
+
 /// Body content, or the whole document when there is no body element.
 #[allow(dead_code)] // kept for callers outside the engine
 pub fn body(document: &Node) -> &Node {
@@ -160,6 +231,20 @@ pub fn body(document: &Node) -> &Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documents_get_html_head_and_body() {
+        let doc = complete_document(parse_document("<title>t</title><p>a</p>"));
+        assert_eq!(doc.children.len(), 1);
+        let html = &doc.children[0];
+        assert_eq!(html.tag, "html");
+        assert_eq!(html.children.iter().map(|n| n.tag.as_str()).collect::<Vec<_>>(), vec!["head", "body"]);
+        assert_eq!(html.children[0].find_first("title").map(|t| t.text_content()), Some("t".into()));
+        assert_eq!(html.children[1].find_first("p").map(|t| t.text_content()), Some("a".into()));
+        // a full document stays as it is
+        let full = complete_document(parse_document("<html><head><title>x</title></head><body><p>b</p></body></html>"));
+        assert_eq!(full.children[0].children.len(), 2);
+    }
 
     #[test]
     fn nests_elements() {

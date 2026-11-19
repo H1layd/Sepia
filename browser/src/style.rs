@@ -805,7 +805,8 @@ fn eval_calc(expr: &str, font_size: f32, percent_base: f32) -> Option<f32> {
 }
 
 fn parse_four(value: &str, font_size: f32, percent_base: f32) -> Option<Edges> {
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    // `calc(.25rem * 12)` is one value: split outside parentheses only
+    let parts: Vec<String> = split_space(value);
     let values: Vec<f32> = parts
         .iter()
         .map(|p| parse_length(p, font_size, percent_base))
@@ -1634,7 +1635,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         }
         "bottom" => style.bottom = parse_length(value, font_size, containing_width),
         "inset" => {
-            let parts: Vec<Option<f32>> = value.split_whitespace().map(|v| parse_length(v, font_size, containing_width)).collect();
+            let parts: Vec<Option<f32>> = split_space(value).iter().map(|v| parse_length(v, font_size, containing_width)).collect();
             let at = |i: usize| parts.get(i).copied().flatten();
             let (t, r, b, l) = match parts.len() {
                 1 => (at(0), at(0), at(0), at(0)),
@@ -1788,7 +1789,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "gap" | "grid-gap" => {
-            let mut parts = value.split_whitespace().filter_map(|v| parse_length(v, font_size, containing_width));
+            let mut parts = split_space(value).into_iter().filter_map(|v| parse_length(&v, font_size, containing_width));
             if let Some(row) = parts.next() {
                 style.flex.row_gap = row;
                 style.flex.column_gap = parts.next().unwrap_or(row);
@@ -1842,7 +1843,8 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         }
         "margin" => {
             // `auto` counts as 0 for the box and is remembered for centring
-            let parts: Vec<&str> = value.split_whitespace().collect();
+            let owned = split_space(value);
+            let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
             let (right, left) = match parts.len() {
                 1 => (parts[0], parts[0]),
                 2 | 3 => (parts[1], parts[1]),
@@ -2019,6 +2021,18 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn box_shorthands_keep_calc_with_spaces_whole() {
+        let doc = parse_document("<div style='padding: calc(.25rem * 12) 4px; margin: calc(1px + 2px) auto; gap: calc(2px * 3)'>x</div>");
+        let sheet = Stylesheet::default();
+        let d = doc.find_first("div").unwrap();
+        let s = compute(d, Some(&default_style("body")), &sheet, &[&doc], 800.0);
+        assert_eq!((s.padding.top, s.padding.left), (48.0, 4.0));
+        assert_eq!(s.margin.top, 3.0);
+        assert_eq!(s.margin_auto, (true, true));
+        assert_eq!(s.flex.row_gap, 6.0);
+    }
 
     #[test]
     fn root_rem_is_the_initial_size() {
