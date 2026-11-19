@@ -438,6 +438,8 @@ struct State {
     /// requests a page's fetch()/XHR started, answered on background threads
     inflight: Vec<Inflight>,
     image_loads: Vec<ImageLoad>,
+    /// Web Animations still running (finite ones): the page is not settled yet
+    animations: i32,
     /// answers ready without a trip (from the page's cache), waiting to be handed over
     ready: Vec<(u32, Result<crate::net::Response, String>)>,
     next_request: u32,
@@ -930,6 +932,12 @@ macro_rules! native {
 }
 
 fn register_canvas(ctx: &mut Context) {
+    // +1 when a finite animation starts, -1 when it ends
+    native!(ctx, "__anim_busy", 1, |_, a, ctx| {
+        let d = arg_num(a, 0, ctx) as i32;
+        with(|st| st.animations = (st.animations + d).max(0));
+        Ok(JsValue::undefined())
+    });
     use crate::canvas2d as cv;
     native!(ctx, "__cv_init", 3, |_, a, ctx| {
         cv::init(arg_id(a, 0).max(0) as usize, arg_num(a, 1, ctx) as u32, arg_num(a, 2, ctx) as u32);
@@ -2785,7 +2793,7 @@ impl Session {
 
     /// Requests the page started that have not been answered and handed over yet.
     pub fn network_busy(&self) -> bool {
-        with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.image_loads.is_empty())
+        with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.image_loads.is_empty() || st.animations > 0)
     }
 
     pub fn next_timer_delay(&mut self) -> Option<Duration> {
@@ -3396,6 +3404,20 @@ mod tests {
         let outcome = s.handle(PageEvent::Click { node: id, href: Some("/x".into()) }, &Fonts::load());
         assert!(text(&s).ends_with("load a div "), "{} {:?}", text(&s), s.log());
         assert!(outcome.navigate.is_none(), "return false cancels the link");
+    }
+
+    #[test]
+    fn web_animations_finish_and_fill_forwards() {
+        let mut s = run(
+            "<p id=o></p><div id=d style='opacity:0'></div>",
+            "const d = document.getElementById('d');
+             const a = d.animate({ opacity: [0, 1] }, { duration: 50, fill: 'both' });
+             let fin = 0;
+             a.onfinish = () => { fin++; };
+             a.finished.then(() => { document.getElementById('o').textContent = a.playState + ' ' + fin + ' ' + d.style.opacity; });",
+        );
+        advance_clock(&mut s, 1000);
+        assert!(text(&s).ends_with("finished 1 1"), "{} {:?}", text(&s), s.log());
     }
 
     #[test]

@@ -525,7 +525,10 @@
     get value() { const v = this.getAttribute('value'); if (v !== null) return v; return this.localName === 'textarea' ? this.textContent : this.localName === 'select' ? selectValue(this) : ''; }
     set value(v) { this.setAttribute('value', v == null ? '' : String(v)); }
     get form() { return this.closest('form'); }
-    animate() { return { finished: Promise.resolve(), cancel() {}, onfinish: null }; }
+    // Web Animations: no frames are drawn in between, but an animation runs
+    // for its time and then finishes (onfinish, finished, fill: forwards)
+    animate(keyframes, options) { return G.__sepia_animate(this, keyframes, options); }
+    getAnimations() { return (this.__sepiaAnimations || []).filter(a => a.playState === 'running' || a.playState === 'paused'); }
   }
   for (const name of reflected) {
     Object.defineProperty(Element.prototype, name, {
@@ -2734,6 +2737,96 @@
   Response.prototype.arrayBuffer = function () { return Promise.resolve(new G.TextEncoder().encode(this.__body).buffer); };
   Response.prototype.blob = function () { return Promise.resolve(new G.Blob([this.__body], { type: this.headers.get('content-type') || '' })); };
   Response.prototype.bodyUsed = false;
+  // ----- Web Animations API ----------------------------------------------------
+  {
+    const toFrames = kf => {
+      if (!kf) return [];
+      if (Array.isArray(kf)) return kf;
+      const keys = Object.keys(kf).filter(k => !['offset', 'easing', 'composite'].includes(k));
+      const n = Math.max(1, ...keys.map(k => Array.isArray(kf[k]) ? kf[k].length : 1));
+      return [...Array(n)].map((_, i) => Object.fromEntries(keys.map(k => [k, Array.isArray(kf[k]) ? kf[k][Math.min(i, kf[k].length - 1)] : kf[k]])));
+    };
+    const cssName = k => k === 'cssFloat' ? 'float' : k.startsWith('--') ? k : k.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
+    const applyFrame = (el, frame) => {
+      if (!el || !el.style || !frame) return;
+      for (const [k, v] of Object.entries(frame)) {
+        if (['offset', 'easing', 'composite'].includes(k) || v === undefined || v === null) continue;
+        try { el.style.setProperty(cssName(k), String(v)); } catch (e) {}
+      }
+    };
+    class KeyframeEffect {
+      constructor(target, keyframes, options) { this.target = target; this.__frames = toFrames(keyframes); this.__timing = typeof options === 'number' ? { duration: options } : { ...(options || {}) }; }
+      getKeyframes() { return this.__frames.map(f => ({ ...f })); }
+      setKeyframes(k) { this.__frames = toFrames(k); }
+      getTiming() { return { delay: 0, endDelay: 0, fill: 'auto', iterations: 1, duration: 'auto', direction: 'normal', easing: 'linear', ...this.__timing }; }
+      getComputedTiming() { const t = this.getTiming(); return { ...t, activeDuration: (+t.duration || 0) * (t.iterations === Infinity ? Infinity : (+t.iterations || 1)), progress: null, currentIteration: null }; }
+      updateTiming(t) { Object.assign(this.__timing, t || {}); }
+    }
+    class Animation extends EventTarget {
+      constructor(effect) {
+        super();
+        this.effect = effect || null; this.id = ''; this.playbackRate = 1; this.startTime = null; this.currentTime = 0;
+        this.playState = 'idle'; this.pending = false; this.replaceState = 'active'; this.timeline = document.timeline;
+        this.onfinish = null; this.oncancel = null; this.onremove = null;
+        this.__newPromise();
+        this.ready = Promise.resolve(this);
+      }
+      __newPromise() { this.finished = new Promise((ok, fail) => { this.__ok = ok; this.__fail = fail; }); this.finished.catch(() => {}); }
+      play() {
+        if (this.playState === 'running') return;
+        this.playState = 'running';
+        const t = this.effect ? this.effect.getTiming() : { duration: 0, delay: 0, iterations: 1 };
+        if (t.iterations === Infinity) return;
+        const total = Math.max(0, (+t.delay || 0) + (+t.duration || 0) * (+t.iterations || 1) + (+t.endDelay || 0)) / Math.abs(this.playbackRate || 1);
+        // entrance animations of a loading page hold its snapshot until they end
+        // (short ones, early on: a looping carousel must not hold it forever)
+        if (!this.__busy && total <= 3000 && performance.now() < 8000) { this.__busy = true; __anim_busy(1); }
+        clearTimeout(this.__timer);
+        this.__timer = setTimeout(() => this.finish(), Math.min(total, 10000));
+      }
+      __idle() { if (this.__busy) { this.__busy = false; __anim_busy(-1); } }
+      pause() { if (this.playState === 'running') { clearTimeout(this.__timer); this.playState = 'paused'; this.__idle(); } }
+      finish() {
+        if (this.playState === 'finished') return;
+        clearTimeout(this.__timer);
+        this.__idle();
+        this.playState = 'finished';
+        const t = this.effect ? this.effect.getTiming() : {};
+        const frames = this.effect ? this.effect.__frames : [];
+        if ((t.fill === 'forwards' || t.fill === 'both') && frames.length) applyFrame(this.effect.target, this.playbackRate < 0 ? frames[0] : frames[frames.length - 1]);
+        this.currentTime = (+t.duration || 0) * (+t.iterations || 1);
+        const ev = new Event('finish'); ev.currentTime = this.currentTime; ev.timelineTime = performance.now();
+        this.dispatchEvent(ev);
+        this.__ok(this);
+      }
+      cancel() {
+        if (this.playState === 'idle') return;
+        clearTimeout(this.__timer);
+        this.__idle();
+        const was = this.playState;
+        this.playState = 'idle';
+        if (was !== 'finished') this.__fail(new DOMException('The user aborted a request.', 'AbortError'));
+        this.__newPromise();
+        const ev = new Event('cancel');
+        this.dispatchEvent(ev);
+      }
+      reverse() { this.playbackRate = -this.playbackRate; if (this.playState !== 'running') this.play(); }
+      updatePlaybackRate(r) { this.playbackRate = +r || 1; }
+      commitStyles() { const f = this.effect ? this.effect.__frames : []; if (f.length) applyFrame(this.effect.target, f[f.length - 1]); }
+      persist() { this.replaceState = 'persisted'; }
+    }
+    G.KeyframeEffect = KeyframeEffect; G.Animation = Animation;
+    G.__sepia_animate = (el, keyframes, options) => {
+      const a = new Animation(new KeyframeEffect(el, keyframes, options));
+      if (options && typeof options === 'object' && options.id) a.id = String(options.id);
+      (el.__sepiaAnimations ||= []).push(a);
+      a.play();
+      return a;
+    };
+    if (!document.timeline) Object.defineProperty(document, 'timeline', { value: { get currentTime() { return performance.now(); } }, configurable: true });
+    if (!document.getAnimations) document.getAnimations = () => [];
+  }
+
   // ----- <img> loading from scripts: fetched and decoded natively, then load/error
   {
     const I = classes.Image.prototype;

@@ -2730,6 +2730,7 @@ impl<'a> Layout<'a> {
             }
         }
         let names = line_names(style.grid_columns.as_deref().unwrap_or(""));
+        let explicit_rows = style.grid_areas.as_ref().map_or(0, Vec::len);
         let mut columns = tracks.len().max(1);
 
         // items and their places
@@ -2779,7 +2780,9 @@ impl<'a> Layout<'a> {
                     order = s.order;
                     fixed = (
                         s.grid_column_lines.as_ref().and_then(|l| grid_lines(l, &names, columns)),
-                        s.grid_row_lines.as_ref().and_then(|l| grid_lines(l, &[], usize::MAX / 4)),
+                        // rows count from the explicit ones (template areas), as in CSS:
+                        // with none, `-1` is the first line
+                        s.grid_row_lines.as_ref().and_then(|l| grid_lines(l, &[], explicit_rows)),
                     );
                     (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align), s.grid_area)
                 }
@@ -3180,14 +3183,18 @@ fn grid_lines(pair: &(String, String), names: &[Vec<String>], tracks: usize) -> 
         }
         _ => P::Auto,
     };
-    match (start, end) {
+    // no item spans more than this many tracks (a stray `-1` must not mean billions)
+    const MOST: usize = 1000;
+    let clamp = |(s, n): (usize, usize)| (s.min(MOST), n.clamp(1, MOST));
+    let placed = match (start, end) {
         (P::Line(s), P::Line(e)) if e != s => Some((s.min(e), (s.max(e) - s.min(e)).max(1))),
         (P::Line(s), P::Line(_)) | (P::Line(s), P::Auto) => Some((s, 1)),
         (P::Line(s), P::Span(n)) => Some((s, n)),
         (P::Span(n), P::Line(e)) => Some((e.saturating_sub(n), n.min(e.max(1)))),
         (P::Auto, P::Line(e)) => Some((e.saturating_sub(1), 1)),
         _ => None,
-    }
+    };
+    placed.map(clamp)
 }
 
 impl InlineItem {
@@ -3436,6 +3443,10 @@ mod tests {
         assert_eq!(grid_lines(&pair("2", "-1"), &names, 3), Some((1, 2)));
         assert_eq!(grid_lines(&pair("1", "span 2"), &names, 3), Some((0, 2)));
         assert_eq!(grid_lines(&pair("auto", "auto"), &names, 3), None);
+        // rows without a template: `1 / -1` is one row, never billions
+        assert_eq!(grid_lines(&pair("1", "-1"), &[], 0), Some((0, 1)));
+        assert_eq!(grid_lines(&pair("span 999999", "auto"), &[], 0), None);
+        assert_eq!(grid_lines(&pair("2", "span 999999"), &[], 0), Some((1, 1000)));
     }
 
     #[test]
