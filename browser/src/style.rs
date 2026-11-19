@@ -920,7 +920,15 @@ pub fn compute(
     if node.tag == "html" {
         ROOT_FONT.with(|r| r.set(16.0));
     }
-    let matched = sheet.matching(node, ancestors);
+    // a generated ::before / ::after box: the rules for its element (the parent)
+    let matched = match node.tag.as_str() {
+        "::before" | "::after" if !ancestors.is_empty() => {
+            let host = ancestors[ancestors.len() - 1];
+            let kind = if node.tag == "::before" { 1 } else { 2 };
+            std::rc::Rc::new(sheet.matching_pseudo(host, &ancestors[..ancestors.len() - 1], kind))
+        }
+        _ => sheet.matching(node, ancestors),
+    };
     let inline: Vec<Declaration> = node.attr("style").map(parse_declarations).unwrap_or_default();
     // (declaration, from a stylesheet: its text lives as long as the layout)
     let declarations: Vec<(&Declaration, bool)> = matched.iter().map(|d| (d, true)).chain(inline.iter().map(|d| (d, false))).collect();

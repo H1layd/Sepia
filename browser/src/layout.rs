@@ -365,6 +365,9 @@ impl<'a> Layout<'a> {
     /// last child, and the root background becomes the canvas, as in CSS.
     pub fn build(mut self, root: &Node) -> Page {
         let _matching_scope = crate::css::cache_layout_matches();
+        // ::before / ::after boxes, where the sheet gives an element `content`
+        let generated = with_generated_content(root, self.sheet);
+        let root = generated.as_ref().unwrap_or(root);
         let html = if root.tag == "html" { Some(root) } else { root.find_first("html") };
         let synthetic;
         let body: &Node = match root.find_first("body") {
@@ -3151,6 +3154,134 @@ fn parse_tracks(value: &str, width: f32, gap: f32, font_size: f32) -> Vec<Track>
     tracks
 }
 
+/// A copy of the tree with `::before` / `::after` children for the elements
+/// whose pseudo-element rules give a `content` (None when the sheet has no
+/// such rules). The generated nodes are tagged `::before` / `::after`; their
+/// style comes from those rules (style::compute), their text from `content`.
+fn with_generated_content(root: &Node, sheet: &crate::css::Stylesheet) -> Option<Node> {
+    if !sheet.has_pseudo_rules() {
+        return None;
+    }
+    fn skip(node: &Node) -> bool {
+        node.text.is_some() || node.tag.starts_with('#') && node.tag != "#document"
+            || matches!(node.tag.as_str(), "img" | "input" | "br" | "svg" | "canvas" | "video" | "audio" | "iframe" | "select" | "textarea"
+                | "head" | "script" | "style" | "template" | "meta" | "link" | "title" | "noscript" | "option" | "object" | "embed")
+    }
+    fn walk<'n>(node: &'n Node, ancestors: &mut Vec<&'n Node>, sheet: &crate::css::Stylesheet) -> Node {
+        let mut out = Node { tag: node.tag.clone(), attrs: node.attrs.clone(), text: node.text.clone(), children: Vec::with_capacity(node.children.len()) };
+        if skip(node) {
+            out.children = node.children.clone();
+            return out;
+        }
+        ancestors.push(node);
+        for child in &node.children {
+            out.children.push(walk(child, ancestors, sheet));
+        }
+        ancestors.pop();
+        if node.tag == "#document" {
+            return out;
+        }
+        for kind in [1u8, 2u8] {
+            let Some(content) = sheet.pseudo_content(node, ancestors, kind) else { continue };
+            let Some(text) = content_text(&content, node) else { continue };
+            let mut generated = Node::element(if kind == 1 { "::before" } else { "::after" });
+            if !text.is_empty() {
+                generated.children.push(Node::text_node(&text));
+            }
+            if kind == 1 {
+                out.children.insert(0, generated);
+            } else {
+                out.children.push(generated);
+            }
+        }
+        out
+    }
+    let mut ancestors = Vec::new();
+    Some(walk(root, &mut ancestors, sheet))
+}
+
+/// The text a `content` value generates: strings (with CSS escapes),
+/// `attr(x)`, quotes; None for `none` / `normal`. Counters and images give
+/// nothing, but the box still exists (icons drawn by its background).
+fn content_text(value: &str, node: &Node) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v == "none" || v == "normal" || v.starts_with("var(") && !v.contains('"') && !v.contains('\'') {
+        return if v.starts_with("var(") { Some(String::new()) } else { None };
+    }
+    let chars: Vec<char> = v.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' || c == '\'' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && i - start < 6 && chars[i].is_ascii_hexdigit() {
+                        i += 1;
+                    }
+                    if i > start {
+                        let hex: String = chars[start..i].iter().collect();
+                        if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                            out.push(ch);
+                        }
+                        if i < chars.len() && chars[i] == ' ' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if chars[i] != '\n' {
+                        out.push(chars[i]);
+                    }
+                    i += 1;
+                    continue;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '/' {
+            break; // alternative text follows
+        }
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // a keyword or a function
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '(' && chars[i] != '"' && chars[i] != '\'' {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect::<String>().to_ascii_lowercase();
+        if i < chars.len() && chars[i] == '(' {
+            let mut depth = 0;
+            let arg_start = i + 1;
+            while i < chars.len() {
+                if chars[i] == '(' { depth += 1; }
+                if chars[i] == ')' { depth -= 1; if depth == 0 { break; } }
+                i += 1;
+            }
+            let arg: String = chars[arg_start..i.min(chars.len())].iter().collect();
+            i += 1;
+            if word == "attr" {
+                let name = arg.split(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("").trim();
+                out.push_str(node.attr(name).unwrap_or(""));
+            }
+            continue;
+        }
+        match word.as_str() {
+            "open-quote" => out.push('\u{201C}'),
+            "close-quote" => out.push('\u{201D}'),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
 /// Line names of a track list (`[a b] 1fr [c] 2fr`): entry i names the line
 /// before track i (the last one, the end line).
 fn line_names(value: &str) -> Vec<Vec<String>> {
@@ -3567,6 +3698,17 @@ mod tests {
         let (l, m, r) = (pos("left"), pos("mid"), pos("right"));
         assert_eq!(l.1, r.1, "contents children wrapped to new lines");
         assert!(l.0 < m.0 && m.0 < r.0, "{l:?} {m:?} {r:?}");
+    }
+
+    #[test]
+    fn before_and_after_generate_content() {
+        let fonts = fonts();
+        let doc = parse_document("<body><p class=q data-n='7'>mid</p></body>");
+        let sheet = crate::css::Stylesheet::parse(".q::before { content: '\\201C' attr(data-n) ' ' } .q::after { content: \"!\"; color: red } p::after { display: inline }");
+        let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+        let text: String = page.draws.iter().filter_map(|d| match d { Draw::Text { text, .. } => Some(text.as_str()), _ => None }).collect::<Vec<_>>().join("");
+        assert!(text.contains("\u{201C}7") && text.contains("mid") && text.ends_with('!'), "{text:?}");
+        assert!(page.draws.iter().any(|d| matches!(d, Draw::Text { text, color, .. } if text.contains('!') && color.r == 255)));
     }
 
     #[test]

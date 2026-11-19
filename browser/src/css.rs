@@ -286,6 +286,8 @@ pub struct Compound {
     pub classes: Vec<String>,
     pub attrs: Vec<AttrSelector>,
     pub pseudos: Vec<Pseudo>,
+    /// `::before` (1) or `::after` (2): the rule styles that generated box
+    pub pseudo_element: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -511,8 +513,13 @@ fn parse_compound(text: &str) -> Option<Compound> {
                     arg = Some(chars[i + 1..j.min(chars.len())].iter().collect::<String>());
                     i = j + 1;
                 }
-                // ::before, ::after, ::placeholder…: generated content we do not draw
-                if element || matches!(name.as_str(), "before" | "after" | "first-line" | "first-letter") {
+                // ::before / ::after: generated boxes (see Stylesheet::matching_pseudo)
+                if name == "before" || name == "after" {
+                    compound.pseudo_element = if name == "before" { 1 } else { 2 };
+                    continue;
+                }
+                // ::placeholder, ::first-line…: not drawn
+                if element || matches!(name.as_str(), "first-line" | "first-letter") {
                     compound.pseudos.push(Pseudo::Never);
                     continue;
                 }
@@ -867,6 +874,11 @@ pub struct Stylesheet {
     /// Height used by viewport media conditions.
     pub viewport_height: f32,
     candidates: std::sync::OnceLock<RuleIndex>,
+    pseudo_rules: std::sync::OnceLock<bool>,
+    /// the ::before / ::after rules only, indexed like `candidates`
+    pseudo_index: std::sync::OnceLock<RuleIndex>,
+    /// those of them that set `content` (only they make a box exist)
+    content_index: std::sync::OnceLock<RuleIndex>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -886,7 +898,7 @@ impl PartialEq for Stylesheet {
 
 impl Default for Stylesheet {
     fn default() -> Stylesheet {
-        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), viewport_width: 1024.0, viewport_height: 800.0, candidates: Default::default() }
+        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), viewport_width: 1024.0, viewport_height: 800.0, candidates: Default::default(), pseudo_rules: Default::default(), pseudo_index: Default::default(), content_index: Default::default() }
     }
 }
 
@@ -959,6 +971,9 @@ impl Stylesheet {
 
     pub fn append(&mut self, other: Stylesheet) {
         self.candidates.take();
+        self.pseudo_rules.take();
+        self.pseudo_index.take();
+        self.content_index.take();
         let base = self.rules.len();
         for mut rule in other.rules {
             rule.order += base;
@@ -1125,11 +1140,45 @@ impl Stylesheet {
     }
 
     fn matching_uncached(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> Vec<Declaration> {
-        let index = self.candidates.get_or_init(|| {
+        self.matching_kind(node, ancestors, 0)
+    }
+
+    /// Declarations for `node`'s `::before` (1) or `::after` (2) box.
+    pub fn matching_pseudo(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node], kind: u8) -> Vec<Declaration> {
+        if !self.has_pseudo_rules() {
+            return Vec::new();
+        }
+        self.matching_kind(node, ancestors, kind)
+    }
+
+    /// Whether any rule styles a ::before / ::after box.
+    pub fn has_pseudo_rules(&self) -> bool {
+        *self.pseudo_rules.get_or_init(|| self.rules.iter().any(|r| r.selector.chain.last().is_some_and(|c| c.pseudo_element != 0)))
+    }
+
+    /// The `content` of `node`'s ::before (1) / ::after (2) box, if a rule gives one.
+    pub fn pseudo_content(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node], kind: u8) -> Option<String> {
+        if !self.has_pseudo_rules() {
+            return None;
+        }
+        self.matching_in(&self.content_index, true, node, ancestors, kind)
+            .into_iter().rev().find(|d| d.name == "content").map(|d| d.value)
+    }
+
+    fn matching_kind(&self, node: &crate::dom::Node, ancestors: &[&crate::dom::Node], kind: u8) -> Vec<Declaration> {
+        let slot = if kind == 0 { &self.candidates } else { &self.pseudo_index };
+        self.matching_in(slot, false, node, ancestors, kind)
+    }
+
+    fn matching_in(&self, slot: &std::sync::OnceLock<RuleIndex>, content_only: bool, node: &crate::dom::Node, ancestors: &[&crate::dom::Node], kind: u8) -> Vec<Declaration> {
+        let index = slot.get_or_init(|| {
             let mut index = RuleIndex { len: self.rules.len(), ..RuleIndex::default() };
             for (i, rule) in self.rules.iter().enumerate() {
                 let Some(last) = rule.selector.chain.last() else { continue };
                 if last.pseudos.iter().any(|p| matches!(p, Pseudo::Never)) { continue; }
+                // each index holds only its own kind of rule
+                if (last.pseudo_element != 0) != (kind != 0) { continue; }
+                if content_only && !rule.declarations.iter().any(|d| d.name == "content") { continue; }
                 let key = last.id.as_ref().map(|id| (0, id.clone()))
                     .or_else(|| last.classes.first().map(|class| (1, class.clone())))
                     .or_else(|| last.tag.as_ref().map(|tag| (2, tag.clone())));
@@ -1154,7 +1203,8 @@ impl Stylesheet {
         candidates.dedup();
         let mut hits: Vec<(u32, usize, &Rule)> = candidates.into_iter()
             .filter_map(|i| self.rules.get(i))
-            .filter(|rule| rule.media.matches_viewport(self.viewport_width, self.viewport_height) && matches_selector(&rule.selector, node, ancestors))
+            .filter(|rule| rule.selector.chain.last().map_or(0, |c| c.pseudo_element) == kind)
+            .filter(|rule| rule.media.matches_viewport(self.viewport_width, self.viewport_height) && if kind == 0 { matches_selector(&rule.selector, node, ancestors) } else { matches_for_pseudo(&rule.selector, node, ancestors) })
             .map(|rule| (rule.selector.specificity(), rule.order, rule))
             .collect();
         hits.sort_by_key(|(spec, order, _)| (*spec, *order));
@@ -1237,8 +1287,17 @@ pub fn parse_declarations(body: &str) -> Vec<Declaration> {
 // ---------------------------------------------------------------------------
 
 pub fn matches_selector(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
+    // `p::before` selects a generated box, never the element itself
+    if selector.chain.last().is_some_and(|c| c.pseudo_element != 0) {
+        return false;
+    }
     let last = selector.chain.len() - 1;
     match_from(selector, last, node, ancestors)
+}
+
+/// Does `selector` (ending in ::before / ::after) select `node`'s generated box?
+fn matches_for_pseudo(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
+    match_from(selector, selector.chain.len() - 1, node, ancestors)
 }
 
 /// Does `selector.chain[..=index]` match with `chain[index]` on `node`?
