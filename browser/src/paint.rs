@@ -338,6 +338,38 @@ impl Canvas {
         }
     }
 
+    /// A background-repeat: `bitmap` scaled to one tile, repeated over
+    /// `rect` on the grid through `tile`'s origin (device pixels).
+    fn draw_tiled(&mut self, rect: Rect, tile: Rect, bitmap: &Bitmap) {
+        let (tw, th) = (tile.w.round().max(1.0) as usize, tile.h.round().max(1.0) as usize);
+        // a huge tile is just an image; tiny ones would cost a scaled copy each
+        if tw > 8192 || th > 8192 {
+            return;
+        }
+        let pixels = bitmap.scaled(tw, th);
+        let (x0, y0) = (rect.x.round().max(0.0) as i64, rect.y.round().max(0.0) as i64);
+        let x1 = ((rect.x + rect.w).round() as i64).min(self.width as i64);
+        let y1 = ((rect.y + rect.h).round() as i64).min(self.height as i64);
+        let (ox, oy) = (tile.x.round() as i64, tile.y.round() as i64);
+        for y in y0..y1 {
+            let sy = (y - oy).rem_euclid(th as i64) as usize;
+            for x in x0..x1 {
+                let sx = (x - ox).rem_euclid(tw as i64) as usize;
+                let s = &pixels[(sy * tw + sx) * 4..(sy * tw + sx) * 4 + 4];
+                if s[3] == 0 {
+                    continue;
+                }
+                let index = (y as usize * self.width + x as usize) * 4;
+                let keep = 255 - s[3] as u32;
+                for c in 0..3 {
+                    let dst = self.pixels[index + c] as u32;
+                    self.pixels[index + c] = (s[c] as u32 + (dst * keep + 127) / 255).min(255) as u8;
+                }
+                self.pixels[index + 3] = 255;
+            }
+        }
+    }
+
     /// Composite a premultiplied RGBA bitmap (colour emoji): dst = src + dst·(1−a).
     fn blit_premultiplied(&mut self, rgba: &[u8], w: usize, h: usize, left: i32, top: i32) {
         for gy in 0..h {
@@ -413,11 +445,14 @@ impl Canvas {
                         self.stroke_rect(map(rect), *width * s, *color, 0.0)
                     }
                 }
-                Draw::Image { rect, image, alt } => {
+                Draw::Image { rect, image, alt, tile } => {
                     if rect.y + rect.h < visible_top || rect.y > visible_bottom {
                         continue;
                     }
-                    self.draw_image(fonts, map(rect), image.as_deref(), alt, s);
+                    match (tile, image.as_deref()) {
+                        (Some(tile), Some(bitmap)) => self.draw_tiled(map(rect), map(tile), bitmap),
+                        _ => self.draw_image(fonts, map(rect), image.as_deref(), alt, s),
+                    }
                 }
                 Draw::Text {
                     x,
@@ -608,6 +643,18 @@ impl Ramp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiles_repeat_on_the_grid_through_their_origin() {
+        // a 2x1 tile (red, blue) repeated over a 5x1 strip from x = 1
+        let bitmap = crate::images::Bitmap::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+        let mut canvas = Canvas::new(6, 1, Color::WHITE);
+        canvas.draw_tiled(Rect { x: 0.0, y: 0.0, w: 5.0, h: 1.0 }, Rect { x: 1.0, y: 0.0, w: 2.0, h: 1.0 }, &bitmap);
+        let reds: Vec<bool> = canvas.pixels.chunks_exact(4).map(|p| p[0] == 255 && p[2] == 0).collect();
+        // x=0 is the blue half of the tile to the left; x=5 is outside
+        assert_eq!(reds, vec![false, true, false, true, false, false]);
+        assert_eq!(&canvas.pixels[5 * 4..5 * 4 + 4], &[255, 255, 255, 255]);
+    }
 
     #[test]
     fn fills_and_clips() {

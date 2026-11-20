@@ -44,7 +44,9 @@ pub enum Draw {
     },
     /// An `<img>`; `image` is None when it could not be fetched or decoded
     /// and paint shows a placeholder with the `alt` text.
-    Image { rect: Rect, image: Option<Arc<Bitmap>>, alt: String },
+    /// A picture in `rect`; with `tile`, repeated over `rect` (a
+    /// background-repeat): one copy per tile, the grid through `tile`'s origin.
+    Image { rect: Rect, image: Option<Arc<Bitmap>>, alt: String, tile: Option<Rect> },
     /// A box background: colour and/or linear gradient, rounded corners.
     Fill { rect: Rect, radius: f32, color: Option<Color>, gradient: Option<Gradient> },
     /// A box border, per side (top, right, bottom, left), rounded corners.
@@ -160,6 +162,24 @@ pub struct Page {
     pub anchors: Vec<(String, f32)>,
     /// positioned boxes and the draws each made, for paint order (z-index)
     pub layers: Vec<Layer>,
+}
+
+/// How a block cuts its lines: `text-overflow: ellipsis` (with overflow
+/// other than visible) ends a line that does not fit in "…";
+/// `-webkit-line-clamp` keeps that many lines, the last ending in "…".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct TextLimits {
+    ellipsis: bool,
+    clamp: Option<u32>,
+}
+
+impl TextLimits {
+    fn of(style: &Style) -> TextLimits {
+        TextLimits {
+            ellipsis: style.ellipsis && (style.clip_x || style.clip_y),
+            clamp: style.line_clamp.filter(|_| style.webkit_box && style.box_vertical),
+        }
+    }
 }
 
 /// A positioned box's draws `start..end` and its z-index (None: auto).
@@ -325,6 +345,8 @@ pub struct Layout<'a> {
     measuring: bool,
     /// the opacity of each box being laid out, innermost last
     opacity_slots: Vec<f32>,
+    /// the block whose lines are being laid out: text-overflow, line-clamp
+    limits: TextLimits,
     /// inside a min/max-content measurement (at any depth): positioned
     /// boxes are out of flow and give their ancestors no size
     intrinsic: bool,
@@ -419,7 +441,7 @@ fn out_of_flow(style: &Style) -> bool {
 impl<'a> Layout<'a> {
     pub fn new(fonts: &'a Fonts, sheet: &'a Stylesheet, viewport_width: f32) -> Layout<'a> {
         crate::style::set_viewport(viewport_width, sheet.viewport_height);
-        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), pending_indent: 0.0, last_margin_bottom: 0.0, last_box: None, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, flex_height: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
+        Layout { fonts, sheet, viewport_width, images: None, measuring: false, intrinsic: false, opacity_slots: Vec::new(), limits: TextLimits::default(), pending_indent: 0.0, last_margin_bottom: 0.0, last_box: None, trailing_margin: 0.0, canvas_node: None, flow_width: viewport_width, blockify: None, flex_main: None, flex_height: None, containers: Vec::new(), exclusions: Vec::new(), page: Page::default() }
     }
 
     /// Decoded images of the document, keyed by `src` as written.
@@ -900,6 +922,7 @@ impl<'a> Layout<'a> {
     #[allow(clippy::too_many_arguments)]
     fn layout_children(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32, collapse_top: f32) -> f32 {
         let saved_flow = std::mem::replace(&mut self.flow_width, width);
+        let saved_limits = std::mem::replace(&mut self.limits, TextLimits::of(style));
         let mut cursor = y;
         let saved_exclusions = self.exclusions.len();
         let mut previous_margin: Option<f32> = Some(collapse_top);
@@ -999,6 +1022,7 @@ impl<'a> Layout<'a> {
         }
         self.trailing_margin = if last_was_block { previous_margin.unwrap_or(0.0) } else { 0.0 };
         self.flow_width = saved_flow;
+        self.limits = saved_limits;
         cursor - y
     }
 
@@ -1267,6 +1291,8 @@ impl<'a> Layout<'a> {
         // Whitespace is a property of the boundary between two runs, so it has
         // to survive element transitions: `</b>, <i>` keeps one space.
         let mut need_space = false;
+        // lines flushed so far, for -webkit-line-clamp
+        let mut lines_done = 0u32;
 
         for item in items {
             if item.br {
@@ -1290,7 +1316,10 @@ impl<'a> Layout<'a> {
                     0.0
                 };
                 if line_width + space + w > lw - indent + FIT_SLACK && line_width > 0.0 && !item.style.nowrap {
-                    self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                    self.pending_indent = 0.0;
+                    return cursor_y - y;
+                }
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                     indent = 0.0;
                     line.clear();
@@ -1310,7 +1339,10 @@ impl<'a> Layout<'a> {
             } else if item.image {
                 let advance = self.text_width(&item.text, &item.style);
                 if line_width + advance > lw - indent + FIT_SLACK && line_width > 0.0 && !item.style.nowrap {
-                    self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                    if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                    self.pending_indent = 0.0;
+                    return cursor_y - y;
+                }
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                     indent = 0.0;
                     line.clear();
@@ -1330,7 +1362,10 @@ impl<'a> Layout<'a> {
                         continue;
                     }
                     if word == "\n" {
-                        self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                        if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                    self.pending_indent = 0.0;
+                    return cursor_y - y;
+                }
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                         indent = 0.0;
                         line.clear();
@@ -1346,7 +1381,10 @@ impl<'a> Layout<'a> {
                         piece_width += self.text_width(" ", &item.style);
                     }
                     if line_width + piece_width > lw - indent + FIT_SLACK && line_width > 0.0 && !item.style.nowrap {
-                        self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                        if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                    self.pending_indent = 0.0;
+                    return cursor_y - y;
+                }
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                         indent = 0.0;
                         line.clear();
@@ -1366,7 +1404,10 @@ impl<'a> Layout<'a> {
                 }
             }
             if line_done {
-                self.flush_line(&mut line, lx, &mut cursor_y, lw, max_size);
+                if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                    self.pending_indent = 0.0;
+                    return cursor_y - y;
+                }
                     (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
                 indent = 0.0;
                 line.clear();
@@ -1384,6 +1425,68 @@ impl<'a> Layout<'a> {
         cursor_y - y
     }
 
+    /// Flush a line that has more content after it. Under line-clamp the
+    /// last allowed line ends in "…" and true says to stop laying out.
+    fn flush_counted(&mut self, line: &mut Vec<(String, InlineItem)>, x: f32, cursor_y: &mut f32, width: f32, max_size: f32, lines_done: &mut u32) -> bool {
+        let last = self.limits.clamp.is_some_and(|n| *lines_done + 1 >= n);
+        if last && !line.is_empty() {
+            self.ellipsize(line, width - self.pending_indent, true);
+        }
+        self.flush_line(line, x, cursor_y, width, max_size);
+        *lines_done += 1;
+        last
+    }
+
+    /// Cut a line to `width` with "…" at its end: when it overflows, or
+    /// always (`force`: a clamped line with more text after it).
+    fn ellipsize(&self, line: &mut Vec<(String, InlineItem)>, width: f32, force: bool) {
+        let total: f32 = line.iter().map(|(t, i)| self.item_width(t, i)).sum();
+        if !force && total <= width + FIT_SLACK {
+            return;
+        }
+        let Some(style) = line.iter().rev().find(|(_, i)| i.img.is_none()).map(|(_, i)| i.style.clone()) else { return };
+        let dots = self.text_width("…", &style);
+        let room = (width - dots).max(0.0);
+        let mut used = 0.0f32;
+        let mut keep = 0;
+        for (index, (text, item)) in line.iter_mut().enumerate() {
+            let w = self.item_width(text, item);
+            if used + w <= room {
+                used += w;
+                keep = index + 1;
+                continue;
+            }
+            // the run that crosses the edge: as many characters as fit
+            if item.img.is_none() {
+                let mut cut = String::new();
+                for c in text.chars() {
+                    cut.push(c);
+                    if used + self.text_width(&cut, &item.style) > room {
+                        cut.pop();
+                        break;
+                    }
+                }
+                if !cut.trim().is_empty() {
+                    *text = cut.trim_end().to_string();
+                    keep = index + 1;
+                }
+            }
+            break;
+        }
+        line.truncate(keep);
+        match line.last_mut() {
+            Some((text, item)) if item.img.is_none() => text.push('…'),
+            _ => {
+                let mut tail = line.iter().rev().find(|(_, i)| i.img.is_none()).map(|(_, i)| i.clone_shallow());
+                if tail.is_none() {
+                    return;
+                }
+                let item = tail.take().unwrap();
+                line.push(("…".to_string(), item));
+            }
+        }
+    }
+
     fn flush_line(
         &mut self,
         line: &mut Vec<(String, InlineItem)>,
@@ -1392,6 +1495,9 @@ impl<'a> Layout<'a> {
         width: f32,
         max_size: f32,
     ) {
+        if self.limits.ellipsis && !self.measuring && !line.is_empty() {
+            self.ellipsize(line, width - self.pending_indent, false);
+        }
         let indent = std::mem::take(&mut self.pending_indent);
         if line.is_empty() {
             *cursor_y += max_size.max(16.0) * 1.35;
@@ -1512,7 +1618,7 @@ impl<'a> Layout<'a> {
                 }
                 let rect = Rect { x: pen_x, y: baseline - raise(item, img.h, img.h), w: img.w, h: img.h };
                 let fitted = img.bitmap.as_ref().filter(|_| item.style.object_fit != crate::style::ObjectFit::Fill).and_then(|b| object_fit_draw(b, rect, &item.style));
-                self.page.draws.push(fitted.unwrap_or_else(|| Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() }));
+                self.page.draws.push(fitted.unwrap_or_else(|| Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone(), tile: None }));
                 if let Some(href) = &item.href {
                     self.page.links.push(link(rect, href));
                 }
@@ -1816,11 +1922,11 @@ fn object_fit_draw(bitmap: &Arc<crate::images::Bitmap>, rect: Rect, style: &Styl
     } else {
         bitmap.crop(((vx0 - x) * px_w) as usize, ((vy0 - y) * px_h) as usize, ((vx1 - vx0) * px_w).round() as usize, ((vy1 - vy0) * px_h).round() as usize)
     };
-    Some(Draw::Image { rect: Rect { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, image: Some(image), alt: String::new() })
+    Some(Draw::Image { rect: Rect { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, image: Some(image), alt: String::new(), tile: None })
 }
 
 /// background-image: sized (auto/cover/contain/lengths), positioned, and cut
-/// to `area`; one copy (no tiling).
+/// to `area`; repeated as background-repeat says.
 fn background_draw(bitmap: &Arc<crate::images::Bitmap>, area: Rect, style: &Style) -> Option<Draw> {
     use crate::style::{BgPos, BgSize};
     if area.w < 1.0 || area.h < 1.0 {
@@ -1860,6 +1966,21 @@ fn background_draw(bitmap: &Arc<crate::images::Bitmap>, area: Rect, style: &Styl
     };
     let x = area.x + place(style.bg_pos.0, area.w - w);
     let y = area.y + place(style.bg_pos.1, area.h - h);
+    // background-repeat (repeat by default): copies on a grid through the
+    // placed one, along x, y or both, cut to the area
+    let (rx, ry) = style.bg_repeat;
+    if rx || ry {
+        let rect = Rect {
+            x: if rx { area.x } else { x.max(area.x) },
+            y: if ry { area.y } else { y.max(area.y) },
+            w: if rx { area.w } else { (x + w).min(area.x + area.w) - x.max(area.x) },
+            h: if ry { area.h } else { (y + h).min(area.y + area.h) - y.max(area.y) },
+        };
+        if rect.w < 0.5 || rect.h < 0.5 {
+            return None;
+        }
+        return Some(Draw::Image { rect, image: Some(bitmap.clone()), alt: String::new(), tile: Some(Rect { x, y, w, h }) });
+    }
     // the part of the placed image inside the area
     let (vx0, vy0) = (x.max(area.x), y.max(area.y));
     let (vx1, vy1) = ((x + w).min(area.x + area.w), (y + h).min(area.y + area.h));
@@ -1868,14 +1989,21 @@ fn background_draw(bitmap: &Arc<crate::images::Bitmap>, area: Rect, style: &Styl
     }
     let (px_w, px_h) = (bitmap.width as f32 / w, bitmap.height as f32 / h);
     let crop = bitmap.crop(((vx0 - x) * px_w) as usize, ((vy0 - y) * px_h) as usize, ((vx1 - vx0) * px_w).round() as usize, ((vy1 - vy0) * px_h).round() as usize);
-    Some(Draw::Image { rect: Rect { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, image: Some(crop), alt: String::new() })
+    Some(Draw::Image { rect: Rect { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, image: Some(crop), alt: String::new(), tile: None })
 }
 
 fn translate(draw: &mut Draw, dx: f32, dy: f32) {
     match draw {
+        Draw::Image { rect, tile, .. } => {
+            rect.x += dx;
+            rect.y += dy;
+            if let Some(t) = tile {
+                t.x += dx;
+                t.y += dy;
+            }
+        }
         Draw::Rect { rect, .. }
         | Draw::Border { rect, .. }
-        | Draw::Image { rect, .. }
         | Draw::Fill { rect, .. }
         | Draw::Edges { rect, .. }
         | Draw::Shadow { rect, .. } => {
@@ -1899,6 +2027,7 @@ impl<'a> Layout<'a> {
             measuring,
             intrinsic: measuring || self.intrinsic,
             opacity_slots: Vec::new(),
+            limits: TextLimits::default(),
             pending_indent: 0.0,
             last_margin_bottom: 0.0,
             last_box: None,
@@ -4169,6 +4298,34 @@ mod tests {
     }
 
     #[test]
+    fn text_overflow_and_line_clamp_cut_lines_with_an_ellipsis() {
+        let words = "word ".repeat(40);
+        let doc = parse_document(&format!(
+            "<body style='margin:0'><div style='width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{words}</div>\
+             <div style='width:120px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden'>{words}</div>\
+             <p style='margin:0'>after</p></body>"
+        ));
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 400.0).build(&doc);
+        let texts: Vec<(f32, String)> = page.draws.iter().filter_map(|d| match d {
+            Draw::Text { baseline, text, .. } => Some((*baseline, text.clone())),
+            _ => None,
+        }).collect();
+        let lines: Vec<f32> = { let mut b: Vec<f32> = texts.iter().map(|t| t.0).collect(); b.dedup_by(|a, b| (*a - *b).abs() < 1.0); b };
+        let ending = |y: f32| texts.iter().filter(|t| (t.0 - y).abs() < 1.0).map(|t| t.1.clone()).collect::<String>();
+        assert!(ending(lines[0]).ends_with('…'), "nowrap line cut: {:?}", ending(lines[0]));
+        assert!(!ending(lines[1]).ends_with('…'), "first clamped line is whole");
+        assert!(ending(lines[2]).ends_with('…'), "second (last) clamped line ends in …");
+        assert!(ending(lines[3]).contains("after"), "two lines, then what follows: {lines:?}");
+        let right = |y: f32| page.draws.iter().filter_map(|d| match d {
+            Draw::Text { baseline, x, text, size, bold, italic, family, .. } if (*baseline - y).abs() < 1.0 => Some(x + fonts.advance_in(text, *size, *bold, *italic, family.as_deref())),
+            _ => None,
+        }).fold(0.0f32, f32::max);
+        assert!(right(lines[0]) <= 121.0 && right(lines[2]) <= 121.0, "inside the box");
+    }
+
+    #[test]
     fn z_index_orders_paint_within_stacking_contexts() {
         let doc = parse_document(
             "<body style='margin:0;position:relative'>\
@@ -4303,7 +4460,8 @@ mod tests {
         map.insert("https://x.test/bg.png".to_string(), Arc::new(bmp));
         let html = "<body style='margin:0'>\
             <div style='width:400px;height:100px;background:#000 url(\"https://x.test/bg.png\") center / cover no-repeat'></div>\
-            <div style='width:400px;height:100px;background-image:url(https://x.test/bg.png);background-size:contain;background-position:right bottom'></div></body>";
+            <div style='width:400px;height:100px;background-image:url(https://x.test/bg.png);background-size:contain;background-position:right bottom;background-repeat:no-repeat'></div>\
+            <div style='width:400px;height:100px;background-image:url(https://x.test/bg.png);background-size:contain'></div></body>";
         let doc = parse_document(html);
         let sheet = Stylesheet::default();
         let fonts = fonts();
@@ -4312,7 +4470,14 @@ mod tests {
             Draw::Image { rect, image: Some(_), .. } => Some(*rect),
             _ => None,
         }).collect();
-        assert_eq!(images.len(), 2, "{images:?}");
+        assert_eq!(images.len(), 3, "{images:?}");
+        // repeat by default (as in CSS): the whole box, tiled
+        let tiled = page.draws.iter().filter_map(|d| match d {
+            Draw::Image { rect, tile: Some(t), .. } => Some((*rect, *t)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(tiled.len(), 1, "only the third repeats: {tiled:?}");
+        assert_eq!((tiled[0].0.x, tiled[0].0.y, tiled[0].0.w, tiled[0].0.h), (0.0, 200.0, 400.0, 100.0));
         let cover = images[0];
         assert_eq!((cover.x, cover.y, cover.w, cover.h), (0.0, 0.0, 400.0, 100.0), "cover fills the box, cut to it");
         let contain = images[1];

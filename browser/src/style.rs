@@ -282,6 +282,15 @@ pub struct Style {
     pub position: Position,
     /// z-index (None: auto)
     pub z_index: Option<i32>,
+    /// text-overflow: ellipsis (a clipped line ends in "…")
+    pub ellipsis: bool,
+    /// -webkit-line-clamp / line-clamp: at most this many lines, the last
+    /// ending in "…" (with display: -webkit-box, -webkit-box-orient: vertical)
+    pub line_clamp: Option<u32>,
+    /// display: -webkit-box / -webkit-inline-box (the legacy flexbox) and
+    /// -webkit-box-orient: vertical
+    pub webkit_box: bool,
+    pub box_vertical: bool,
     pub left: Option<f32>,
     pub top: Option<f32>,
     pub right: Option<f32>,
@@ -307,6 +316,8 @@ pub struct Style {
     pub bg_size: BgSize,
     pub bg_pos: (BgPos, BgPos),
     pub object_fit: ObjectFit,
+    /// background-repeat along x and y (both by default)
+    pub bg_repeat: (bool, bool),
     /// object-position (centred by default)
     pub object_pos: (BgPos, BgPos),
     /// a transform that moves the box a whole box-length or more off its place
@@ -380,6 +391,10 @@ impl Default for Style {
             transparent: false,
             position: Position::Static,
             z_index: None,
+            ellipsis: false,
+            line_clamp: None,
+            webkit_box: false,
+            box_vertical: false,
             left: None,
             top: None,
             right: None,
@@ -397,6 +412,7 @@ impl Default for Style {
             bg_size: BgSize::Auto,
             bg_pos: (BgPos::Frac(0.0), BgPos::Frac(0.0)),
             object_fit: ObjectFit::Fill,
+            bg_repeat: (true, true),
             object_pos: (BgPos::Frac(0.5), BgPos::Frac(0.5)),
             moved_away: false,
             grid_columns: None,
@@ -626,6 +642,21 @@ fn parse_bg_size(value: &str, font_size: f32) -> BgSize {
             BgSize::Sized(one(words.first()), one(words.get(1)))
         }
     }
+}
+
+/// background-repeat: the first layer's (x, y); space and round repeat too.
+fn parse_bg_repeat(value: &str) -> Option<(bool, bool)> {
+    let first = value.split(',').next()?.trim().to_ascii_lowercase();
+    let words: Vec<&str> = first.split_whitespace().collect();
+    let on = |w: &str| matches!(w, "repeat" | "space" | "round");
+    Some(match words.as_slice() {
+        ["repeat-x"] => (true, false),
+        ["repeat-y"] => (false, true),
+        ["no-repeat"] => (false, false),
+        [one] if on(one) => (true, true),
+        [a, b] => (on(a), on(b)),
+        _ => return None,
+    })
 }
 
 fn parse_bg_pos(value: &str, font_size: f32) -> Option<(BgPos, BgPos)> {
@@ -1068,6 +1099,15 @@ pub fn compute(
             }
             let value: std::borrow::Cow<str> = if value.contains("light-dark(") { light_dark(&value, style.dark).into() } else { value };
             apply(&mut style, &declaration.name, &value, containing_width);
+        }
+    }
+    // display: -webkit-box with -webkit-box-orient: vertical lays its
+    // content out as a block (what line-clamp boxes are)
+    if style.webkit_box && style.box_vertical {
+        match style.display {
+            Display::Flex => style.display = Display::Block,
+            Display::InlineBlock => style.inner = Inner::Flow,
+            _ => {}
         }
     }
     // UA block margins are in em of the element's own font size (h2 is
@@ -1582,6 +1622,16 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
     let font_size = style.font_size;
     match name {
         "display" => {
+            // prefixed and legacy spellings of flexbox; -webkit-box is the old
+            // flexbox (a row, or a column with -webkit-box-orient: vertical,
+            // settled after all declarations)
+            style.webkit_box = matches!(value, "-webkit-box" | "-webkit-inline-box" | "-moz-box" | "-moz-inline-box");
+            let value = match value {
+                "-webkit-flex" | "-ms-flexbox" | "-webkit-box" | "-moz-box" | "-webkit-flexbox" | "-moz-flex" => "flex",
+                "-webkit-inline-flex" | "-ms-inline-flexbox" | "-webkit-inline-box" | "-moz-inline-box" => "inline-flex",
+                "-webkit-inline-block" | "-moz-inline-block" | "-moz-inline-stack" => "inline-block",
+                other => other,
+            };
             style.caption = value == "table-caption";
             style.contents = value == "contents";
             style.display = match value {
@@ -1627,6 +1677,11 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "background-size" => style.bg_size = parse_bg_size(value, font_size),
+        "background-repeat" | "-webkit-background-repeat" => {
+            if let Some(r) = parse_bg_repeat(value) {
+                style.bg_repeat = r;
+            }
+        }
         "object-fit" | "-o-object-fit" => {
             style.object_fit = match value.to_ascii_lowercase().as_str() {
                 "contain" => ObjectFit::Contain,
@@ -1663,6 +1718,12 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                     Some(at) => &value[at + 1..],
                     None => value,
                 };
+                // the repeat words ride along too (repeat when none is given)
+                let first_layer = rest.split(',').next().unwrap_or("");
+                let repeat_words: Vec<&str> = first_layer.split(|c: char| c.is_whitespace() || c == '/').filter(|w| matches!(*w, "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | "space" | "round")).collect();
+                style.bg_repeat = if repeat_words.is_empty() { (true, true) } else { parse_bg_repeat(&repeat_words.join(" ")).unwrap_or((true, true)) };
+                let rest_owned: String = rest.split_whitespace().filter(|w| !matches!(*w, "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | "space" | "round" | "scroll" | "fixed" | "local")).collect::<Vec<_>>().join(" ");
+                let rest = rest_owned.as_str();
                 let (pos, size) = match rest.split_once('/') {
                     Some((p, s)) => (p, Some(s)),
                     None => (rest, None),
@@ -1775,6 +1836,9 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "z-index" => style.z_index = value.trim().parse::<i32>().ok(),
+        "text-overflow" => style.ellipsis = value.split_whitespace().last() == Some("ellipsis"),
+        "-webkit-line-clamp" | "line-clamp" => style.line_clamp = value.trim().parse::<u32>().ok().filter(|n| *n > 0),
+        "-webkit-box-orient" | "box-orient" => style.box_vertical = matches!(value.trim(), "vertical" | "block-axis"),
         "left" => style.left = parse_length(value, font_size, containing_width),
         "right" => style.right = parse_length(value, font_size, containing_width),
         "overflow" => {
