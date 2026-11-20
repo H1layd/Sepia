@@ -121,6 +121,40 @@ impl Bitmap {
 
 /// Decode by content, not by extension or Content-Type: servers lie.
 pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
+    let bitmap = decode_known(bytes);
+    if bitmap.is_none() && !bytes.is_empty() {
+        crate::report::miss("image", sniff_name(bytes));
+    }
+    bitmap
+}
+
+/// What an image file is, by its first bytes (for the sensors).
+fn sniff_name(bytes: &[u8]) -> &'static str {
+    let at = |i: usize, s: &[u8]| bytes.get(i..i + s.len()) == Some(s);
+    if at(4, b"ftypavif") || at(4, b"ftypavis") {
+        "avif"
+    } else if at(4, b"ftypheic") || at(4, b"ftypmif1") {
+        "heic"
+    } else if at(0, &[0xFF, 0x0A]) || at(4, b"JXL ") {
+        "jxl"
+    } else if at(0, b"BM") {
+        "bmp"
+    } else if at(0, b"\x89PNG") {
+        "png (broken)"
+    } else if at(0, &[0xFF, 0xD8]) {
+        "jpeg (broken)"
+    } else if at(0, b"GIF8") {
+        "gif (broken)"
+    } else if at(0, b"RIFF") {
+        "webp (broken)"
+    } else if bytes.iter().take(64).any(|&b| b == b'<') {
+        "markup (svg or html)"
+    } else {
+        "unknown"
+    }
+}
+
+fn decode_known(bytes: &[u8]) -> Option<Bitmap> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         decode_png(bytes)
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {

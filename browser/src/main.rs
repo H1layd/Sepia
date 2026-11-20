@@ -22,6 +22,7 @@ mod page;
 mod paint;
 mod persona;
 mod protocols;
+mod report;
 mod resolver;
 mod style;
 mod url;
@@ -438,6 +439,19 @@ fn run_cli(args: Args, resolver_setting: Option<resolver::Resolver>) {
         }
     };
 
+    // SEPIA_REPORT=path: the sensors (report.rs) write what this page needed
+    // and the engine could not do, also when the page fails to load
+    let report_path = std::env::var_os("SEPIA_REPORT").map(PathBuf::from);
+    if report_path.is_some() {
+        report::enable();
+    }
+    let write_report = || {
+        if let Some(path) = &report_path {
+            if let Err(err) = report::write(path) {
+                eprintln!("error: cannot write {}: {err}", path.display());
+            }
+        }
+    };
     let started = std::time::Instant::now();
     let fonts = Fonts::load();
     if let Some((x, y)) = args.click {
@@ -499,6 +513,8 @@ fn run_cli(args: Args, resolver_setting: Option<resolver::Resolver>) {
             loaded
         }
         Err(err) => {
+            report::load_failed("page", &err);
+            write_report();
             eprintln!("error: {err}");
             std::process::exit(1);
         }
@@ -557,4 +573,5 @@ fn run_cli(args: Args, resolver_setting: Option<resolver::Resolver>) {
         }
         println!("png         {} ({}x{})", path.display(), args.width, height);
     }
+    write_report();
 }

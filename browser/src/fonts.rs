@@ -344,6 +344,10 @@ pub fn load_web_font(key: &str, bytes: &[u8]) -> Option<&'static Font> {
             Some(font)
         })
         .map(|f| &*Box::leak(Box::new(f)));
+    if font.is_none() {
+        let kind = if bytes.starts_with(b"wOFF") { "woff" } else if bytes.starts_with(b"wOF2") { "woff2" } else if bytes.starts_with(b"OTTO") { "otf (cff)" } else if bytes.first() == Some(&b'<') { "markup instead of a font" } else { "ttf or other" };
+        crate::report::miss("font", kind);
+    }
     cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), font);
     font
 }

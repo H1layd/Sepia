@@ -185,6 +185,16 @@ impl<'a> PageRequest<'a> {
 /// `ctx.site`'s partition are sent and stored (memory only), and a form body
 /// makes the first request a POST (a 301/302/303 after it continues as GET).
 pub fn fetch_in(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Resolver>, timeout: Duration, ctx: &PageRequest) -> Result<Response, String> {
+    let result = fetch_in_once(url, chain, resolver, timeout, ctx);
+    match &result {
+        Err(e) => crate::report::load_failed("network", e),
+        Ok(r) if r.status >= 400 => crate::report::miss("load", &format!("http {}", r.status)),
+        Ok(_) => {}
+    }
+    result
+}
+
+fn fetch_in_once(url: &Url, chain: &Chain, resolver: Option<&crate::resolver::Resolver>, timeout: Duration, ctx: &PageRequest) -> Result<Response, String> {
     let mut current = url.clone();
     let mut form = ctx.form;
     let mut method = match ctx.method.map(str::to_ascii_uppercase) {

@@ -1105,7 +1105,7 @@ impl Stylesheet {
                         }
                     }
                     // @keyframes, @page, @property…
-                    _ => {}
+                    other => crate::report::miss("css-at", &format!("@{other}")),
                 }
                 continue;
             }
@@ -1123,6 +1123,8 @@ impl Stylesheet {
                 if let Some(selector) = Selector::parse(&selector_text) {
                     let order = self.rules.len();
                     self.rules.push(Rule { selector, declarations: declarations.clone(), media: media.clone(), order });
+                } else {
+                    crate::report::css_selector(&selector_text);
                 }
             }
         }

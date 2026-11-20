@@ -1558,12 +1558,19 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 "table-row" => Display::Row,
                 "table-cell" => Display::Cell,
                 "list-item" => Display::ListItem,
-                _ => Display::Inline,
+                _ => {
+                    if value != "inline" {
+                        crate::report::css_value("display", value);
+                    }
+                    Display::Inline
+                }
             }
         }
         "color" => {
             if let Some(color) = parse_color(value) {
                 style.color = color;
+            } else {
+                crate::report::css_value("color", value);
             }
         }
         "background-color" => {
@@ -1571,6 +1578,8 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.background = Some(style.color);
             } else if let Some(color) = parse_color(value) {
                 style.background = Some(color);
+            } else {
+                crate::report::css_value("background-color", value);
             }
         }
         "background-size" => style.bg_size = parse_bg_size(value, font_size),
@@ -2120,7 +2129,21 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.list_marker = style.marker;
             }
         }
-        _ => {}
+        // read elsewhere: `content` by the ::before/::after code in css.rs
+        "content" => {}
+        // no effect on a still render (pointer, motion, hints): counted apart
+        // so they do not crowd the properties that change how a page looks
+        "cursor" | "pointer-events" | "user-select" | "-webkit-user-select" | "-moz-user-select" | "-ms-user-select" | "touch-action"
+        | "will-change" | "scroll-behavior" | "caret-color" | "resize" | "speak" | "-webkit-tap-highlight-color" | "-webkit-touch-callout"
+        | "-webkit-font-smoothing" | "-moz-osx-font-smoothing" | "text-rendering" | "font-display" | "contain-intrinsic-size" | "overscroll-behavior"
+        | "print-color-adjust" | "-webkit-print-color-adjust" | "text-size-adjust" | "-webkit-text-size-adjust" | "-moz-text-size-adjust"
+        | "-ms-text-size-adjust" | "backface-visibility" | "-webkit-backface-visibility" | "interpolate-size" => {
+            crate::report::miss("css-prop-inert", name)
+        }
+        n if n.starts_with("transition") || n.starts_with("animation") || n.starts_with("scroll-") || n.starts_with("overscroll-") || n.starts_with("-webkit-transition") || n.starts_with("-webkit-animation") => {
+            crate::report::miss("css-prop-inert", name)
+        }
+        _ => crate::report::miss("css-prop", name),
     }
 }
 
