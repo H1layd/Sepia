@@ -885,6 +885,9 @@ pub struct Stylesheet {
     pub font_faces: Vec<FontFace>,
     /// `@import` URLs, in order, for the loader to fetch
     pub imports: Vec<String>,
+    /// `@keyframes` by name: the declarations of the last frame (`to` /
+    /// `100%`), what an animation that fills forwards leaves on its element
+    pub keyframes: std::collections::HashMap<String, Vec<Declaration>>,
     /// width the `@media` queries are evaluated against
     pub viewport_width: f32,
     /// Height used by viewport media conditions.
@@ -914,7 +917,7 @@ impl PartialEq for Stylesheet {
 
 impl Default for Stylesheet {
     fn default() -> Stylesheet {
-        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), viewport_width: 1024.0, viewport_height: 800.0, candidates: Default::default(), pseudo_rules: Default::default(), pseudo_index: Default::default(), content_index: Default::default() }
+        Stylesheet { rules: Vec::new(), font_faces: Vec::new(), imports: Vec::new(), keyframes: Default::default(), viewport_width: 1024.0, viewport_height: 800.0, candidates: Default::default(), pseudo_rules: Default::default(), pseudo_index: Default::default(), content_index: Default::default() }
     }
 }
 
@@ -997,6 +1000,8 @@ impl Stylesheet {
         }
         self.imports.extend(other.imports);
         self.font_faces.extend(other.font_faces);
+        // a later @keyframes of the same name replaces the earlier one
+        self.keyframes.extend(other.keyframes);
     }
 
     fn parse_block(&mut self, css: &str, media: &Media) {
@@ -1104,7 +1109,13 @@ impl Stylesheet {
                             self.font_faces.push(face);
                         }
                     }
-                    // @keyframes, @page, @property…
+                    "keyframes" | "-webkit-keyframes" => {
+                        let name = condition.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                        if let Some(last) = last_keyframe(&body) {
+                            self.keyframes.insert(name, last);
+                        }
+                    }
+                    // @page, @property…
                     other => crate::report::miss("css-at", &format!("@{other}")),
                 }
                 continue;
@@ -1272,6 +1283,23 @@ fn import_url(rest: &str) -> Option<String> {
         return None;
     }
     (!url.is_empty()).then(|| url.to_string())
+}
+
+/// The declarations of a `@keyframes` block's last frame: the frame
+/// whose selector list holds `to` or `100%` (merged when several do).
+fn last_keyframe(body: &str) -> Option<Vec<Declaration>> {
+    let mut out: Vec<Declaration> = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find('{') {
+        let selector = rest[..open].trim().to_ascii_lowercase();
+        let Some(close) = rest[open..].find('}') else { break };
+        let block = &rest[open + 1..open + close];
+        if selector.split(',').any(|s| matches!(s.trim(), "to" | "100%")) {
+            out.extend(parse_declarations(block));
+        }
+        rest = &rest[open + close + 1..];
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 pub fn parse_declarations(body: &str) -> Vec<Declaration> {

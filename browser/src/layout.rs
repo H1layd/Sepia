@@ -4464,6 +4464,29 @@ mod tests {
     }
 
     #[test]
+    fn finished_animations_leave_their_last_frame() {
+        // a fade-in (opacity 0 -> 1, forwards) is visible once it is over;
+        // one without forwards falls back to its own style; infinite ones too
+        let doc = parse_document(
+            "<body style='margin:0'><p class='a'>shown</p><p class='b'>hidden</p><p class='c'>spinner</p></body>",
+        );
+        let sheet = Stylesheet::parse(
+            "@keyframes fade { from { opacity: 0 } to { opacity: 1; color: red } }\
+             .a { opacity: 0; animation: fade .4s ease-out .2s forwards }\
+             .b { opacity: 0; animation: fade .4s }\
+             .c { opacity: 0; animation: fade 1s infinite both }",
+        );
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 600.0).build(&doc);
+        let text: Vec<(String, Color)> = page.draws.iter().filter_map(|d| match d {
+            Draw::Text { text, color, .. } => Some((text.clone(), *color)),
+            _ => None,
+        }).collect();
+        assert!(text.iter().any(|(t, c)| t.contains("shown") && *c == Color::rgb(255, 0, 0)), "{text:?}");
+        assert!(!text.iter().any(|(t, _)| t.contains("hidden") || t.contains("spinner")), "{text:?}");
+    }
+
+    #[test]
     fn long_words_break_with_overflow_wrap() {
         let word = "x".repeat(80);
         let doc = parse_document(&format!("<body style='margin:0'><div style='width:100px;overflow-wrap:break-word'>{word}</div></body>"));

@@ -285,6 +285,11 @@ pub struct Style {
     /// overflow-wrap: break-word / anywhere, word-break: break-all (inherited):
     /// a word wider than its line is broken
     pub break_words: bool,
+    /// animation: its @keyframes name, whether it keeps its last frame
+    /// (fill-mode forwards/both) and whether it never ends (infinite)
+    pub anim_name: Option<Arc<str>>,
+    pub anim_forwards: bool,
+    pub anim_infinite: bool,
     /// text-shadow (the first one; inherited): offset, blur, colour
     pub text_shadow: Option<(f32, f32, f32, Color)>,
     /// …and it also narrows min-content (anywhere, break-all; not break-word)
@@ -407,6 +412,9 @@ impl Default for Style {
             transparent: false,
             clip_empty: false,
             break_words: false,
+            anim_name: None,
+            anim_forwards: false,
+            anim_infinite: false,
             text_shadow: None,
             break_min: false,
             outline_width: 3.0,
@@ -1233,6 +1241,17 @@ pub fn compute(
     if node.tag == "table" && matches!(style.display, Display::Block | Display::ListItem) {
         style.display = Display::Table;
     }
+    // an animation that ends and keeps its last frame (forwards / both):
+    // the page as Chrome shows it once the fade-in or slide-in is over
+    if let (Some(name), true, false) = (style.anim_name.clone(), style.anim_forwards, style.anim_infinite) {
+        if let Some(frame) = sheet.keyframes.get(&*name) {
+            for declaration in frame {
+                if let Some(value) = crate::css::substitute_in(&declaration.value, &style.vars, true) {
+                    apply(&mut style, &declaration.name, &value, containing_width);
+                }
+            }
+        }
+    }
     style.transparent |= style.opacity == 0.0;
     // clipped to nothing: drawn as nothing (its box still takes its place)
     style.transparent |= style.clip_path_empty || (style.clip_empty && matches!(style.position, Position::Absolute | Position::Fixed));
@@ -1935,6 +1954,31 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "z-index" => style.z_index = value.trim().parse::<i32>().ok(),
+        "animation" | "-webkit-animation" => {
+            // the first animation of the list: name, fill mode, iterations
+            let first = crate::css::split_top_level(value, ',').into_iter().next().unwrap_or_default();
+            style.anim_name = None;
+            style.anim_forwards = false;
+            style.anim_infinite = false;
+            for token in split_space(&first) {
+                let t = token.to_ascii_lowercase();
+                match t.as_str() {
+                    "forwards" | "both" => style.anim_forwards = true,
+                    "backwards" | "none" => {}
+                    "infinite" => style.anim_infinite = true,
+                    "normal" | "reverse" | "alternate" | "alternate-reverse" | "running" | "paused" | "ease" | "linear" | "ease-in"
+                    | "ease-out" | "ease-in-out" | "step-start" | "step-end" | "initial" | "inherit" => {}
+                    _ if t.contains('(') || t.ends_with("ms") || t.ends_with('s') && t[..t.len() - 1].parse::<f32>().is_ok() || t.parse::<f32>().is_ok() => {}
+                    _ => style.anim_name = Some(Arc::from(token.as_str())),
+                }
+            }
+        }
+        "animation-name" | "-webkit-animation-name" => {
+            let first = value.split(',').next().unwrap_or("").trim();
+            style.anim_name = (first != "none" && !first.is_empty()).then(|| Arc::from(first));
+        }
+        "animation-fill-mode" | "-webkit-animation-fill-mode" => style.anim_forwards = matches!(value.split(',').next().unwrap_or("").trim(), "forwards" | "both"),
+        "animation-iteration-count" | "-webkit-animation-iteration-count" => style.anim_infinite = value.split(',').next().unwrap_or("").trim() == "infinite",
         "clip" => style.clip_empty = clip_rect_empty(value),
         "outline" => {
             // width style colour, any order (as border); `auto` is a focus ring
