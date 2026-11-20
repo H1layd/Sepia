@@ -552,7 +552,22 @@
     });
   }
   function selectValue(sel) { const opts = sel.querySelectorAll('option'); const chosen = opts.find(o => o.selected) || opts[0]; return chosen ? (chosen.getAttribute('value') ?? chosen.textContent) : ''; }
-  function nodeList(arr) { arr.item = i => arr[i] ?? null; return arr; }
+  // NodeList / HTMLCollection: arrays underneath (every Array method keeps
+  // working), with the DOM's own prototype for instanceof and item()
+  class NodeList extends Array { item(i) { return this[i] ?? null; } }
+  class HTMLCollection extends Array { item(i) { return this[i] ?? null; } namedItem(n) { return this.find(e => e.id === n || e.getAttribute('name') === n) ?? null; } }
+  G.NodeList = NodeList; G.HTMLCollection = HTMLCollection;
+  function nodeList(arr) { Object.setPrototypeOf(arr, NodeList.prototype); return arr; }
+  // the elements under a viewport point, topmost first (by layout boxes;
+  // the later and deeper box wins, as paint order mostly is)
+  function elementsAt(root, x, y) {
+    const px = Number(x) + (G.scrollX || 0), py = Number(y) + (G.scrollY || 0), hits = [];
+    for (const el of root.querySelectorAll('*')) {
+      const r = __dom_rect(el.__sepiaNode);
+      if (r && r[2] > 0 && r[3] > 0 && px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3]) hits.push(el);
+    }
+    return hits.reverse();
+  }
 
   // element classes, for instanceof checks
   const HTMLElement = class HTMLElement extends Element {};
@@ -753,11 +768,14 @@
     get adoptedStyleSheets() { return this.__adopted || []; }
     set adoptedStyleSheets(list) { Object.defineProperty(this, '__adopted', { value: [...list], writable: true, configurable: true }); __css_set(this.__sepiaNode, this.__adopted.map(s => s.__rules.join('\n')).join('\n')); }
     getElementById(id) { return this.querySelector('#' + CSS.escape(String(id))); }
-    elementFromPoint() { return null; }
+    elementFromPoint(x, y) { return elementsAt(this, x, y)[0] ?? null; }
+    elementsFromPoint(x, y) { return elementsAt(this, x, y); }
     getSelection() { return G.getSelection(); }
   }
 
   class Document extends NodeBase {
+    elementFromPoint(x, y) { const hit = elementsAt(this, x, y)[0]; return hit ?? (x >= 0 && y >= 0 && x < G.innerWidth && y < G.innerHeight ? this.documentElement : null); }
+    elementsFromPoint(x, y) { return elementsAt(this, x, y); }
     get documentElement() { return wrap(__dom_find_tag('html')); }
     get head() { return wrap(__dom_find_tag('head')); }
     get body() { return wrap(__dom_find_tag('body')); }
@@ -2015,7 +2033,15 @@
     const z = origin;
     G.performance.timing = { navigationStart: z, fetchStart: z, domainLookupStart: z, domainLookupEnd: z, connectStart: z, connectEnd: z, secureConnectionStart: z, requestStart: z, responseStart: z, responseEnd: z, domLoading: z, domInteractive: z, domContentLoadedEventStart: z, domContentLoadedEventEnd: z, domComplete: z, loadEventStart: z, loadEventEnd: z, redirectStart: 0, redirectEnd: 0, unloadEventStart: 0, unloadEventEnd: 0, toJSON() { return this; } };
     G.performance.navigation = { type: 0, redirectCount: 0, TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2 };
+    // the entry interfaces, for instanceof (PerformanceNavigationTiming etc.)
+    class PerformanceEntry { toJSON() { return { ...this }; } }
+    class PerformanceResourceTiming extends PerformanceEntry {}
+    class PerformanceNavigationTiming extends PerformanceResourceTiming {}
+    class PerformanceMark extends PerformanceEntry {}
+    class PerformanceMeasure extends PerformanceEntry {}
+    Object.assign(G, { PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming, PerformanceMark, PerformanceMeasure });
     G.performance.__nav = { name: location.href, entryType: 'navigation', startTime: 0, duration: 0, type: 'navigate', redirectCount: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: 0, transferSize: 0, toJSON() { return this; } };
+    Object.setPrototypeOf(G.performance.__nav, PerformanceNavigationTiming.prototype);
   }
   G.crypto = { getRandomValues: a => { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256); return a; }, randomUUID: () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }) };
   G.console = { log, info: log, warn: log, error: log, debug: () => {}, trace: () => {}, table: log, group: () => {}, groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {}, assert: (c, ...a) => { if (!c) log('assert', ...a); }, dir: log, count: () => {} };

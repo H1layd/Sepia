@@ -1865,12 +1865,23 @@ pub(crate) trait Engine {
     fn report_rejections(&mut self);
 }
 
-/// The engine for a new page: V8 with `SEPIA_JS=v8`, else Boa.
+thread_local! {
+    /// Tests that need one engine in particular (see the persona test).
+    static FORCE_ENGINE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// The engine for a new page: V8, or Boa with `SEPIA_JS=boa`. V8 became
+/// the default when a 200-site crawl showed it loads as many sites as Boa
+/// and gets more of them working (7% more text on the same sites).
 fn new_engine(loader: std::rc::Rc<Loader>, persona: crate::persona::Persona) -> Box<dyn Engine> {
-    if std::env::var("SEPIA_JS").is_ok_and(|v| v == "v8") {
-        return Box::new(v8engine::V8Engine::new(loader, persona));
+    let boa = match FORCE_ENGINE.with(|f| f.get()) {
+        Some(engine) => engine == "boa",
+        None => std::env::var("SEPIA_JS").is_ok_and(|v| v == "boa"),
+    };
+    if boa {
+        return Box::new(BoaEngine::new(loader, persona));
     }
-    Box::new(BoaEngine::new(loader, persona))
+    Box::new(v8engine::V8Engine::new(loader, persona))
 }
 
 struct BoaEngine {
@@ -3806,6 +3817,10 @@ mod tests {
     fn scripts_see_the_chosen_browser_and_country() {
         use crate::persona::{browser, country, Persona, TEST_PERSONA};
         TEST_PERSONA.with(|t| t.set(Some(Persona { browser: browser("chrome-win").unwrap(), country: country("RU").unwrap() })));
+        // Boa: V8 takes the zone from the process-wide TZ, which the tests
+        // running beside this one (New York) set too. One page per process
+        // (the planned process-per-site model) has no such race.
+        FORCE_ENGINE.with(|f| f.set(Some("boa")));
         let s = run(
             "<p id=o></p>",
             "const d = new Date(Date.UTC(2026, 6, 1, 12));
@@ -3814,6 +3829,7 @@ mod tests {
                d.getTimezoneOffset(), d.getHours(), new Intl.NumberFormat().resolvedOptions().locale, (1234.5).toLocaleString()].join('|');",
         );
         TEST_PERSONA.with(|t| t.set(None));
+        FORCE_ENGINE.with(|f| f.set(None));
         // the default locale: "ru" (Boa) or "ru-RU" (V8, as Chrome reports it)
         let got = text(&s).replace("|ru-RU|1\u{a0}", "|ru|1\u{a0}");
         assert_eq!(got, "true|Win32|Google Inc.|ru-RU|ru-RU,ru,en-US,en|true|false|-180|15|ru|1\u{a0}234,5", "{:?}", s.log());
