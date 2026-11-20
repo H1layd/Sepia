@@ -463,7 +463,7 @@ impl Fonts {
                     // San Francisco: a variable face, drawn by swash at its optical size.
                     // Off by default until its vertical metrics and macOS-like stroke
                     // weight match Chrome (example.com: 66 with it, 73 without); SEPIA_SF=1
-                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" if !bold && !italic && std::env::var_os("SEPIA_SF").is_some() => Some(&self.system),
+                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" if !bold && !italic && sf_enabled() => Some(&self.system),
                     "sans-serif" | "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" | "arial" | "helvetica" | "helvetica neue" | "segoe ui" | "roboto" => return self.pick(bold, italic),
                     _ => None,
                 };
@@ -1177,4 +1177,10 @@ mod tests {
             .count();
         assert!(coloured > 50, "expected a yellow face, got {coloured} coloured pixels");
     }
+}
+
+/// SEPIA_SF, read once (font picking runs for every text run).
+fn sf_enabled() -> bool {
+    static SF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SF.get_or_init(|| std::env::var_os("SEPIA_SF").is_some())
 }

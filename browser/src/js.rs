@@ -26,6 +26,8 @@ use boa_engine::object::builtins::JsArray;
 use boa_engine::{js_string, Context, JsResult, JsString, JsValue, NativeFunction, Source};
 
 use crate::jsval::Val;
+
+mod v8engine;
 use crate::css::{matches_selector, split_top_level, Selector, Stylesheet};
 use crate::dom::{self, Node};
 use crate::images::ImageMap;
@@ -823,7 +825,7 @@ fn geometry_for(want: Option<usize>) -> Option<(std::rc::Rc<std::collections::Ha
             }
         });
         if std::env::var_os("SEPIA_VERBOSE").is_some() {
-            eprintln!("geometry: layout {} ms", started.elapsed().as_millis());
+            eprintln!("geometry: layout {} ms, {} styles computed", started.elapsed().as_millis(), crate::style::COMPUTED.swap(0, std::sync::atomic::Ordering::Relaxed));
         }
     }
     GEOMETRY.with(|g| g.borrow().as_ref().map(|g| (g.boxes.clone(), g.height)))
@@ -1843,6 +1845,100 @@ fn install(ctx: &mut Context) {
     ctx.register_global_builtin_callable(js_string!("__script_eval"), 2, eval).expect("register native");
 }
 
+
+// ---------------------------------------------------------------------------
+// The JS engine behind a page
+// ---------------------------------------------------------------------------
+
+/// What a page needs from a JS engine. The host functions (`natives()`)
+/// and the prelude are shared; an engine runs code and its jobs.
+pub(crate) trait Engine {
+    /// Run a classic script; its completion value, or the error as text
+    /// (`TypeError: …`). `label` names the script in stacks ("" for glue).
+    fn eval(&mut self, code: &str, label: &str) -> Result<Val, String>;
+    /// Promise jobs (microtasks) until none are left.
+    fn run_jobs(&mut self);
+    /// Run a module script (its imports through the page's Loader) and the
+    /// jobs it starts.
+    fn run_module(&mut self, code: &str, path: &str) -> Result<(), String>;
+    /// Promises rejected with no handler: `__sepia_unhandled(promise, reason)`.
+    fn report_rejections(&mut self);
+}
+
+/// The engine for a new page: V8 with `SEPIA_JS=v8`, else Boa.
+fn new_engine(loader: std::rc::Rc<Loader>, persona: crate::persona::Persona) -> Box<dyn Engine> {
+    if std::env::var("SEPIA_JS").is_ok_and(|v| v == "v8") {
+        return Box::new(v8engine::V8Engine::new(loader, persona));
+    }
+    Box::new(BoaEngine::new(loader, persona))
+}
+
+struct BoaEngine {
+    ctx: Context,
+    hooks: std::rc::Rc<Hooks>,
+    loader: std::rc::Rc<Loader>,
+}
+
+impl BoaEngine {
+    fn new(loader: std::rc::Rc<Loader>, persona: crate::persona::Persona) -> BoaEngine {
+        let hooks = std::rc::Rc::new(Hooks(persona, RefCell::new(Vec::new())));
+        let mut ctx = Context::builder()
+            .host_hooks(hooks.clone())
+            .module_loader(loader.clone())
+            .build()
+            .unwrap_or_default();
+        {
+            let limits = ctx.runtime_limits_mut();
+            limits.set_loop_iteration_limit(std::env::var("SEPIA_LOOP_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
+            limits.set_recursion_limit(100_000);
+            limits.set_stack_size_limit(64 * 1024 * 1024);
+        }
+        install(&mut ctx);
+        BoaEngine { ctx, hooks, loader }
+    }
+}
+
+impl Engine for BoaEngine {
+    fn eval(&mut self, code: &str, label: &str) -> Result<Val, String> {
+        let source = Source::from_bytes(code.as_bytes());
+        let result = if label.is_empty() { self.ctx.eval(source) } else { self.ctx.eval(source.with_path(std::path::Path::new(label))) };
+        match result {
+            Ok(v) => boa_to_val(&v, &mut self.ctx, 0).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn run_jobs(&mut self) {
+        let _ = self.ctx.run_jobs();
+    }
+
+    fn run_module(&mut self, code: &str, path: &str) -> Result<(), String> {
+        let loader = self.loader.clone();
+        boa_run_module(&mut self.ctx, &loader, code, path)
+    }
+
+    fn report_rejections(&mut self) {
+        let pending: Vec<boa_engine::JsObject> = std::mem::take(&mut *self.hooks.1.borrow_mut());
+        if pending.is_empty() {
+            return;
+        }
+        let Ok(report) = self.ctx.global_object().get(js_string!("__sepia_unhandled"), &mut self.ctx) else { return };
+        let Some(report) = report.as_callable() else { return };
+        for promise in pending {
+            let reason = boa_engine::object::builtins::JsPromise::from_object(promise.clone())
+                .ok()
+                .and_then(|p| match p.state() {
+                    boa_engine::builtins::promise::PromiseState::Rejected(r) => Some(r),
+                    _ => None,
+                });
+            if let Some(reason) = reason {
+                let _ = report.call(&JsValue::undefined(), &[promise.into(), reason], &mut self.ctx);
+            }
+        }
+        let _ = self.ctx.run_jobs();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
@@ -1889,8 +1985,7 @@ pub struct Outcome {
 
 /// One live page: DOM, scripts, styles, images.
 pub struct Session {
-    ctx: Context,
-    hooks: std::rc::Rc<Hooks>,
+    engine: Box<dyn Engine>,
     sheet: Stylesheet,
     /// the stylesheet with the CSS scripts added, and what it was built from
     live_sheet: RefCell<Option<(u64, Stylesheet)>>,
@@ -2121,6 +2216,22 @@ fn module_imports(code: &str, lazy: bool) -> Vec<String> {
 }
 
 impl Loader {
+    /// The URL (the module's key) and source of an imported module, for any
+    /// engine: a data: URL module without the network, otherwise fetched
+    /// (or taken from the prefetched graph) with its own imports prefetched.
+    fn source_for(&self, specifier: &str, base: &Url) -> Result<(String, String), String> {
+        if let Some(raw) = data_specifier(&self.imports.borrow(), specifier, base) {
+            let (_, bytes) = crate::images::data_url_bytes(&raw).ok_or("bad data: URL")?;
+            return Ok((raw, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        let url = self.locate(specifier, base)?;
+        let key = url.to_string();
+        let code = self.fetch(&url).map_err(|e| format!("{key}: {e}"))?;
+        peek(&code, &key);
+        self.prefetch(vec![(url.clone(), code.clone())]);
+        Ok((key, code))
+    }
+
     /// Where a specifier points from `base`, through the import map.
     fn locate(&self, specifier: &str, base: &Url) -> Result<Url, String> {
         locate_specifier(&self.imports.borrow(), specifier, base)
@@ -2350,12 +2461,15 @@ fn peek(code: &str, label: &str) {
 }
 
 /// The `imports` of an import map, values made absolute against `base`.
-fn import_map(ctx: &mut Context, json: &str, base: &str) -> Vec<(String, String)> {
+fn import_map(engine: &mut dyn Engine, json: &str, base: &str) -> Vec<(String, String)> {
     let code = format!(
         "(() => {{ try {{ const m = JSON.parse({}); return Object.entries(m.imports || {{}}).map(([k, v]) => k + '\\u0000' + v).join('\\u0001'); }} catch (e) {{ return ''; }} }})()",
         json_string(json)
     );
-    let text = ctx.eval(Source::from_bytes(&code)).ok().and_then(|v| v.as_string().map(|s| s.to_std_string_escaped())).unwrap_or_default();
+    let text = match engine.eval(&code, "") {
+        Ok(Val::Str(text)) => text,
+        _ => String::new(),
+    };
     let base = Url::parse(base);
     text.split('\u{1}')
         .filter_map(|pair| pair.split_once('\u{0}'))
@@ -2430,7 +2544,7 @@ fn persona_json(p: &crate::persona::Persona) -> String {
 /// Run one module and the jobs it starts; an error comes back as text.
 /// A module script lives in the page's one module map: a `src` that was
 /// already imported (or listed twice) is the same module, evaluated once.
-fn run_module(ctx: &mut Context, loader: &Loader, code: &str, path: &str) -> Result<(), String> {
+fn boa_run_module(ctx: &mut Context, loader: &Loader, code: &str, path: &str) -> Result<(), String> {
     let inline = path.contains("#inline-module-");
     let known = if inline { None } else { loader.modules.borrow().get(path).cloned() };
     let module = match known {
@@ -2493,28 +2607,16 @@ impl Session {
             st.net = net.map(|n| Net { origin: url.clone(), chain: n.chain.clone(), resolver: n.resolver.cloned(), timeout: n.timeout });
         });
         let persona = crate::persona::current();
-        let hooks = std::rc::Rc::new(Hooks(persona, RefCell::new(Vec::new())));
         let loader = std::rc::Rc::new(Loader::default());
-        let mut ctx = Context::builder()
-            .host_hooks(hooks.clone())
-            .module_loader(loader.clone())
-            .build()
-            .unwrap_or_default();
-        {
-            let limits = ctx.runtime_limits_mut();
-            limits.set_loop_iteration_limit(std::env::var("SEPIA_LOOP_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
-            limits.set_recursion_limit(100_000);
-            limits.set_stack_size_limit(64 * 1024 * 1024);
-        }
-        install(&mut ctx);
+        let mut engine = new_engine(loader.clone(), persona);
         let viewport = format!("globalThis.__viewport = [{width}, 800]; globalThis.__verbose = {}; globalThis.__persona = {};", std::env::var_os("SEPIA_VERBOSE").is_some(), persona_json(&persona));
-        let _ = ctx.eval(Source::from_bytes(&viewport));
-        if let Err(e) = ctx.eval(Source::from_bytes(PRELUDE)) {
+        let _ = engine.eval(&viewport, "");
+        if let Err(e) = engine.eval(PRELUDE, "sepia:prelude") {
             with(|st| st.log.push(format!("prelude: {e}")));
         }
         // SEPIA_PRELUDE_EXTRA: debugging hooks that run before the page's scripts
         if let Ok(extra) = std::env::var("SEPIA_PRELUDE_EXTRA") {
-            if let Err(e) = ctx.eval(Source::from_bytes(extra.as_bytes())) {
+            if let Err(e) = engine.eval(&extra, "") {
                 with(|st| st.log.push(format!("prelude extra: {e}")));
             }
         }
@@ -2533,7 +2635,7 @@ impl Session {
         let roots_empty = roots.is_empty();
         if !roots_empty {
             for (code, label) in scripts.iter().filter(|(_, l)| l.starts_with(IMPORT_MAP)) {
-                loader.imports.borrow_mut().extend(import_map(&mut ctx, code, &label[IMPORT_MAP.len()..]));
+                loader.imports.borrow_mut().extend(import_map(engine.as_mut(), code, &label[IMPORT_MAP.len()..]));
             }
             let prefetch_started = std::time::Instant::now();
             loader.prefetch(roots);
@@ -2564,7 +2666,7 @@ impl Session {
             }
             if let Some(base) = label.strip_prefix(IMPORT_MAP) {
                 if roots_empty {
-                    loader.imports.borrow_mut().extend(import_map(&mut ctx, code, base));
+                    loader.imports.borrow_mut().extend(import_map(engine.as_mut(), code, base));
                 }
                 continue;
             }
@@ -2579,8 +2681,8 @@ impl Session {
                 }
             };
             if let Some(path) = label.strip_prefix(MODULE) {
-                let _ = ctx.eval(Source::from_bytes("globalThis.__currentScript = null"));
-                let result = run_module(&mut ctx, &loader, code, path);
+                let _ = engine.eval("globalThis.__currentScript = null", "");
+                let result = engine.run_module(code, path);
                 slow(label);
                 if let Err(e) = result {
                     { let line = format!("{label}: {e}"); crate::report::js_error(&line); with(|st| st.log.push(line)); }
@@ -2592,21 +2694,21 @@ impl Session {
             } else {
                 format!("__sepia_current(null, {})", json_string(&code.chars().take(64).collect::<String>()))
             };
-            let _ = ctx.eval(Source::from_bytes(&current));
-            let result = ctx.eval(Source::from_bytes(code.as_bytes()).with_path(std::path::Path::new(label)));
+            let _ = engine.eval(&current, "");
+            let result = engine.eval(code, label);
             slow(label);
             if let Err(e) = result {
                 let at = if std::env::var_os("SEPIA_VERBOSE").is_some() { near(scripts, &e.to_string()) } else { String::new() };
                 { crate::report::js_error(&format!("{label}: {e}")); with(|st| st.log.push(format!("{label}: {e}{at}"))); }
             }
-            let _ = ctx.run_jobs();
+            engine.run_jobs();
         }
         let loaded_started = std::time::Instant::now();
-        let _ = ctx.eval(Source::from_bytes("__sepia_loaded()"));
+        let _ = engine.eval("__sepia_loaded()", "");
         if std::env::var_os("SEPIA_VERBOSE").is_some() {
             eprintln!("page timing: load events {} ms", loaded_started.elapsed().as_millis());
         }
-        let mut session = Session { ctx, hooks, sheet, live_sheet: RefCell::new(None), images: RefCell::new(images), asked_images: RefCell::new(Default::default()), width };
+        let mut session = Session { engine, sheet, live_sheet: RefCell::new(None), images: RefCell::new(images), asked_images: RefCell::new(Default::default()), width };
         let settle_started = std::time::Instant::now();
         session.settle();
         if std::env::var_os("SEPIA_VERBOSE").is_some() {
@@ -2619,8 +2721,8 @@ impl Session {
     /// SEPIA_EVAL: run a snippet after load and print its value (debugging).
     pub fn debug_eval(&mut self) {
         let Ok(code) = std::env::var("SEPIA_EVAL") else { return };
-        let out = match self.ctx.eval(Source::from_bytes(&code)) {
-            Ok(v) => v.to_string(&mut self.ctx).map(|s| s.to_std_string_escaped()).unwrap_or_default(),
+        let out = match self.engine.eval(&code, "") {
+            Ok(v) => v.text(),
             Err(e) => format!("error: {e}"),
         };
         self.settle();
@@ -2639,12 +2741,12 @@ impl Session {
         let verbose = std::env::var_os("SEPIA_VERBOSE").is_some();
         for _ in 0..2000 {
             let t = std::time::Instant::now();
-            let _ = self.ctx.run_jobs();
+            self.engine.run_jobs();
             if verbose && t.elapsed() > Duration::from_millis(300) {
                 eprintln!("settle: promise jobs {} ms", t.elapsed().as_millis());
             }
             let t = std::time::Instant::now();
-            let ran = self.ctx.eval(Source::from_bytes("__sepia_tick()")).ok().and_then(|v| v.as_number()).unwrap_or(0.0);
+            let ran = self.engine.eval("__sepia_tick()", "").ok().and_then(|v| v.num()).unwrap_or(0.0);
             if verbose && t.elapsed() > Duration::from_millis(300) {
                 eprintln!("settle: tick {} ms ({ran} ran)", t.elapsed().as_millis());
             }
@@ -2657,7 +2759,7 @@ impl Session {
             break;
         }
         let t = std::time::Instant::now();
-        let _ = self.ctx.run_jobs();
+        self.engine.run_jobs();
         if verbose && t.elapsed() > Duration::from_millis(300) {
             eprintln!("settle: final promise jobs {} ms", t.elapsed().as_millis());
         }
@@ -2674,24 +2776,7 @@ impl Session {
     /// Promises still rejected with no handler after the jobs ran: an
     /// `unhandledrejection` event, and the console unless a listener cancels it.
     fn report_rejections(&mut self) {
-        let pending: Vec<boa_engine::JsObject> = std::mem::take(&mut *self.hooks.1.borrow_mut());
-        if pending.is_empty() {
-            return;
-        }
-        let Ok(report) = self.ctx.global_object().get(js_string!("__sepia_unhandled"), &mut self.ctx) else { return };
-        let Some(report) = report.as_callable() else { return };
-        for promise in pending {
-            let reason = boa_engine::object::builtins::JsPromise::from_object(promise.clone())
-                .ok()
-                .and_then(|p| match p.state() {
-                    boa_engine::builtins::promise::PromiseState::Rejected(r) => Some(r),
-                    _ => None,
-                });
-            if let Some(reason) = reason {
-                let _ = report.call(&JsValue::undefined(), &[promise.into(), reason], &mut self.ctx);
-            }
-        }
-        let _ = self.ctx.run_jobs();
+        self.engine.report_rejections();
     }
 
 
@@ -2866,7 +2951,7 @@ impl Session {
     /// it as a step in its own history (pushState entries, popstate).
     pub fn history_step(&mut self, delta: i32) -> bool {
         let call = if delta < 0 { "__sepia_history_back()" } else { "__sepia_history_forward()" };
-        let handled = self.ctx.eval(Source::from_bytes(call)).ok().map(|v| v.to_boolean()).unwrap_or(false);
+        let handled = self.engine.eval(call, "").ok().map(|v| v.truthy()).unwrap_or(false);
         if handled {
             self.settle_for(Duration::from_millis(100));
         }
@@ -2880,7 +2965,7 @@ impl Session {
 
     pub fn next_timer_delay(&mut self) -> Option<Duration> {
         let waiting = with(|st| !st.inflight.is_empty() || !st.ready.is_empty() || !st.sockets.is_empty() || !st.image_loads.is_empty());
-        let delay = self.ctx.eval(Source::from_bytes("__sepia_next_timer()")).ok().and_then(|v| v.as_number());
+        let delay = self.engine.eval("__sepia_next_timer()", "").ok().and_then(|v| v.num());
         let timer = delay.filter(|d| d.is_finite() && *d >= 0.0).map(|d| Duration::from_secs_f64((d / 1000.0).clamp(0.001, 86_400.0)));
         // requests in flight: look again soon (their answers are events too)
         let net = waiting.then_some(Duration::from_millis(15));
@@ -2920,7 +3005,7 @@ impl Session {
                 format!("__sepia_resize({width}, {height})")
             }
         };
-        if let Err(e) = self.ctx.eval(Source::from_bytes(&call)) {
+        if let Err(e) = self.engine.eval(&call, "") {
             { let line = format!("event: {e}"); crate::report::js_error(&line); with(|st| st.log.push(line)); }
         }
         self.settle_for(Duration::from_millis(100));
@@ -2931,8 +3016,8 @@ impl Session {
             });
             (st.dirty, st.navigate.take(), st.form.take(), st.jump.take(), focus, st.title.clone())
         });
-        let history = self.ctx.eval(Source::from_bytes("__sepia_history_position()")).ok()
-            .and_then(|v| v.as_number()).filter(|n| *n >= 0.0)
+        let history = self.engine.eval("__sepia_history_position()", "").ok()
+            .and_then(|v| v.num()).filter(|n| *n >= 0.0)
             .map(|n| ((n as u64 >> 16) as usize, (n as u64 & 0xffff) as usize));
         Outcome { page: dirty.then(|| self.layout(fonts)), title, navigate, form, jump, focus, history }
     }
@@ -3105,7 +3190,7 @@ mod tests {
 
     fn advance_clock(session: &mut Session, milliseconds: u32) -> Outcome {
         let source = format!("globalThis.__test_now = Date.now() + {milliseconds}; Date.now = () => __test_now;");
-        session.ctx.eval(Source::from_bytes(&source)).unwrap();
+        session.engine.eval(&source, "").unwrap();
         session.handle(PageEvent::Tick, &Fonts::load())
     }
 
@@ -3702,7 +3787,9 @@ mod tests {
              const o = {}; function f() { return (() => () => this)()() === this; }
              document.getElementById('o').textContent = [...new I().m(), f.call(o), /\\bclass\\b/.test(class {}.toString()), String(class B {})].join('|');",
         );
-        assert_eq!(text(&s), "true|2|1|true|true|class B { [native code] }", "{:?}", s.log());
+        // a class's source text, as Chrome prints it (Boa prints "{ [native code] }")
+        let got = text(&s).replace("class B { [native code] }", "class B {}");
+        assert_eq!(got, "true|2|1|true|true|class B {}", "{:?}", s.log());
     }
 
     #[test]
@@ -3727,7 +3814,9 @@ mod tests {
                d.getTimezoneOffset(), d.getHours(), new Intl.NumberFormat().resolvedOptions().locale, (1234.5).toLocaleString()].join('|');",
         );
         TEST_PERSONA.with(|t| t.set(None));
-        assert_eq!(text(&s), "true|Win32|Google Inc.|ru-RU|ru-RU,ru,en-US,en|true|false|-180|15|ru|1\u{a0}234,5", "{:?}", s.log());
+        // the default locale: "ru" (Boa) or "ru-RU" (V8, as Chrome reports it)
+        let got = text(&s).replace("|ru-RU|1\u{a0}", "|ru|1\u{a0}");
+        assert_eq!(got, "true|Win32|Google Inc.|ru-RU|ru-RU,ru,en-US,en|true|false|-180|15|ru|1\u{a0}234,5", "{:?}", s.log());
     }
 
     #[test]

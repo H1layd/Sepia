@@ -867,6 +867,26 @@ pub fn inherited(parent: &Style) -> Style {
     style
 }
 
+impl Style {
+    /// What a child's layout reads from this (its parent's) style: the
+    /// inherited properties, the box sizes percentages resolve against and
+    /// the formatting context. Two parents with the same key lay a child
+    /// out the same way (the layout memo keys on it).
+    pub fn inherited_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.font_size.to_bits(), self.bold, self.italic, self.color.r, self.color.g, self.color.b, self.color.a).hash(&mut h);
+        (self.letter_spacing.to_bits(), self.text_indent.to_bits(), self.nowrap, self.hidden, self.transparent, self.pre, self.monospace, self.dark).hash(&mut h);
+        (self.width.map(f32::to_bits), self.height.map(f32::to_bits), self.list_marker, self.family.as_deref()).hash(&mut h);
+        (Arc::as_ptr(&self.vars) as usize).hash(&mut h);
+        format!("{:?}{:?}{:?}{:?}{:?}", self.align, self.line_height, self.text_transform, self.display, self.flex).hash(&mut h);
+        h.finish()
+    }
+}
+
+/// How many times `compute` ran (SEPIA_VERBOSE prints it per layout).
+pub static COMPUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn compute(
     node: &Node,
     parent: Option<&Style>,
@@ -874,6 +894,7 @@ pub fn compute(
     ancestors: &[&Node],
     containing_width: f32,
 ) -> Style {
+    COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut style = default_style(&node.tag);
     // UA: a closed <details> shows only its <summary>
     if node.tag != "summary" && ancestors.last().is_some_and(|p| p.tag == "details" && p.attr("open").is_none()) {
@@ -941,9 +962,11 @@ pub fn compute(
     // (declaration, from a stylesheet: its text lives as long as the layout)
     let declarations: Vec<(&Declaration, bool)> = matched.iter().map(|d| (d, true)).chain(inline.iter().map(|d| (d, false))).collect();
     // SEPIA_WHY=substring: print what reaches an element whose markup starts with it
-    if let Ok(why) = std::env::var("SEPIA_WHY") {
+    // (read once: compute runs for every element on every layout pass)
+    static WHY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(why) = WHY.get_or_init(|| std::env::var("SEPIA_WHY").ok()) {
         let head = format!("{} {:?}", node.tag, node.attrs);
-        if head.contains(&why) {
+        if head.contains(why.as_str()) {
             for (d, _) in &declarations {
                 eprintln!("why {head}: {}: {}", d.name, d.value);
             }
