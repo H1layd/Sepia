@@ -326,12 +326,17 @@ fn fetch_request(
         .last()
         .map(|hop| hop.kind == HopKind::Http)
         .unwrap_or(false);
+    // as Chrome: at most 6 connections at once to an origin and 32 through
+    // one proxy; the rest wait their turn. Opening dozens of CONNECTs at
+    // once makes proxies drop them (66 lost images on one news page).
+    let key = pool_key(url, chain);
+    let proxy = chain.hops.first().map(|h| format!("proxy {}:{}", h.host, h.port));
+    let _slot = Slot::acquire(&key, proxy, timeout);
     if last_is_http && url.scheme == "http" {
         return fetch_via_http_proxy(url, chain, timeout);
     }
 
     // reuse an open connection to this origin when there is one
-    let key = pool_key(url, chain);
     if let Some(stream) = reuse.then(|| take_pooled(&key)).flatten() {
         if let Ok((response, keep)) = exchange(stream, url, request) {
             if let Some(stream) = keep {
@@ -359,6 +364,55 @@ fn fetch_request(
         put_pooled(key, stream);
     }
     Ok(response)
+}
+
+/// Connections in use, by origin key and by proxy (see `fetch_request`).
+static ACTIVE: OnceLock<(Mutex<HashMap<String, usize>>, std::sync::Condvar)> = OnceLock::new();
+const PER_PROXY: usize = 32;
+
+/// One connection's place in the limits, given back when dropped.
+struct Slot {
+    keys: Vec<String>,
+}
+
+impl Slot {
+    /// Wait (up to `wait`, then go anyway: a limit must never hang a page)
+    /// until the origin and the proxy both have room.
+    fn acquire(origin: &str, proxy: Option<String>, wait: Duration) -> Slot {
+        let (lock, ready) = ACTIVE.get_or_init(Default::default);
+        let mut keys = vec![origin.to_string()];
+        keys.extend(proxy);
+        let limit = |k: &str| if k.starts_with("proxy ") { PER_PROXY } else { PER_ORIGIN };
+        let deadline = Instant::now() + wait;
+        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let room = keys.iter().all(|k| active.get(k).copied().unwrap_or(0) < limit(k));
+            let left = deadline.saturating_duration_since(Instant::now());
+            if room || left.is_zero() {
+                for k in &keys {
+                    *active.entry(k.clone()).or_insert(0) += 1;
+                }
+                return Slot { keys };
+            }
+            active = ready.wait_timeout(active, left.min(Duration::from_millis(250))).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let (lock, ready) = ACTIVE.get_or_init(Default::default);
+        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        for k in &self.keys {
+            if let Some(n) = active.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    active.remove(k);
+                }
+            }
+        }
+        ready.notify_all();
+    }
 }
 
 /// Open connections, by origin and path (scheme, host, port and the chain),
