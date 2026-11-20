@@ -622,14 +622,45 @@ fn decodable_type(mime: &str) -> bool {
 }
 
 fn pick_candidate<'a>(srcset: &'a str, sizes: Option<&str>, viewport: f32) -> Option<&'a str> {
-    // "url 640w, url 1280w" or "url 1x, url 2x" (commas inside URLs are rare;
-    // a candidate is split at ", " or a comma followed by its URL)
+    // the HTML srcset parser: a URL runs to whitespace (commas inside it,
+    // as in `w_120,c_limit`, belong to it; trailing ones end a candidate),
+    // then descriptors up to a comma outside parentheses
     let mut candidates: Vec<(&str, Option<f32>, Option<f32>)> = Vec::new();
-    for part in srcset.split(',') {
-        let mut words = part.split_whitespace();
-        let Some(url) = words.next() else { continue };
+    let bytes = srcset.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut url = &srcset[start..i];
+        let mut descriptors = "";
+        if url.ends_with(',') {
+            url = url.trim_end_matches(',');
+        } else {
+            let from = i;
+            let mut depth = 0;
+            while i < bytes.len() && !(bytes[i] == b',' && depth == 0) {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => depth = (depth - 1).max(0),
+                    _ => {}
+                }
+                i += 1;
+            }
+            descriptors = &srcset[from..i];
+        }
+        if url.is_empty() {
+            continue;
+        }
         let (mut w, mut x) = (None, None);
-        for d in words {
+        for d in descriptors.split_whitespace() {
             if let Some(n) = d.strip_suffix('w').and_then(|n| n.parse::<f32>().ok()) {
                 w = Some(n);
             } else if let Some(n) = d.strip_suffix('x').and_then(|n| n.parse::<f32>().ok()) {
@@ -687,5 +718,11 @@ mod srcset_tests {
         assert_eq!(pick_candidate(set, Some("100px"), 1200.0), Some("a-320.jpg"));
         assert_eq!(pick_candidate("b.jpg, b2.jpg 2x", None, 1200.0), Some("b.jpg"));
         assert_eq!(pick_candidate("c2.jpg 2x, c1.jpg 1x", None, 1200.0), Some("c1.jpg"));
+        // commas inside URLs (image CDNs: w_640,c_limit) stay in the URL
+        let cdn = "https://m.test/1:1/w_120,c_limit/a.jpg 120w, https://m.test/1:1/w_640,c_limit/a.jpg 640w";
+        assert_eq!(pick_candidate(cdn, Some("600px"), 1200.0), Some("https://m.test/1:1/w_640,c_limit/a.jpg"));
+        // no whitespace: one URL, as the HTML parser reads it
+        assert_eq!(pick_candidate("d.jpg,e.jpg 2x", None, 1200.0), Some("d.jpg,e.jpg"));
+        assert_eq!(pick_candidate("d.jpg, e.jpg 2x", None, 1200.0), Some("d.jpg"));
     }
 }
