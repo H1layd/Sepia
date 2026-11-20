@@ -846,6 +846,16 @@ impl<'a> Layout<'a> {
         if paints && (b.top > 0.0 || b.right > 0.0 || b.bottom > 0.0 || b.left > 0.0) {
             self.page.draws.push(Draw::Edges { rect, widths: b, colors: style.border_colors, radius: style.radius });
         }
+        // outline: outside the border (past outline-offset), taking no room
+        let outline_color = style.outline_color.unwrap_or(style.color);
+        if paints && style.outline_visible && style.outline_width > 0.0 && outline_color.a > 0 && !self.measuring {
+            let grow = style.outline_offset + style.outline_width;
+            let around = Rect { x: rect.x - grow, y: rect.y - grow, w: rect.w + 2.0 * grow, h: rect.h + 2.0 * grow };
+            if around.w > 0.0 && around.h > 0.0 {
+                let radius = if style.radius > 0.0 { style.radius + grow } else { 0.0 };
+                self.page.draws.push(Draw::Edges { rect: around, widths: Edges::all(style.outline_width), colors: [outline_color; 4], radius });
+            }
+        }
         // a box with a width of its own is that wide for whoever measures content
         // (a percentage of the huge measuring width is not a size: left out)
         if style.width.is_some() && !style.width_relative && !style.hidden && rect.x + rect.w < 50_000.0 {
@@ -1408,6 +1418,52 @@ impl<'a> Layout<'a> {
                         }
                         piece_width = self.text_width(&piece, &item.style);
                     }
+                    // overflow-wrap: break-word / anywhere — a word wider than
+                    // the whole line is cut where it reaches the edge
+                    while item.style.break_words && (!self.intrinsic || item.style.break_min) && !item.style.nowrap && piece_width > lw - indent - line_width + FIT_SLACK && piece.chars().count() > 1 {
+                        let room = lw - indent - line_width;
+                        let mut head = String::new();
+                        for c in piece.chars() {
+                            head.push(c);
+                            if self.text_width(&head, &item.style) > room {
+                                head.pop();
+                                break;
+                            }
+                        }
+                        if head.is_empty() {
+                            if line_width == 0.0 {
+                                // not even one character fits: it goes alone
+                                head = piece.chars().next().map(String::from).unwrap_or_default();
+                            } else {
+                                if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                                    self.pending_indent = 0.0;
+                                    return cursor_y - y;
+                                }
+                                (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
+                                indent = 0.0;
+                                line.clear();
+                                line_width = 0.0;
+                                max_size = 0.0;
+                                piece = piece.trim_start().to_string();
+                                piece_width = self.text_width(&piece, &item.style);
+                                continue;
+                            }
+                        }
+                        let rest: String = piece.chars().skip(head.chars().count()).collect();
+                        max_size = max_size.max(item.style.font_size);
+                        line.push((head, item.clone_shallow()));
+                        if self.flush_counted(&mut line, lx, &mut cursor_y, lw, max_size, &mut lines_done) {
+                            self.pending_indent = 0.0;
+                            return cursor_y - y;
+                        }
+                        (cursor_y, lx, lw) = self.line_slot(cursor_y, x, width, line_guess);
+                        indent = 0.0;
+                        line.clear();
+                        line_width = 0.0;
+                        max_size = 0.0;
+                        piece = rest;
+                        piece_width = self.text_width(&piece, &item.style);
+                    }
                     max_size = max_size.max(item.style.font_size);
                     line_width += piece_width;
                     line.push((piece, item.clone_shallow()));
@@ -1654,6 +1710,27 @@ impl<'a> Layout<'a> {
             if item.style.hidden || item.style.transparent {
                 pen_x += advance;
                 continue;
+            }
+            // text-shadow: the same text under it, offset, in the shadow colour
+            // (a blur spreads it: drawn fainter, as the eye sees a soft shadow)
+            if let Some((dx, dy, blur, mut shadow)) = item.style.text_shadow {
+                if blur > 0.0 {
+                    shadow.a = (shadow.a as f32 / (1.0 + blur / 3.0)).round() as u8;
+                }
+                if shadow.a > 0 {
+                    self.page.draws.push(Draw::Text {
+                        x: pen_x + dx,
+                        baseline: baseline + dy,
+                        text: text.clone(),
+                        size: item.style.font_size,
+                        color: shadow,
+                        bold: item.style.bold,
+                        italic: item.style.italic,
+                        underline: false,
+                        letter_spacing: item.style.letter_spacing,
+                        family: item.style.family.clone(),
+                    });
+                }
             }
             self.page.draws.push(Draw::Text {
                 x: pen_x,
@@ -4384,6 +4461,41 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(below > 60.0 && below < 85.0, "text starts under the tallest float: {below}");
+    }
+
+    #[test]
+    fn long_words_break_with_overflow_wrap() {
+        let word = "x".repeat(80);
+        let doc = parse_document(&format!("<body style='margin:0'><div style='width:100px;overflow-wrap:break-word'>{word}</div></body>"));
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 600.0).build(&doc);
+        let runs: Vec<(f32, f32)> = page.draws.iter().filter_map(|d| match d {
+            Draw::Text { x, text, size, bold, italic, family, .. } => Some((*x, x + fonts.advance_in(text, *size, *bold, *italic, family.as_deref()))),
+            _ => None,
+        }).collect();
+        assert!(runs.len() > 3, "broken over several lines: {runs:?}");
+        assert!(runs.iter().all(|r| r.1 <= 101.0), "each inside the box: {runs:?}");
+    }
+
+    #[test]
+    fn outlines_and_empty_clips() {
+        // an outline outside the border (offset included); a visually hidden
+        // label (clip: rect(0 0 0 0)) draws nothing
+        let doc = parse_document(
+            "<body style='margin:0'><div style='margin:20px;width:100px;height:40px;outline:2px solid #f00;outline-offset:3px'></div>\
+             <div style='position:relative'><span style='position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)'>Skip to content</span>shown</div></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 600.0).build(&doc);
+        let outline = page.draws.iter().find_map(|d| match d {
+            Draw::Edges { rect, colors, widths, .. } if colors[0] == Color::rgb(255, 0, 0) => Some((*rect, widths.top)),
+            _ => None,
+        });
+        assert_eq!(outline.map(|(r, w)| (r.x, r.y, r.w, r.h, w)), Some((15.0, 15.0, 110.0, 50.0, 2.0)));
+        let texts: String = page.draws.iter().filter_map(|d| match d { Draw::Text { text, .. } => Some(text.as_str()), _ => None }).collect();
+        assert!(texts.contains("shown") && !texts.contains("Skip"), "{texts:?}");
     }
 
     #[test]

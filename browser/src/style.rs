@@ -279,6 +279,22 @@ pub struct Style {
     pub opacity: f32,
     /// This box or an ancestor has zero opacity (descendants cannot undo it).
     pub transparent: bool,
+    /// clip: rect() with no area (applies to absolute boxes) / clip-path
+    /// that leaves nothing: the "visually hidden" text for screen readers
+    pub clip_empty: bool,
+    /// overflow-wrap: break-word / anywhere, word-break: break-all (inherited):
+    /// a word wider than its line is broken
+    pub break_words: bool,
+    /// text-shadow (the first one; inherited): offset, blur, colour
+    pub text_shadow: Option<(f32, f32, f32, Color)>,
+    /// …and it also narrows min-content (anywhere, break-all; not break-word)
+    pub break_min: bool,
+    /// outline: width (0: none), colour, style shown, offset
+    pub outline_width: f32,
+    pub outline_color: Option<Color>,
+    pub outline_visible: bool,
+    pub outline_offset: f32,
+    pub clip_path_empty: bool,
     pub position: Position,
     /// z-index (None: auto)
     pub z_index: Option<i32>,
@@ -389,6 +405,15 @@ impl Default for Style {
             hidden: false,
             opacity: 1.0,
             transparent: false,
+            clip_empty: false,
+            break_words: false,
+            text_shadow: None,
+            break_min: false,
+            outline_width: 3.0,
+            outline_color: None,
+            outline_visible: false,
+            outline_offset: 0.0,
+            clip_path_empty: false,
             position: Position::Static,
             z_index: None,
             ellipsis: false,
@@ -642,6 +667,75 @@ fn parse_bg_size(value: &str, font_size: f32) -> BgSize {
             BgSize::Sized(one(words.first()), one(words.get(1)))
         }
     }
+}
+
+/// text-shadow: the first shadow as (x, y, blur, colour); none when it is
+/// `none`, fully transparent or not readable.
+fn parse_text_shadow(value: &str, font_size: f32, current: Color) -> Option<(f32, f32, f32, Color)> {
+    let first = crate::css::split_top_level(value, ',').into_iter().next()?;
+    if first.trim().eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut lengths = Vec::new();
+    let mut color = None;
+    for part in split_space(&first) {
+        if let Some(c) = parse_color(&part) {
+            color = Some(c);
+        } else if part.eq_ignore_ascii_case("currentcolor") {
+            color = Some(current);
+        } else if let Some(l) = parse_length(&part, font_size, 0.0) {
+            lengths.push(l);
+        } else {
+            return None;
+        }
+    }
+    let color = color.unwrap_or(current);
+    match lengths.as_slice() {
+        [x, y] => Some((*x, *y, 0.0, color)),
+        [x, y, blur, ..] => Some((*x, *y, *blur, color)),
+        _ => None,
+    }
+    .filter(|s| s.3.a > 0)
+}
+
+/// `clip: rect(0 0 0 0)` / `rect(1px, 1px, 1px, 1px)`: a rectangle with no
+/// area (bottom <= top or right <= left).
+fn clip_rect_empty(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    let Some(inner) = v.strip_prefix("rect(").and_then(|r| r.strip_suffix(')')) else { return false };
+    let parts: Vec<Option<f32>> = inner.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()).map(|p| if p == "auto" { None } else { parse_length(p, 16.0, 0.0) }).collect();
+    match parts.as_slice() {
+        [top, right, bottom, left] => {
+            let empty = |a: &Option<f32>, b: &Option<f32>| matches!((a, b), (Some(a), Some(b)) if b <= a);
+            empty(top, bottom) || empty(left, right)
+        }
+        _ => false,
+    }
+}
+
+/// clip-path that leaves nothing visible: inset(50%) or more, circle(0),
+/// a polygon with every point the same.
+fn clip_path_empty(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    if let Some(inner) = v.strip_prefix("inset(").and_then(|r| r.split(')').next()) {
+        let insets: Vec<f32> = inner.split(" round").next().unwrap_or("").split_whitespace().filter_map(|p| p.strip_suffix('%').and_then(|n| n.parse::<f32>().ok())).collect();
+        return match insets.as_slice() {
+            [a] => *a >= 50.0,
+            [a, b] => *a >= 50.0 || *b >= 50.0,
+            [a, b, c] => a + c >= 100.0 || *b >= 50.0,
+            [a, b, c, d] => a + c >= 100.0 || b + d >= 100.0,
+            _ => false,
+        };
+    }
+    if let Some(inner) = v.strip_prefix("circle(").or_else(|| v.strip_prefix("ellipse(")).and_then(|r| r.split(')').next()) {
+        let radius = inner.split(" at").next().unwrap_or("").trim();
+        return radius.split_whitespace().next().is_some_and(|r| parse_length(r, 16.0, 0.0) == Some(0.0) || r == "0%");
+    }
+    if let Some(inner) = v.strip_prefix("polygon(").and_then(|r| r.split(')').next()) {
+        let points: Vec<String> = inner.split(',').map(|p| p.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+        return points.len() >= 2 && points.iter().all(|p| *p == points[0]);
+    }
+    false
 }
 
 /// background-repeat: the first layer's (x, y); space and round repeat too.
@@ -987,6 +1081,9 @@ pub fn compute(
             style.family = inherit.family.clone();
         }
         style.pre = style.pre || inherit.pre;
+        style.break_words = inherit.break_words;
+        style.text_shadow = inherit.text_shadow;
+        style.break_min = inherit.break_min;
         style.list_marker = parent_style.list_marker;
         if style.display == Display::ListItem {
             if let Some(m) = parent_style.list_marker {
@@ -1137,6 +1234,8 @@ pub fn compute(
         style.display = Display::Table;
     }
     style.transparent |= style.opacity == 0.0;
+    // clipped to nothing: drawn as nothing (its box still takes its place)
+    style.transparent |= style.clip_path_empty || (style.clip_empty && matches!(style.position, Position::Absolute | Position::Fixed));
     if node.tag == "html" {
         ROOT_FONT.with(|r| r.set(style.font_size.clamp(4.0, 200.0)));
     }
@@ -1836,6 +1935,46 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "z-index" => style.z_index = value.trim().parse::<i32>().ok(),
+        "clip" => style.clip_empty = clip_rect_empty(value),
+        "outline" => {
+            // width style colour, any order (as border); `auto` is a focus ring
+            style.outline_visible = false;
+            style.outline_width = 3.0;
+            style.outline_color = None;
+            for part in split_space(value) {
+                match part.as_str() {
+                    "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => style.outline_visible = true,
+                    "none" | "hidden" | "auto" => style.outline_visible = false,
+                    "thin" => style.outline_width = 1.0,
+                    "medium" => style.outline_width = 3.0,
+                    "thick" => style.outline_width = 5.0,
+                    p => {
+                        if let Some(c) = parse_color(p) {
+                            style.outline_color = Some(c);
+                        } else if let Some(w) = parse_length(p, font_size, containing_width) {
+                            style.outline_width = w;
+                        }
+                    }
+                }
+            }
+        }
+        "text-shadow" => style.text_shadow = parse_text_shadow(value, font_size, style.color),
+        "outline-style" => style.outline_visible = matches!(value.trim(), "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"),
+        "outline-width" => {
+            style.outline_width = match value.trim() {
+                "thin" => 1.0,
+                "medium" => 3.0,
+                "thick" => 5.0,
+                v => parse_length(v, font_size, containing_width).unwrap_or(style.outline_width),
+            }
+        }
+        "outline-color" => {
+            if let Some(c) = parse_color(value) {
+                style.outline_color = Some(c);
+            }
+        }
+        "outline-offset" => style.outline_offset = parse_length(value, font_size, containing_width).unwrap_or(0.0),
+        "clip-path" | "-webkit-clip-path" => style.clip_path_empty = clip_path_empty(value),
         "text-overflow" => style.ellipsis = value.split_whitespace().last() == Some("ellipsis"),
         "-webkit-line-clamp" | "line-clamp" => style.line_clamp = value.trim().parse::<u32>().ok().filter(|n| *n > 0),
         "-webkit-box-orient" | "box-orient" => style.box_vertical = matches!(value.trim(), "vertical" | "block-axis"),
@@ -2267,14 +2406,74 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         n if n.starts_with("transition") || n.starts_with("animation") || n.starts_with("scroll-") || n.starts_with("overscroll-") || n.starts_with("-webkit-transition") || n.starts_with("-webkit-animation") => {
             crate::report::miss("css-prop-inert", name)
         }
+        "overflow-wrap" | "word-wrap" => {
+            style.break_words = matches!(value.trim(), "break-word" | "anywhere");
+            style.break_min = value.trim() == "anywhere";
+        }
+        "word-break" => {
+            style.break_words = matches!(value.trim(), "break-all" | "break-word");
+            style.break_min = value.trim() == "break-all";
+        }
+        // the old flexbox (display: -webkit-box) by its own names
+        "-webkit-box-align" => {
+            let v = match value.trim() { "start" => "flex-start", "end" => "flex-end", other => other };
+            apply(style, "align-items", v, containing_width)
+        }
+        "-webkit-box-pack" => {
+            let v = match value.trim() { "start" => "flex-start", "end" => "flex-end", "justify" => "space-between", "distribute" => "space-around", other => other };
+            apply(style, "justify-content", v, containing_width)
+        }
+        "-webkit-box-flex" => apply(style, "flex-grow", value, containing_width),
+        "-webkit-box-ordinal-group" => apply(style, "order", value, containing_width),
+        // -webkit- on a property this engine knows by its standard name: Chrome
+        // takes it as an alias (it ignores -moz-, -ms- and -o-, and so do we)
+        n if n.starts_with("-webkit-") => {
+            let bare = &n["-webkit-".len()..];
+            if KNOWN_UNPREFIXED.contains(&bare) {
+                apply(style, bare, value, containing_width)
+            } else {
+                crate::report::miss("css-prop", name)
+            }
+        }
         _ => crate::report::miss("css-prop", name),
     }
 }
+
+/// Standard properties whose -webkit- forms Chrome still accepts as aliases.
+const KNOWN_UNPREFIXED: &[&str] = &[
+    "box-sizing", "transform", "transform-origin", "flex", "flex-direction", "flex-wrap", "flex-flow", "flex-grow",
+    "flex-shrink", "flex-basis", "align-items", "align-self", "align-content", "justify-content", "order",
+    "border-radius", "box-shadow", "column-gap", "gap", "text-decoration", "text-decoration-line", "text-decoration-color",
+    "background-size", "background-clip", "filter", "hyphens", "line-clamp", "text-overflow", "overflow-wrap", "word-break",
+    "mask-image", "mask", "appearance", "user-select", "transition", "animation", "position", "sticky",
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dom::parse_document;
+
+    #[test]
+    fn text_shadows() {
+        let c = Color::BLACK;
+        assert_eq!(parse_text_shadow("1px 2px 3px rgba(0,0,0,.5), 0 0 1px red", 16.0, c).map(|s| (s.0, s.1, s.2)), Some((1.0, 2.0, 3.0)));
+        assert_eq!(parse_text_shadow("#fff 0 1px", 16.0, c).map(|s| (s.0, s.1, s.3)), Some((0.0, 1.0, Color::WHITE)));
+        assert_eq!(parse_text_shadow("none", 16.0, c), None);
+        assert_eq!(parse_text_shadow("0 0 0 transparent", 16.0, c), None);
+    }
+
+    #[test]
+    fn clipped_to_nothing() {
+        assert!(clip_rect_empty("rect(0 0 0 0)"));
+        assert!(clip_rect_empty("rect(1px, 1px, 1px, 1px)"));
+        assert!(!clip_rect_empty("rect(0, 100px, 50px, 0)"));
+        assert!(clip_path_empty("inset(50%)"));
+        assert!(clip_path_empty("inset(100%)"));
+        assert!(!clip_path_empty("inset(10% 0 0 0 round 8px)"));
+        assert!(clip_path_empty("circle(0)"));
+        assert!(clip_path_empty("polygon(0 0, 0 0, 0 0)"));
+        assert!(!clip_path_empty("polygon(0 0, 100% 0, 50% 100%)"));
+    }
 
     #[test]
     fn closed_details_show_only_the_summary() {
