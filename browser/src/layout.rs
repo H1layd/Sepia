@@ -2745,40 +2745,43 @@ impl<'a> Layout<'a> {
 // ---------------------------------------------------------------------------
 
 /// One flex item: an element child, or a run of text (an anonymous item).
+/// A flex item: its node, and the ancestors and parent style it is laid out
+/// under when it comes from a `display: contents` child (None: the container's).
 struct FlexItem<'n> {
     node: &'n Node,
-    flex: crate::style::Flex,
-    /// main size the item asks for before growing/shrinking (outer, margins included)
-    basis: f32,
-    /// smallest main size it can shrink to (min-content, outer)
-    min: f32,
-    /// main size after grow/shrink
-    size: f32,
-    /// the item's own vertical margins, to find its box when stretching
-    margin_top: f32,
-    margin_bottom: f32,
+    via: Option<(Vec<&'n Node>, Style)>,
     /// padding + border + margin on the right: past the content's extent
     right_chrome: f32,
-    /// min-width as an outer size (0 without one)
-    min_outer: f32,
-    /// align-self, else the container's align-items
-    align: crate::style::AlignItems,
-    /// a definite width the item gives itself (outer): a column item that is
-    /// not stretched keeps it instead of shrinking to its content
-    fixed_outer: Option<f32>,
-    /// ancestors and parent style when the item comes from a `display:
-    /// contents` child (None: the container's own)
-    via: Option<(Vec<&'n Node>, Style)>,
-    /// max-width as an outer size (infinite without one)
-    max_outer: f32,
-    /// margin-left / margin-right: auto (they take the line's free space)
-    auto: (bool, bool),
-    order: i32,
+    /// vertical margins, to find the item's own box when stretching it
+    margin_top: f32,
+    margin_bottom: f32,
 }
 
 impl<'n> FlexItem<'n> {
     fn ctx<'s>(&'s self, ancestors: &'s [&'n Node], style: &'s Style) -> (&'s [&'n Node], &'s Style) {
         match &self.via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) }
+    }
+}
+
+fn taffy_justify(j: crate::style::Justify) -> taffy::AlignContent {
+    use crate::style::Justify;
+    match j {
+        Justify::Start => taffy::AlignContent::FLEX_START,
+        Justify::End => taffy::AlignContent::FLEX_END,
+        Justify::Center => taffy::AlignContent::CENTER,
+        Justify::SpaceBetween => taffy::AlignContent::SPACE_BETWEEN,
+        Justify::SpaceAround => taffy::AlignContent::SPACE_AROUND,
+        Justify::SpaceEvenly => taffy::AlignContent::SPACE_EVENLY,
+    }
+}
+
+fn taffy_align(a: crate::style::AlignItems) -> taffy::AlignItems {
+    use crate::style::AlignItems;
+    match a {
+        AlignItems::Stretch => taffy::AlignItems::STRETCH,
+        AlignItems::Start => taffy::AlignItems::FLEX_START,
+        AlignItems::End => taffy::AlignItems::FLEX_END,
+        AlignItems::Center => taffy::AlignItems::CENTER,
     }
 }
 
@@ -2928,25 +2931,32 @@ impl<'a> Layout<'a> {
     /// Items are measured (max- and min-content), sized along the main axis,
     /// broken into lines when wrapping, then placed and aligned; returns the
     /// height used. `ancestors` ends with `node`.
+    /// A flex container's items, sized and placed by taffy (the CSS
+    /// Flexible Box algorithm: basis, grow/shrink with the automatic minimum
+    /// size, lines, justify/align, auto margins, align-content). Each item is
+    /// a leaf taffy measures through this engine: its min-content and
+    /// max-content widths and its height at a width. `width` is the content
+    /// box's; while measuring, 100000 asks for max-content and 1 for min-content.
     fn layout_flex(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
-        use crate::style::{AlignItems, FlexDirection, Justify};
+        use crate::style::FlexDirection;
+        use taffy::prelude::{AvailableSpace, Dimension, LengthPercentage, LengthPercentageAuto, NodeId, Size, TaffyTree};
         let f = style.flex;
         let row = matches!(f.direction, FlexDirection::Row | FlexDirection::RowReverse);
-        let reverse = matches!(f.direction, FlexDirection::RowReverse | FlexDirection::ColumnReverse);
 
-        let mut items: Vec<FlexItem> = Vec::new();
         let entries: Vec<(&Node, Option<(Vec<&Node>, Style)>)> = match self.contents_children(node, ancestors, style, width) {
             Some(list) => list.into_iter().map(|(n, chain, parent)| (n, Some((chain, parent)))).collect(),
             None => node.children.iter().map(|c| (c, None)).collect(),
         };
+        let mut items: Vec<(i32, FlexItem, taffy::Style)> = Vec::new();
         for (child, via) in entries {
             let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
-            let mut fixed_outer = None;
-            let mut auto = (false, false);
+            let mut leaf = taffy::Style::default();
             let mut order = 0;
-            let (item_flex, margin_top, margin_bottom, right_chrome, min_outer) = match &child.text {
+            let mut right_chrome = 0.0;
+            let (mut margin_top, mut margin_bottom) = (0.0, 0.0);
+            match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
-                Some(_) => (crate::style::Flex::default(), 0.0, 0.0, 0.0, 0.0),
+                Some(_) => {}
                 None => {
                     let s = compute(child, Some(parent), self.sheet, anc, width);
                     if s.display == Display::None {
@@ -2956,248 +2966,166 @@ impl<'a> Layout<'a> {
                         self.place_out_of_flow(child, anc, &s, x, y);
                         continue;
                     }
-                    let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
-                    let min_outer = s.min_width.map(|m| m + chrome + s.margin.horizontal()).unwrap_or(0.0);
-                    auto = s.margin_auto;
                     order = s.order;
-                    fixed_outer = s.width.map(|w| {
-                        let w = s.max_width.map_or(w, |m| w.min(m));
-                        w + chrome + s.margin.horizontal()
-                    });
-                    (s.flex, s.margin.top, s.margin.bottom, s.padding.right + s.border.right + s.margin.right, min_outer)
+                    right_chrome = s.padding.right + s.border.right + s.margin.right;
+                    (margin_top, margin_bottom) = (s.margin.top, s.margin.bottom);
+                    // the item's own box is this engine's: taffy sees its
+                    // outer (margin) box, so sizes here add padding, border
+                    // (unless border-box) and margins
+                    let chrome_w = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
+                    let chrome_h = if s.border_box { 0.0 } else { s.padding.vertical() + s.border.top + s.border.bottom };
+                    let outer_w = |v: f32| v + chrome_w + s.margin.horizontal();
+                    let outer_h = |v: f32| v + chrome_h + s.margin.vertical();
+                    let len = |v: Option<f32>| v.map_or(Dimension::auto(), Dimension::length);
+                    let lim = |v: Option<f32>| v.map_or(LengthPercentageAuto::auto(), LengthPercentageAuto::length);
+                    leaf.size = Size { width: len(s.width.map(outer_w)), height: len(s.height.map(outer_h)) };
+                    leaf.min_size = Size { width: lim(s.min_width.map(outer_w)), height: lim(s.min_height.map(outer_h)) };
+                    leaf.max_size = Size { width: lim(s.max_width.map(outer_w)), height: lim(s.max_height.map(outer_h)) };
+                    leaf.flex_grow = s.flex.grow;
+                    leaf.flex_shrink = s.flex.shrink;
+                    leaf.flex_basis = match s.flex.basis {
+                        Some(b) => Dimension::length(if row { outer_w(b) } else { outer_h(b) }),
+                        None => Dimension::auto(),
+                    };
+                    leaf.align_self = s.flex.align_self.map(taffy_align);
+                    let auto = |on: bool| if on { LengthPercentageAuto::auto() } else { LengthPercentageAuto::length(0.0) };
+                    leaf.margin = taffy::Rect { left: auto(s.margin_auto.0), right: auto(s.margin_auto.1), top: auto(false), bottom: auto(false) };
+                    if s.scroller {
+                        leaf.overflow = taffy::Point { x: taffy::Overflow::Hidden, y: taffy::Overflow::Hidden };
+                    }
                 }
-            };
-            let align = item_flex.align_self.unwrap_or(f.align);
-            items.push(FlexItem { node: child, flex: item_flex, basis: 0.0, min: 0.0, size: 0.0, margin_top, margin_bottom, right_chrome, min_outer, align, fixed_outer, via, max_outer: f32::INFINITY, auto, order });
+            }
+            items.push((order, FlexItem { node: child, via, right_chrome, margin_top, margin_bottom }, leaf));
         }
         // `order` first (stable: equal orders keep document order)
-        items.sort_by_key(|i| i.order);
-        if reverse {
-            items.reverse();
-        }
+        items.sort_by_key(|(order, _, _)| *order);
         if items.is_empty() {
             return 0.0;
         }
 
-        if !row {
-            return self.layout_flex_column(items, ancestors, style, x, y, width);
-        }
-
-        // ----- measure along the main (horizontal) axis ----------------------
-        for item in &mut items {
-            let (anc, parent) = item.ctx(ancestors, style);
-            let (wide, _) = self.item_page(item.node, anc, parent, 100_000.0, true);
-            let (narrow, _) = self.item_page(item.node, anc, parent, 1.0, true);
-            let (own, basis_chrome, explicit_min) = match item.node.text {
-                Some(_) => (None, 0.0, false),
-                // a declared width is the content box; the item's outer size adds its margins
-                None => {
-                    let s = compute(item.node, Some(parent), self.sheet, anc, width);
-                    let chrome = if s.border_box { 0.0 } else { s.padding.horizontal() + s.border.left + s.border.right };
-                    if let Some(m) = s.max_width {
-                        item.max_outer = m + chrome + s.margin.horizontal();
-                    }
-                    (s.width.map(|w| w + chrome + s.margin.horizontal()),
-                     chrome + s.margin.horizontal(), s.min_width.is_some())
-                }
-            };
-            let max_content = self.extent(&wide) + item.right_chrome;
-            item.min = (self.extent(&narrow) + item.right_chrome).min(max_content);
-            item.basis = item.flex.basis.map(|b| b + basis_chrome).or(own).unwrap_or(max_content);
-            if own.is_some() && item.flex.basis.is_none() {
-                item.min = item.min.min(item.basis);
-            }
-            // min-width is a floor for both
-            item.min = if explicit_min { item.min_outer } else { item.min.max(item.min_outer) };
-            // max-width caps the basis (and the min-content floor) too
-            item.basis = item.basis.min(item.max_outer).max(item.min_outer);
-            item.min = item.min.min(item.max_outer.max(item.min_outer));
-        }
-
-        // ----- lines -----------------------------------------------------------
-        let gap = f.column_gap;
-        let mut lines: Vec<std::ops::Range<usize>> = Vec::new();
-        let mut start = 0;
-        let mut used = 0.0f32;
-        for i in 0..items.len() {
-            let add = items[i].basis + if i > start { gap } else { 0.0 };
-            if f.wrap && i > start && used + add > width {
-                lines.push(start..i);
-                start = i;
-                used = items[i].basis;
-            } else {
-                used += add;
-            }
-        }
-        lines.push(start..items.len());
-
-        // ----- grow / shrink, place, align --------------------------------------
-        let mut cursor = y;
-        for (n, line) in lines.iter().enumerate() {
-            let count = line.len();
-            let gaps = gap * (count.saturating_sub(1)) as f32;
-            let total: f32 = items[line.clone()].iter().map(|i| i.basis).sum();
-            let free = width - total - gaps;
-            // measuring max-content: items stay at their basis (growing into the
-            // huge measuring space would push the next item out of sight)
-            if free > 0.0 && (self.measuring || self.intrinsic) {
-                for item in &mut items[line.clone()] {
-                    item.size = item.basis;
-                }
-            } else if free > 0.0 {
-                let grow: f32 = items[line.clone()].iter().map(|i| i.flex.grow).sum();
-                for item in &mut items[line.clone()] {
-                    item.size = (item.basis + if grow > 0.0 { free * item.flex.grow / grow } else { 0.0 }).min(item.max_outer.max(item.basis));
-                }
-            } else {
-                // Freeze items that reach their minimum, then redistribute the
-                // remaining deficit among the items that can still shrink.
-                for item in &mut items[line.clone()] {
-                    item.size = item.basis.max(item.min);
-                }
-                loop {
-                    let deficit = items[line.clone()].iter().map(|i| i.size).sum::<f32>() + gaps - width;
-                    let weight: f32 = items[line.clone()].iter()
-                        .filter(|i| i.size > i.min)
-                        .map(|i| i.flex.shrink * i.basis).sum();
-                    if deficit <= 0.001 || weight <= 0.0 {
-                        break;
-                    }
-                    let mut froze = false;
-                    for item in &mut items[line.clone()] {
-                        if item.size > item.min && item.flex.shrink > 0.0 {
-                            let target = item.size - deficit * item.flex.shrink * item.basis / weight;
-                            froze |= target < item.min;
-                            item.size = target.max(item.min);
-                        }
-                    }
-                    if !froze {
-                        break;
-                    }
-                }
-            }
-            let used: f32 = items[line.clone()].iter().map(|i| i.size).sum::<f32>() + gaps;
-            let leftover = (width - used).max(0.0);
-            // when measuring, everything packs to the start: centring a
-            // line in a 100000px measuring box would read as a huge width
-            let justify = if self.measuring { Justify::Start } else { f.justify };
-            let (pen, spacing) = match justify {
-                Justify::Start => (0.0, 0.0),
-                Justify::End => (leftover, 0.0),
-                Justify::Center => (leftover / 2.0, 0.0),
-                Justify::SpaceBetween if count > 1 => (0.0, leftover / (count - 1) as f32),
-                Justify::SpaceBetween => (0.0, 0.0),
-                Justify::SpaceAround => (leftover / count as f32 / 2.0, leftover / count as f32),
-                Justify::SpaceEvenly => (leftover / (count + 1) as f32, leftover / (count + 1) as f32),
-            };
-            // auto margins take the free space before justify-content does
-            let autos = items[line.clone()].iter().map(|i| i.auto.0 as u32 + i.auto.1 as u32).sum::<u32>();
-            let per_auto = if autos > 0 && !self.measuring && leftover > 0.0 { leftover / autos as f32 } else { 0.0 };
-            let (mut pen, spacing) = if per_auto > 0.0 { (0.0, 0.0) } else { (pen, spacing) };
-            let laid: Vec<(Page, f32)> = items[line.clone()]
-                .iter()
-                .map(|item| { let (anc, parent) = item.ctx(ancestors, style); self.item_page_sized(item.node, anc, parent, item.size) })
-                .collect();
-            let mut line_h = laid.iter().map(|(_, h)| *h).fold(0.0f32, f32::max);
-            // a single-line container with a definite height: its one line is that tall
-            if lines.len() == 1 && !self.measuring {
-                let chrome = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
-                if let Some(h) = style.height.or(style.min_height) {
-                    line_h = line_h.max(h - chrome);
-                }
-            }
-            for (item, (mut page, h)) in items[line.clone()].iter().zip(laid) {
-                if item.align == AlignItems::Stretch && h < line_h && item.node.text.is_none() {
-                    stretch_box(&mut page, h, line_h - h, item.margin_top, item.margin_bottom);
-                }
-                let dy = match item.align {
-                    AlignItems::Center => (line_h - h) / 2.0,
-                    AlignItems::End => line_h - h,
-                    AlignItems::Start | AlignItems::Stretch => 0.0,
-                };
-                if item.auto.0 { pen += per_auto; }
-                self.paste(page, x + pen, cursor + dy);
-                pen += item.size + gap + spacing;
-                if item.auto.1 { pen += per_auto; }
-            }
-            cursor += line_h;
-            if n + 1 < lines.len() {
-                cursor += f.row_gap;
-            }
-        }
-        cursor - y
-    }
-
-    /// Column direction: items stack; `align-items` places them across,
-    /// `justify-content` along the container's declared height, if any.
-    fn layout_flex_column(&mut self, items: Vec<FlexItem>, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
-        use crate::style::{AlignItems, Justify};
-        let f = style.flex;
-        let mut laid: Vec<(Page, f32, f32)> = Vec::new(); // page, height, width
-        let mut aligns = Vec::new();
-        for item in &items {
-            let item_w = if item.align == AlignItems::Stretch {
-                width
-            } else if let Some(fixed) = item.fixed_outer {
-                fixed.min(width).max(1.0)
-            } else {
-                let (anc, parent) = item.ctx(ancestors, style);
-                let (wide, _) = self.item_page(item.node, anc, parent, width, true);
-                (self.extent(&wide) + item.right_chrome).min(width).max(1.0)
-            };
-            let (anc, parent) = item.ctx(ancestors, style);
-            let (page, h) = self.item_page(item.node, anc, parent, item_w, false);
-            laid.push((page, h, item_w));
-            aligns.push(item.align);
-        }
-        let gaps = f.row_gap * (laid.len().saturating_sub(1)) as f32;
-        let mut content: f32 = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
-        // the container's own height (or min-height), as a content box
-        let chrome = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
-        let target = style.height.or(style.min_height).map(|h| (h - chrome).max(0.0));
-        // flex-grow: growing items share the free space and are laid out again at their new height
-        let grow: f32 = items.iter().map(|i| i.flex.grow).sum();
-        if let (Some(t), false) = (target, self.measuring) {
-            let free = t - content;
-            if free > 0.5 && grow > 0.0 {
-                for (i, item) in items.iter().enumerate() {
-                    if item.flex.grow <= 0.0 || item.node.text.is_some() {
-                        continue;
-                    }
-                    let h = laid[i].1 + free * item.flex.grow / grow;
-                    let (anc, parent) = item.ctx(ancestors, style);
-                    let mut sub = self.sub_layout(false);
-                    sub.blockify = Some(item.node as *const Node);
-                    sub.flex_height = Some((item.node as *const Node, h));
-                    let got = sub.layout_block(item.node, anc, Some(parent), 0.0, 0.0, laid[i].2.max(1.0));
-                    laid[i] = (sub.page, got.max(h), laid[i].2);
-                }
-                content = laid.iter().map(|(_, h, _)| *h).sum::<f32>() + gaps;
-            }
-        }
-        let leftover = target.map(|h| (h - content).max(0.0)).unwrap_or(0.0);
-        let count = laid.len();
-        let justify = if self.measuring { Justify::Start } else { f.justify };
-        let (mut pen, spacing) = match justify {
-            Justify::Start => (0.0, 0.0),
-            Justify::End => (leftover, 0.0),
-            Justify::Center => (leftover / 2.0, 0.0),
-            Justify::SpaceBetween if count > 1 => (0.0, leftover / (count - 1) as f32),
-            Justify::SpaceBetween => (0.0, 0.0),
-            Justify::SpaceAround => (leftover / count as f32 / 2.0, leftover / count as f32),
-            Justify::SpaceEvenly => (leftover / (count + 1) as f32, leftover / (count + 1) as f32),
+        let probe = if self.measuring || self.intrinsic {
+            if width >= 50_000.0 { Some(AvailableSpace::MaxContent) } else if width <= 1.5 { Some(AvailableSpace::MinContent) } else { None }
+        } else {
+            None
         };
-        for ((page, h, w), align) in laid.into_iter().zip(aligns) {
-            let align = if self.measuring { AlignItems::Start } else { align };
-            let dx = match align {
-                AlignItems::Center => (width - w) / 2.0,
-                AlignItems::End => width - w,
-                _ => 0.0,
-            };
-            self.paste(page, x + dx, y + pen);
-            pen += h + f.row_gap + spacing;
+        let chrome_h = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
+        let content_h = |v: Option<f32>| v.map(|h| (h - chrome_h).max(0.0));
+        let mut root = taffy::Style {
+            display: taffy::Display::Flex,
+            flex_direction: match f.direction {
+                FlexDirection::Row => taffy::FlexDirection::Row,
+                FlexDirection::RowReverse => taffy::FlexDirection::RowReverse,
+                FlexDirection::Column => taffy::FlexDirection::Column,
+                FlexDirection::ColumnReverse => taffy::FlexDirection::ColumnReverse,
+            },
+            flex_wrap: if f.wrap { taffy::FlexWrap::Wrap } else { taffy::FlexWrap::NoWrap },
+            justify_content: taffy_justify(f.justify),
+            align_items: taffy_align(f.align),
+            align_content: f.align_content.map_or(taffy::AlignContent::NORMAL, taffy_justify),
+            gap: Size { width: LengthPercentage::length(f.column_gap), height: LengthPercentage::length(f.row_gap) },
+            ..taffy::Style::default()
+        };
+        root.size = Size {
+            width: if probe.is_some() { Dimension::auto() } else { Dimension::length(width) },
+            height: content_h(style.height).map_or(Dimension::auto(), Dimension::length),
+        };
+        if probe.is_none() {
+            root.min_size.height = content_h(style.min_height).map_or(LengthPercentageAuto::auto(), LengthPercentageAuto::length);
+            root.max_size.height = content_h(style.max_height).map_or(LengthPercentageAuto::auto(), LengthPercentageAuto::length);
         }
-        (pen - f.row_gap - spacing).max(0.0)
+
+        let mut tree: TaffyTree<usize> = TaffyTree::new();
+        tree.disable_rounding();
+        let leaves: Vec<NodeId> = items.iter().enumerate()
+            .map(|(i, (_, _, leaf))| tree.new_leaf_with_context(leaf.clone(), i).expect("taffy leaf"))
+            .collect();
+        let container = tree.new_with_children(root, &leaves).expect("taffy container");
+        // min-content and max-content widths, measured once per item
+        let intrinsic: Vec<std::cell::Cell<Option<(f32, f32)>>> = items.iter().map(|_| std::cell::Cell::new(None)).collect();
+        let this = &*self;
+        let widths = |i: usize| {
+            if let Some(w) = intrinsic[i].get() {
+                return w;
+            }
+            let item = &items[i].1;
+            let (anc, parent) = item.ctx(ancestors, style);
+            let (wide, _) = this.item_page(item.node, anc, parent, 100_000.0, true);
+            let (narrow, _) = this.item_page(item.node, anc, parent, 1.0, true);
+            let max = this.extent(&wide) + item.right_chrome;
+            let w = ((this.extent(&narrow) + item.right_chrome).min(max), max);
+            intrinsic[i].set(Some(w));
+            w
+        };
+        // inside a measuring pass only the widths of what is drawn count:
+        // heights would lay every nested item out again at every width
+        let widths_only = self.measuring || self.intrinsic;
+        let available = Size { width: probe.unwrap_or(AvailableSpace::Definite(width)), height: AvailableSpace::MaxContent };
+        let measured = tree.compute_layout_with_measure(container, available, |input, _, context, leaf_style| {
+            let Some(&mut i) = context else { return taffy::LayoutOutput::HIDDEN };
+            // asked for a width only (a flex basis, a min-content
+            // contribution): no layout at that width
+            let width_only = input.axis == taffy::RequestedAxis::Horizontal;
+            taffy::compute_leaf_layout(input, leaf_style, |_, _| 0.0, |known, space| {
+                let item = &items[i].1;
+                let (anc, parent) = item.ctx(ancestors, style);
+                let w = known.width.unwrap_or_else(|| {
+                    let (min, max) = widths(i);
+                    match space.width {
+                        AvailableSpace::MinContent => min,
+                        AvailableSpace::MaxContent => max,
+                        AvailableSpace::Definite(room) => max.min(room).max(min),
+                    }
+                });
+                let h = if width_only || widths_only { known.height.unwrap_or(0.0) } else { known.height.unwrap_or_else(|| this.item_page_sized(item.node, anc, parent, w.max(1.0)).1) };
+                Size { width: w, height: h }
+            })
+        });
+        if measured.is_err() {
+            return 0.0;
+        }
+
+        let mut placed = Vec::with_capacity(items.len());
+        for i in 0..items.len() {
+            let Ok(l) = tree.layout(leaves[i]) else { continue };
+            placed.push((i, l.location.x, l.location.y, l.size.width, l.size.height));
+        }
+        let height = tree.layout(container).map(|l| l.size.height).unwrap_or(0.0);
+        let ranges: Vec<(f32, f32)> = if widths_only { (0..items.len()).map(&widths).collect() } else { Vec::new() };
+        for (i, lx, ly, w, h) in placed {
+            let item = &items[i].1;
+            let (anc, parent) = item.ctx(ancestors, style);
+            if widths_only {
+                // the pages already measured at the extremes, else one at w
+                let (min, max) = ranges[i];
+                let at = if w >= max - 0.5 { 100_000.0 } else if w <= min + 0.5 { 1.0 } else { w.max(1.0) };
+                let (page, _) = self.item_page(item.node, anc, parent, at, true);
+                self.paste(page, x + lx, y + ly);
+                // the item's whole outer box counts, right padding and
+                // margin included, though nothing is drawn there
+                self.page.content_right = self.page.content_right.max(x + lx + w);
+                continue;
+            }
+            let (mut page, natural) = self.item_page_sized(item.node, anc, parent, w.max(1.0));
+            // a row item stretched across its line: its box (background,
+            // border) grows; laying it out again at every level of nested
+            // rows would cost 2^depth
+            if row && item.node.text.is_none() && h > natural + 0.5 {
+                stretch_box(&mut page, natural, h - natural, item.margin_top, item.margin_bottom);
+            }
+            // grown or shrunk along a column: the item's box takes that
+            // height, and its own content lays out inside it
+            if !row && item.node.text.is_none() && (h - natural).abs() > 0.5 {
+                let mut sub = self.sub_layout(false);
+                let ptr = item.node as *const Node;
+                sub.blockify = Some(ptr);
+                sub.flex_main = Some(ptr);
+                sub.flex_height = Some((ptr, h));
+                sub.layout_block(item.node, anc, Some(parent), 0.0, 0.0, w.max(1.0));
+                page = sub.page;
+            }
+            self.paste(page, x + lx, y + ly);
+        }
+        height
     }
 }
 
@@ -4201,6 +4129,30 @@ mod tests {
         let page = Layout::new(&fonts, &sheet, 1200.0).build(&doc);
         let x = page.draws.iter().find_map(|d| match d { Draw::Text { x, text, .. } if text.contains("second") => Some(*x), _ => None }).unwrap();
         assert!((x - 400.0).abs() < 2.0, "second item at {x}, the first should stop at its 400px max-width");
+    }
+
+    #[test]
+    fn flexbox_by_the_spec() {
+        let fonts = fonts();
+        let sheet = crate::css::Stylesheet::default();
+        let text_at = |html: &str, word: &str| {
+            let doc = parse_document(html);
+            let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+            page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(word) => Some((*x, *baseline)), _ => None }).unwrap()
+        };
+        // row-reverse: the first item sits at the end
+        let (x, _) = text_at("<body style='margin:0'><div style='display:flex;flex-direction:row-reverse;width:800px'><div>first</div><div>second</div></div></body>", "first");
+        assert!(x > 700.0, "first at {x}");
+        // align-content: center puts wrapped lines in the middle of a tall container
+        let (_, y) = text_at("<body style='margin:0'><div style='display:flex;flex-wrap:wrap;align-content:center;height:400px;width:800px'><div style='width:500px'>one</div><div style='width:500px'>two</div></div></body>", "one");
+        assert!(y > 150.0 && y < 250.0, "first line at {y}");
+        // a scroll container's automatic minimum size is zero: it shrinks
+        // below its long content and leaves room for its sibling
+        let (x, _) = text_at("<body style='margin:0'><div style='display:flex;width:400px'><div style='overflow:hidden;white-space:nowrap'>a-very-long-unbreakable-run-of-text-that-is-much-wider-than-the-container-itself</div><div style='flex:none'>tail</div></div></body>", "tail");
+        assert!(x < 400.0, "tail at {x}");
+        // column with justify-content: space-between and a definite height
+        let (_, y) = text_at("<body style='margin:0'><div style='display:flex;flex-direction:column;justify-content:space-between;height:300px'><div>top</div><div>bottom</div></div></body>", "bottom");
+        assert!(y > 270.0, "bottom at {y}");
     }
 
     #[test]

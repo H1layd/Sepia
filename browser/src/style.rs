@@ -159,6 +159,8 @@ pub struct Flex {
     pub basis: Option<f32>,
     /// align-self on an item (None: the container's align-items)
     pub align_self: Option<AlignItems>,
+    /// align-content: how wrapped lines share the cross axis (None: normal, they stretch)
+    pub align_content: Option<Justify>,
 }
 
 impl Default for Flex {
@@ -174,6 +176,7 @@ impl Default for Flex {
             shrink: 1.0,
             basis: None,
             align_self: None,
+            align_content: None,
         }
     }
 }
@@ -323,6 +326,9 @@ pub struct Style {
     pub clip_y: bool,
     /// clear: start below the floats before it
     pub clear: bool,
+    /// overflow other than visible/clip on either axis: a scroll container,
+    /// whose automatic minimum size as a flex or grid item is zero
+    pub scroller: bool,
     /// mask-image: the background is only a colour for an icon shape we cannot cut out
     pub masked: bool,
     /// mask-image: the mask's URL, size and position (drawn as the
@@ -436,6 +442,7 @@ impl Default for Style {
             clip_x: false,
             clip_y: false,
             clear: false,
+            scroller: false,
             masked: false,
             mask_image: None,
             mask_size: None,
@@ -2030,6 +2037,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             let y = parts.next().unwrap_or(x);
             style.clip_x = matches!(x, "hidden" | "clip");
             style.clip_y = matches!(y, "hidden" | "clip");
+            style.scroller = [x, y].iter().any(|v| matches!(*v, "hidden" | "auto" | "scroll" | "overlay"));
         }
         "mask-image" | "-webkit-mask-image" | "mask" | "-webkit-mask" => {
             style.masked = value.contains("url(");
@@ -2044,8 +2052,8 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "mask-size" | "-webkit-mask-size" => style.mask_size = Some(parse_bg_size(value, font_size)),
         "mask-position" | "-webkit-mask-position" => style.mask_pos = parse_bg_pos(value, font_size),
         "clear" => style.clear = matches!(value, "both" | "left" | "right" | "inline-start" | "inline-end"),
-        "overflow-x" => style.clip_x = matches!(value, "hidden" | "clip"),
-        "overflow-y" => style.clip_y = matches!(value, "hidden" | "clip"),
+        "overflow-x" => { style.clip_x = matches!(value, "hidden" | "clip"); style.scroller |= matches!(value, "hidden" | "auto" | "scroll" | "overlay"); }
+        "overflow-y" => { style.clip_y = matches!(value, "hidden" | "clip"); style.scroller |= matches!(value, "hidden" | "auto" | "scroll" | "overlay"); }
         "float" => {
             style.float = match value {
                 "left" | "inline-start" => Some(Align::Left),
@@ -2198,6 +2206,17 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 "flex-end" | "end" | "self-end" => Some(AlignItems::End),
                 "center" => Some(AlignItems::Center),
                 _ => Some(AlignItems::Stretch),
+            }
+        }
+        "align-content" => {
+            style.flex.align_content = match value.trim_start_matches("safe ").trim_start_matches("unsafe ") {
+                "flex-start" | "start" | "baseline" | "first baseline" => Some(Justify::Start),
+                "flex-end" | "end" => Some(Justify::End),
+                "center" => Some(Justify::Center),
+                "space-between" => Some(Justify::SpaceBetween),
+                "space-around" => Some(Justify::SpaceAround),
+                "space-evenly" => Some(Justify::SpaceEvenly),
+                _ => None,
             }
         }
         "align-items" => {
