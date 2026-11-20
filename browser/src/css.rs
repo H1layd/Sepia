@@ -883,8 +883,9 @@ pub struct Stylesheet {
     pub rules: Vec<Rule>,
     /// `@font-face` rules, for the loader to fetch
     pub font_faces: Vec<FontFace>,
-    /// `@import` URLs, in order, for the loader to fetch
-    pub imports: Vec<String>,
+    /// `@import`s in order, for the loader to fetch: URL and the condition
+    /// (media list) its rules apply under
+    pub imports: Vec<(String, Media)>,
     /// `@keyframes` by name: the declarations of the last frame (`to` /
     /// `100%`), what an animation that fills forwards leaves on its element
     pub keyframes: std::collections::HashMap<String, Vec<Declaration>>,
@@ -1044,8 +1045,8 @@ impl Stylesheet {
                 // statement at-rule: @import, @charset, @namespace, @layer a, b;
                 if let Some(rest) = prelude.strip_prefix("@import") {
                     if matches!(media, Media::All) {
-                        if let Some(url) = import_url(rest) {
-                            self.imports.push(url);
+                        if let Some(import) = import_rule(rest, media) {
+                            self.imports.push(import);
                         }
                     }
                 }
@@ -1273,16 +1274,81 @@ pub fn css_url(value: &str) -> Option<String> {
     (!url.is_empty()).then(|| url.to_string())
 }
 
-fn import_url(rest: &str) -> Option<String> {
+/// `@import url(x) [layer(...)] [supports(...)] [media list]`: the URL
+/// and the condition its rules apply under (with the enclosing one).
+fn import_rule(rest: &str, outer: &Media) -> Option<(String, Media)> {
     let rest = rest.trim();
-    let target = rest.strip_prefix("url(").map(|r| r.split(')').next().unwrap_or("")).unwrap_or_else(|| rest.split_whitespace().next().unwrap_or(""));
-    let url = target.trim().trim_matches(|c| c == '"' || c == '\'');
-    // an @import with a media list only applies under it: skip conditional ones
-    let after = rest.split_once(')').map(|(_, a)| a).unwrap_or_else(|| rest.split_once(char::is_whitespace).map(|(_, a)| a).unwrap_or(""));
-    if !after.trim().is_empty() && !after.trim().starts_with("layer") && !after.contains("screen") && !after.contains("all") {
+    let (target, after) = match rest.strip_prefix("url(") {
+        Some(r) => {
+            let (inside, after) = r.split_once(')')?;
+            (inside, after)
+        }
+        None => {
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let end = rest[1..].find(quote)? + 1;
+            (&rest[..=end], &rest[end + 1..])
+        }
+    };
+    let url = target.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    if url.is_empty() {
         return None;
     }
-    (!url.is_empty()).then(|| url.to_string())
+    // cascade layers and feature queries before the media list: a layer
+    // only orders rules; supports() is taken as met, as @supports is here
+    let mut condition = after.trim();
+    for prefix in ["layer", "supports"] {
+        if let Some(r) = condition.strip_prefix(prefix) {
+            condition = match r.strip_prefix('(') {
+                Some(inner) => {
+                    let mut depth = 1;
+                    let mut end = inner.len();
+                    for (i, c) in inner.char_indices() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = i + 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    inner[end..].trim()
+                }
+                None if r.is_empty() || r.starts_with(char::is_whitespace) => r.trim(),
+                None => condition,
+            };
+        }
+    }
+    let condition = condition.trim_end_matches(';').trim();
+    let own = if condition.is_empty() { Media::All } else { Media::parse(condition) };
+    let media = match (outer, own) {
+        (Media::All, own) => own,
+        (outer, Media::All) => outer.clone(),
+        (outer, own) => Media::Both(Box::new(outer.clone()), Box::new(own)),
+    };
+    Some((url, media))
+}
+
+/// An imported sheet's rules apply only under its @import's condition.
+pub fn under_media(sheet: &mut Stylesheet, media: &Media) {
+    if matches!(media, Media::All) {
+        return;
+    }
+    for rule in &mut sheet.rules {
+        rule.media = match std::mem::replace(&mut rule.media, Media::All) {
+            Media::All => media.clone(),
+            own => Media::Both(Box::new(media.clone()), Box::new(own)),
+        };
+    }
+    for (_, m) in &mut sheet.imports {
+        *m = match std::mem::replace(m, Media::All) {
+            Media::All => media.clone(),
+            own => Media::Both(Box::new(media.clone()), Box::new(own)),
+        };
+    }
 }
 
 /// The declarations of a `@keyframes` block's last frame: the frame
@@ -1841,7 +1907,14 @@ mod tests {
              @font-face { font-family: X; src: url(x.ttf) } @keyframes spin { from { color: red } } \
              @supports (display: grid) { .g { display: grid } } p { color: red }",
         );
-        assert_eq!(sheet.imports, vec!["base.css".to_string()]);
+        // every @import is kept with its condition; print never applies on screen
+        let urls: Vec<&str> = sheet.imports.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(urls, vec!["base.css", "print.css"]);
+        assert!(sheet.imports[0].1.matches_viewport(1200.0, 800.0));
+        assert!(!sheet.imports[1].1.matches_viewport(1200.0, 800.0));
+        let themed = Stylesheet::parse("@import url(/dark.css) (prefers-color-scheme: dark) and (not (prefers-contrast: more)); @import url(x.css) layer(base) supports(display: grid) screen;");
+        assert_eq!(themed.imports.len(), 2);
+        assert!(themed.imports[1].1.matches_viewport(1200.0, 800.0), "layer() and supports() before the media list");
         let selectors: Vec<String> = sheet.rules.iter().map(|r| format!("{:?}", r.selector.chain[0].tag.as_deref().or(r.selector.chain[0].classes.first().map(|s| s.as_str())))).collect();
         assert_eq!(sheet.rules.len(), 2, "{selectors:?}");
     }

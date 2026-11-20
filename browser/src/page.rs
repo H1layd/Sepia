@@ -852,23 +852,12 @@ fn load_styles(document: &dom::Node, base: &Url, how: Option<&ImageFetch>) -> (S
             },
         };
         let parsed = Stylesheet::parse(&text);
-        // @import comes before the rules of the sheet that imports it
+        // @import comes before the rules of the sheet that imports it, under
+        // its condition (`@import url(dark.css) (prefers-color-scheme: dark)`);
+        // imports inside imported sheets load the same way, a few levels deep
         if let Some(how) = how {
-            for import in &parsed.imports {
-                if imports_left == 0 || started.elapsed() > CSS_BUDGET {
-                    break;
-                }
-                imports_left -= 1;
-                let Some(url) = sheet_url.resolve(import) else { continue };
-                let left = CSS_BUDGET.saturating_sub(started.elapsed());
-                if let Some(css) = fetch_css(&url, how, how.timeout.min(left)) {
-                    external += 1;
-                    let mut imported = Stylesheet::parse(&css);
-                    imported.imports.clear();
-                    imported.absolutize_urls(&url);
-                    sheet.append(imported);
-                }
-            }
+            let budget = ImportBudget { started, left: &mut imports_left, external: &mut external };
+            load_imports(&parsed.imports, &sheet_url, how, &mut sheet, budget, 0);
         }
         let mut parsed = parsed;
         parsed.imports.clear();
@@ -879,6 +868,37 @@ fn load_styles(document: &dom::Node, base: &Url, how: Option<&ImageFetch>) -> (S
         sheet.append(parsed);
     }
     (sheet, external)
+}
+
+/// What @import loading may still spend (shared by every level).
+struct ImportBudget<'a> {
+    started: Instant,
+    left: &'a mut usize,
+    external: &'a mut usize,
+}
+
+/// Fetch `imports` (relative to `base`) and append each imported sheet to
+/// `sheet` after its own imports, its rules under the @import's condition.
+fn load_imports(imports: &[(String, crate::css::Media)], base: &Url, how: &ImageFetch, sheet: &mut Stylesheet, mut budget: ImportBudget, depth: usize) {
+    for (target, media) in imports {
+        if *budget.left == 0 || budget.started.elapsed() > CSS_BUDGET {
+            return;
+        }
+        let Some(url) = base.resolve(target) else { continue };
+        *budget.left -= 1;
+        let left = CSS_BUDGET.saturating_sub(budget.started.elapsed());
+        let Some(css) = fetch_css(&url, how, how.timeout.min(left)) else { continue };
+        *budget.external += 1;
+        let mut imported = Stylesheet::parse(&css);
+        crate::css::under_media(&mut imported, media);
+        let nested = std::mem::take(&mut imported.imports);
+        if depth < 4 && !nested.is_empty() {
+            let inner = ImportBudget { started: budget.started, left: &mut *budget.left, external: &mut *budget.external };
+            load_imports(&nested, &url, how, sheet, inner, depth + 1);
+        }
+        imported.absolutize_urls(&url);
+        sheet.append(imported);
+    }
 }
 
 fn fetch_css(url: &Url, how: &ImageFetch, timeout: Duration) -> Option<String> {
