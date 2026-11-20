@@ -36,7 +36,7 @@ impl std::fmt::Debug for Bitmap {
 pub type ImageMap = HashMap<String, Arc<Bitmap>>;
 
 impl Bitmap {
-    fn new(width: usize, height: usize, rgba: Vec<u8>) -> Bitmap {
+    pub(crate) fn new(width: usize, height: usize, rgba: Vec<u8>) -> Bitmap {
         Bitmap { width, height, rgba, natural: None, scaled: Mutex::new(None) }
     }
 

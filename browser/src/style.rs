@@ -48,6 +48,16 @@ pub enum BgPos {
     Px(f32),
 }
 
+/// object-fit: how a replaced element's picture fills its box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectFit {
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
     Static,
@@ -255,6 +265,8 @@ pub struct Style {
     pub gradient: Option<Gradient>,
     pub shadow: Option<Shadow>,
     pub min_height: Option<f32>,
+    /// max-height: the box is never taller (min-height still wins over it)
+    pub max_height: Option<f32>,
     pub min_width: Option<f32>,
     /// box-sizing: border-box (width includes padding and border)
     pub border_box: bool,
@@ -292,6 +304,9 @@ pub struct Style {
     pub bg_image: Option<Arc<str>>,
     pub bg_size: BgSize,
     pub bg_pos: (BgPos, BgPos),
+    pub object_fit: ObjectFit,
+    /// object-position (centred by default)
+    pub object_pos: (BgPos, BgPos),
     /// a transform that moves the box a whole box-length or more off its place
     pub moved_away: bool,
     /// grid-template-columns, resolved at layout (it needs the width)
@@ -339,6 +354,7 @@ impl Default for Style {
             letter_spacing: 0.0,
             text_indent: 0.0,
             max_width: None,
+            max_height: None,
             margin_auto: (false, false),
             pre: false,
             marker: None,
@@ -377,6 +393,8 @@ impl Default for Style {
             bg_image: None,
             bg_size: BgSize::Auto,
             bg_pos: (BgPos::Frac(0.0), BgPos::Frac(0.0)),
+            object_fit: ObjectFit::Fill,
+            object_pos: (BgPos::Frac(0.5), BgPos::Frac(0.5)),
             moved_away: false,
             grid_columns: None,
             grid_span: GridSpan::Auto,
@@ -1606,6 +1624,20 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             }
         }
         "background-size" => style.bg_size = parse_bg_size(value, font_size),
+        "object-fit" | "-o-object-fit" => {
+            style.object_fit = match value.to_ascii_lowercase().as_str() {
+                "contain" => ObjectFit::Contain,
+                "cover" => ObjectFit::Cover,
+                "none" => ObjectFit::None,
+                "scale-down" => ObjectFit::ScaleDown,
+                _ => ObjectFit::Fill,
+            }
+        }
+        "object-position" | "-o-object-position" => {
+            if let Some(pos) = parse_bg_pos(value, font_size) {
+                style.object_pos = pos;
+            }
+        }
         "background-position" => {
             if let Some(pos) = parse_bg_pos(value, font_size) {
                 style.bg_pos = pos;
@@ -1709,6 +1741,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         }
         "box-shadow" => style.shadow = parse_shadow(value, font_size),
         "min-height" => style.min_height = height_length(value, font_size),
+        "max-height" => style.max_height = if value == "none" { None } else { height_length(value, font_size) },
         "min-width" => style.min_width = parse_length(value, font_size, containing_width),
         "box-sizing" => style.border_box = value == "border-box",
         "text-transform" => {

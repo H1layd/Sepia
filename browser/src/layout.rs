@@ -765,6 +765,11 @@ impl<'a> Layout<'a> {
             // a clipped box keeps its height; others grow to hold what is in them
             content_height = if style.clip_y { content_box(height) } else { content_height.max(content_box(height)) };
         }
+        // max-height caps the box (its content may spill, or be clipped
+        // with overflow: hidden); min-height wins over it, as in CSS
+        if let Some(max_height) = style.max_height {
+            content_height = content_height.min(content_box(max_height));
+        }
         if let Some(min_height) = style.min_height {
             content_height = content_height.max(content_box(min_height));
         }
@@ -1485,7 +1490,8 @@ impl<'a> Layout<'a> {
                     continue;
                 }
                 let rect = Rect { x: pen_x, y: baseline - raise(item, img.h, img.h), w: img.w, h: img.h };
-                self.page.draws.push(Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() });
+                let fitted = img.bitmap.as_ref().filter(|_| item.style.object_fit != crate::style::ObjectFit::Fill).and_then(|b| object_fit_draw(b, rect, &item.style));
+                self.page.draws.push(fitted.unwrap_or_else(|| Draw::Image { rect, image: img.bitmap.clone(), alt: img.alt.clone() }));
                 if let Some(href) = &item.href {
                     self.page.links.push(link(rect, href));
                 }
@@ -1667,6 +1673,45 @@ fn tinted_mask(bitmap: &Arc<crate::images::Bitmap>, color: Color) -> Arc<crate::
     TINTED.with(|t| {
         t.borrow_mut().entry(key).or_insert_with(|| Arc::new(bitmap.tinted(key.1))).clone()
     })
+}
+
+/// A replaced element's picture placed in its box by object-fit and
+/// object-position: scaled to fit inside (contain), to cover it (the rest
+/// cut off), at its own size (none) or the smaller of those (scale-down).
+fn object_fit_draw(bitmap: &Arc<crate::images::Bitmap>, rect: Rect, style: &Style) -> Option<Draw> {
+    use crate::style::{BgPos, ObjectFit};
+    let (nw, nh) = bitmap.natural_size();
+    if nw < 0.5 || nh < 0.5 || rect.w < 0.5 || rect.h < 0.5 {
+        return None;
+    }
+    let contain = (rect.w / nw).min(rect.h / nh);
+    let scale = match style.object_fit {
+        ObjectFit::Fill => return None,
+        ObjectFit::Contain => contain,
+        ObjectFit::Cover => (rect.w / nw).max(rect.h / nh),
+        ObjectFit::None => 1.0,
+        ObjectFit::ScaleDown => contain.min(1.0),
+    };
+    let (w, h) = (nw * scale, nh * scale);
+    let place = |p: BgPos, free: f32| match p {
+        BgPos::Frac(f) => free * f,
+        BgPos::Px(px) => px,
+    };
+    let x = rect.x + place(style.object_pos.0, rect.w - w);
+    let y = rect.y + place(style.object_pos.1, rect.h - h);
+    let (vx0, vy0) = (x.max(rect.x), y.max(rect.y));
+    let (vx1, vy1) = ((x + w).min(rect.x + rect.w), (y + h).min(rect.y + rect.h));
+    if vx1 - vx0 < 0.5 || vy1 - vy0 < 0.5 {
+        return None;
+    }
+    let (px_w, px_h) = (bitmap.width as f32 / w, bitmap.height as f32 / h);
+    let whole = vx0 <= x + 0.01 && vy0 <= y + 0.01 && vx1 >= x + w - 0.01 && vy1 >= y + h - 0.01;
+    let image = if whole {
+        bitmap.clone()
+    } else {
+        bitmap.crop(((vx0 - x) * px_w) as usize, ((vy0 - y) * px_h) as usize, ((vx1 - vx0) * px_w).round() as usize, ((vy1 - vy0) * px_h).round() as usize)
+    };
+    Some(Draw::Image { rect: Rect { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 }, image: Some(image), alt: String::new() })
 }
 
 /// background-image: sized (auto/cover/contain/lengths), positioned, and cut
@@ -4007,6 +4052,50 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(below > 60.0 && below < 85.0, "text starts under the tallest float: {below}");
+    }
+
+    #[test]
+    fn object_fit_places_the_picture_in_its_box() {
+        use crate::style::ObjectFit;
+        // a 200x100 picture in a 100x100 box
+        let bitmap = Arc::new(crate::images::Bitmap::new(200, 100, vec![0; 200 * 100 * 4]));
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let placed = |fit: ObjectFit| {
+            let mut style = Style::default();
+            style.object_fit = fit;
+            match object_fit_draw(&bitmap, rect, &style) {
+                Some(Draw::Image { rect, image: Some(img), .. }) => Some((rect.x, rect.y, rect.w, rect.h, img.width)),
+                _ => None,
+            }
+        };
+        assert_eq!(placed(ObjectFit::Fill), None, "fill: drawn as before, stretched");
+        assert_eq!(placed(ObjectFit::Contain), Some((0.0, 25.0, 100.0, 50.0, 200)), "letterboxed, centred");
+        assert_eq!(placed(ObjectFit::Cover), Some((0.0, 0.0, 100.0, 100.0, 100)), "the middle half of the picture");
+    }
+
+    #[test]
+    fn max_height_caps_a_box_and_min_height_wins() {
+        // a collapsed menu (max-height: 0; overflow: hidden) shows nothing and
+        // takes no room; min-height still beats max-height
+        let doc = parse_document(
+            "<body style='margin:0'><div style='overflow:hidden;max-height:0'>\
+               <div style='height:20px;background:red'></div>\
+             </div><div style='overflow:hidden;max-height:25px'>\
+               <div style='height:20px;background:blue'></div>\
+               <div style='height:20px;background:green'></div>\
+             </div><div style='max-height:5px;min-height:15px;background:yellow'></div></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 400.0).build(&doc);
+        let fill = |c: Color| page.draws.iter().find_map(|d| match d {
+            Draw::Fill { rect, color: Some(col), .. } if *col == c => Some(*rect),
+            _ => None,
+        });
+        assert!(fill(Color::rgb(255, 0, 0)).is_none(), "collapsed: not drawn");
+        assert_eq!(fill(Color::rgb(0, 0, 255)).map(|r| (r.y, r.h)), Some((0.0, 20.0)));
+        assert_eq!(fill(Color::rgb(0, 128, 0)).map(|r| (r.y, r.h)), Some((20.0, 5.0)), "cut at 25px");
+        assert_eq!(fill(Color::rgb(255, 255, 0)).map(|r| (r.y, r.h)), Some((25.0, 15.0)), "min-height wins");
     }
 
     #[test]
