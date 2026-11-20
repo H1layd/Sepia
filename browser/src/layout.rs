@@ -97,6 +97,51 @@ fn link_target(node: &Node, href: &str) -> String {
     }
 }
 
+/// What a flex/grid item's scratch layout depends on (see `item_page_memo`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ItemKey {
+    node: usize,
+    parent: usize,
+    depth: usize,
+    width: u32,
+    flow: u32,
+    measuring: bool,
+    intrinsic: bool,
+    sized: bool,
+    style: u64,
+}
+
+thread_local! {
+    /// item layouts of the pass in progress (None outside `Layout::build`)
+    static ITEM_PAGES: std::cell::RefCell<Option<std::collections::HashMap<ItemKey, (Page, f32)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Turns the item memo on for one `build` (and off at its end, so node
+/// addresses from a finished pass are never looked up again).
+struct ItemPagesScope(bool);
+
+impl ItemPagesScope {
+    fn start() -> ItemPagesScope {
+        let outer = ITEM_PAGES.with(|m| {
+            let mut m = m.borrow_mut();
+            let was = m.is_some();
+            if !was {
+                *m = Some(std::collections::HashMap::new());
+            }
+            was
+        });
+        ItemPagesScope(outer)
+    }
+}
+
+impl Drop for ItemPagesScope {
+    fn drop(&mut self) {
+        if !self.0 {
+            ITEM_PAGES.with(|m| *m.borrow_mut() = None);
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Page {
     pub draws: Vec<Draw>,
@@ -394,6 +439,7 @@ impl<'a> Layout<'a> {
     /// last child, and the root background becomes the canvas, as in CSS.
     pub fn build(mut self, root: &Node) -> Page {
         let _matching_scope = crate::css::cache_layout_matches();
+        let _item_scope = ItemPagesScope::start();
         // ::before / ::after boxes, where the sheet gives an element `content`
         let generated = with_generated_content(root, self.sheet);
         let root = generated.as_ref().unwrap_or(root);
@@ -1004,8 +1050,7 @@ impl<'a> Layout<'a> {
                     return;
                 }
                 let scale = 3.0f32.min(1024.0 / w.max(h));
-                let mut bitmap = crate::svg::render_node_styled(node, (w * scale).round() as usize, (h * scale).round() as usize, style.color, style.svg_fill, style.svg_stroke);
-                bitmap.natural = Some((w, h));
+                let bitmap = crate::svg::render_node_cached(node, (w * scale).round() as usize, (h * scale).round() as usize, (w, h), style.color, style.svg_fill, style.svg_stroke);
                 items.push(InlineItem {
                     text: String::new(),
                     style,
@@ -1013,7 +1058,7 @@ impl<'a> Layout<'a> {
                     br: false,
                     image: false,
                     own_background: None,
-                    img: Some(ImgBox { w, h, bitmap: Some(Arc::new(bitmap)), alt: String::new(), atom: None }),
+                    img: Some(ImgBox { w, h, bitmap: Some(bitmap), alt: String::new(), atom: None }),
                     owners: Vec::new(),
                 });
                 return;
@@ -2334,20 +2379,48 @@ impl<'a> Layout<'a> {
     /// Lay `node` out as a block at the origin of a scratch page with
     /// `width` available: (page, height). Used to measure and place items.
     fn item_page(&self, node: &Node, ancestors: &[&Node], parent: &Style, width: f32, measuring: bool) -> (Page, f32) {
-        let mut sub = self.sub_layout(measuring);
-        // flex and grid items are blockified: an inline-block item is a block
-        sub.blockify = Some(node as *const Node);
-        let height = sub.layout_block(node, ancestors, Some(parent), 0.0, 0.0, width.max(1.0));
-        (sub.page, height)
+        self.item_page_memo(node, ancestors, parent, width, measuring, false)
     }
 
     /// A flex row item at its resolved outer size.
     fn item_page_sized(&self, node: &Node, ancestors: &[&Node], parent: &Style, width: f32) -> (Page, f32) {
-        let mut sub = self.sub_layout(false);
+        self.item_page_memo(node, ancestors, parent, width, false, true)
+    }
+
+    /// A flex or grid item laid out on its own scratch page, remembered for
+    /// this layout pass. A sub-layout depends only on what is in the key
+    /// (it starts with no floats or positioned containers of its own), and
+    /// containers measure each item at the widest and narrowest width and
+    /// then lay it out: without the memo nested flex boxes cost 3^depth.
+    fn item_page_memo(&self, node: &Node, ancestors: &[&Node], parent: &Style, width: f32, measuring: bool, sized: bool) -> (Page, f32) {
+        let key = ItemKey {
+            node: node as *const Node as usize,
+            parent: ancestors.last().map(|p| *p as *const Node as usize).unwrap_or(0),
+            depth: ancestors.len(),
+            width: width.max(1.0).to_bits(),
+            flow: self.flow_width.to_bits(),
+            measuring,
+            intrinsic: measuring || self.intrinsic,
+            sized,
+            style: parent.inherited_key(),
+        };
+        if let Some(hit) = ITEM_PAGES.with(|m| m.borrow().as_ref().and_then(|m| m.get(&key).cloned())) {
+            return hit;
+        }
+        let mut sub = self.sub_layout(measuring);
+        // flex and grid items are blockified: an inline-block item is a block
         sub.blockify = Some(node as *const Node);
-        sub.flex_main = Some(node as *const Node);
+        if sized {
+            sub.flex_main = Some(node as *const Node);
+        }
         let height = sub.layout_block(node, ancestors, Some(parent), 0.0, 0.0, width.max(1.0));
-        (sub.page, height)
+        let out = (sub.page, height);
+        ITEM_PAGES.with(|m| {
+            if let Some(m) = m.borrow_mut().as_mut() {
+                m.insert(key, out.clone());
+            }
+        });
+        out
     }
 
     fn paste(&mut self, page: Page, dx: f32, dy: f32) {

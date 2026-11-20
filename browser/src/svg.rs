@@ -722,6 +722,48 @@ pub fn render_node(svg: &Node, width: usize, height: usize, current: Color) -> B
 /// `render_node` with the CSS `fill` / `stroke` the `<svg>` element got from
 /// the page's stylesheet (octicons: `.octicon { fill: currentColor }`): they
 /// replace the SVG defaults; attributes inside still win.
+/// `render_node_styled`, remembered: the same icon (same markup, size and
+/// colours) is drawn once per page thread, not on every layout pass. Pages
+/// repeat a few icons hundreds of times and lay out several times.
+pub fn render_node_cached(svg: &Node, width: usize, height: usize, natural: (f32, f32), current: Color, fill: Option<Option<Color>>, stroke: Option<Option<Color>>) -> std::sync::Arc<Bitmap> {
+    use std::hash::{Hash, Hasher};
+    fn walk(n: &Node, h: &mut std::collections::hash_map::DefaultHasher) {
+        n.tag.hash(h);
+        n.attrs.hash(h);
+        n.text.hash(h);
+        n.children.len().hash(h);
+        for c in &n.children {
+            walk(c, h);
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    walk(svg, &mut h);
+    (width, height, natural.0.to_bits(), natural.1.to_bits()).hash(&mut h);
+    let rgba = |c: Color| (c.r, c.g, c.b, c.a);
+    rgba(current).hash(&mut h);
+    fill.map(|f| f.map(rgba)).hash(&mut h);
+    stroke.map(|s| s.map(rgba)).hash(&mut h);
+    let key = h.finish();
+    thread_local! {
+        static DRAWN: std::cell::RefCell<std::collections::HashMap<u64, std::sync::Arc<Bitmap>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(hit) = DRAWN.with(|d| d.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let mut bitmap = render_node_styled(svg, width, height, current, fill, stroke);
+    bitmap.natural = Some(natural);
+    let bitmap = std::sync::Arc::new(bitmap);
+    DRAWN.with(|d| {
+        let mut d = d.borrow_mut();
+        // a bound, so a page of ever-new SVG cannot grow it without end
+        if d.len() > 4096 {
+            d.clear();
+        }
+        d.insert(key, bitmap.clone());
+    });
+    bitmap
+}
+
 pub fn render_node_styled(svg: &Node, width: usize, height: usize, current: Color, fill: Option<Option<Color>>, stroke: Option<Option<Color>>) -> Bitmap {
     let (width, height) = (width.clamp(1, 2048), height.clamp(1, 2048));
     let mut renderer = Renderer { canvas: Canvas { w: width, h: height, px: vec![[0.0; 4]; width * height] }, root: svg };
