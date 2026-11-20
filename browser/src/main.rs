@@ -15,6 +15,7 @@ mod fonts;
 mod html;
 mod images;
 mod js;
+mod jsval;
 mod svg;
 mod layout;
 mod net;

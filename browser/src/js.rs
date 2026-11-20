@@ -25,6 +25,7 @@ use std::time::Duration;
 use boa_engine::object::builtins::JsArray;
 use boa_engine::{js_string, Context, JsResult, JsString, JsValue, NativeFunction, Source};
 
+use crate::jsval::Val;
 use crate::css::{matches_selector, split_top_level, Selector, Stylesheet};
 use crate::dom::{self, Node};
 use crate::images::ImageMap;
@@ -682,8 +683,8 @@ fn take_script_images() -> Vec<(String, std::sync::Arc<crate::images::Bitmap>)> 
     NEW_SCRIPT_IMAGES.with(|n| std::mem::take(&mut *n.borrow_mut()))
 }
 
-fn arg_num(args: &[JsValue], i: usize, ctx: &mut Context) -> f32 {
-    args.get(i).and_then(|v| v.to_number(ctx).ok()).filter(|n| n.is_finite()).unwrap_or(0.0) as f32
+fn arg_num(args: &[Val], i: usize) -> f32 {
+    args.get(i).and_then(Val::to_number).filter(|n| n.is_finite()).unwrap_or(0.0) as f32
 }
 
 fn with_fonts<R>(f: impl FnOnce(&Fonts) -> R) -> R {
@@ -905,109 +906,153 @@ fn computed_style(id: usize) -> Option<(crate::style::Style, f32)> {
     style.map(|s| (s, width))
 }
 
-fn arg_str(args: &[JsValue], i: usize, ctx: &mut Context) -> JsResult<String> {
+/// A string argument; undefined and null are "" (as the prelude expects).
+fn arg_str(args: &[Val], i: usize) -> String {
     match args.get(i) {
-        Some(v) if !v.is_undefined() && !v.is_null() => Ok(v.to_string(ctx)?.to_std_string_escaped()),
-        _ => Ok(String::new()),
+        Some(Val::Undef | Val::Null) | None => String::new(),
+        Some(v) => v.text(),
     }
 }
 
-fn arg_id(args: &[JsValue], i: usize) -> i64 {
-    args.get(i).and_then(|v| v.as_number()).map(|n| n as i64).unwrap_or(-1)
+/// An optional string argument: undefined and null are None.
+fn arg_opt(args: &[Val], i: usize) -> Option<String> {
+    match args.get(i) {
+        Some(Val::Undef | Val::Null) | None => None,
+        Some(v) => Some(v.text()),
+    }
 }
 
-fn s(v: impl Into<String>) -> JsValue {
-    JsValue::from(JsString::from(v.into()))
+fn arg_list(args: &[Val], i: usize) -> &[Val] {
+    match args.get(i) {
+        Some(Val::List(items)) => items,
+        _ => &[],
+    }
 }
 
-fn ids(list: Vec<usize>, ctx: &mut Context) -> JsValue {
-    JsArray::from_iter(list.into_iter().map(|i| JsValue::from(i as f64)), ctx).into()
+/// `[[name, value], ...]` (headers), at most 64.
+fn arg_pairs(args: &[Val], i: usize) -> Vec<(String, String)> {
+    arg_list(args, i)
+        .iter()
+        .take(64)
+        .filter_map(|pair| match pair {
+            Val::List(kv) => Some((kv.first().map(Val::text).unwrap_or_default(), kv.get(1).map(Val::text).unwrap_or_default())),
+            _ => None,
+        })
+        .collect()
 }
+
+fn arg_id(args: &[Val], i: usize) -> i64 {
+    args.get(i).and_then(Val::num).map(|n| n as i64).unwrap_or(-1)
+}
+
+fn s(v: impl Into<String>) -> Val {
+    Val::Str(v.into())
+}
+
+fn list(items: impl IntoIterator<Item = Val>) -> Val {
+    Val::List(items.into_iter().collect())
+}
+
+fn ids(items: Vec<usize>) -> Val {
+    list(items.into_iter().map(|i| Val::from(i as f64)))
+}
+
+/// A host function the page's JS calls (the `__dom_*`, `__fetch*`, … the
+/// prelude builds the web platform on). Engine-neutral: plain values in and
+/// out; an `Err` is thrown as a TypeError (or the error its text starts with).
+pub type Native = fn(&[Val]) -> Result<Val, String>;
 
 macro_rules! native {
-    ($ctx:expr, $name:literal, $len:expr, $f:expr) => {
-        $ctx.register_global_builtin_callable(js_string!($name), $len, NativeFunction::from_fn_ptr($f))
-            .expect("register native");
-    };
+    ($t:expr, $name:literal, $len:expr, $f:expr) => {{
+        let f: Native = $f;
+        $t.push(($name, $len, f));
+    }};
 }
 
-fn register_canvas(ctx: &mut Context) {
+/// Every host function, for whichever engine runs the page.
+fn natives() -> Vec<(&'static str, usize, Native)> {
+    let mut t = Vec::new();
+    register(&mut t);
+    t
+}
+
+fn register_canvas(t: &mut Vec<(&'static str, usize, Native)>) {
     // +1 when a finite animation starts, -1 when it ends
-    native!(ctx, "__anim_busy", 1, |_, a, ctx| {
-        let d = arg_num(a, 0, ctx) as i32;
+    native!(t, "__anim_busy", 1, |a| {
+        let d = arg_num(a, 0) as i32;
         with(|st| st.animations = (st.animations + d).max(0));
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     use crate::canvas2d as cv;
-    native!(ctx, "__cv_init", 3, |_, a, ctx| {
-        cv::init(arg_id(a, 0).max(0) as usize, arg_num(a, 1, ctx) as u32, arg_num(a, 2, ctx) as u32);
+    native!(t, "__cv_init", 3, |a| {
+        cv::init(arg_id(a, 0).max(0) as usize, arg_num(a, 1) as u32, arg_num(a, 2) as u32);
         with(|st| st.dirty = true);
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // (id, path, evenodd, paint, paint transform, alpha, op)
-    native!(ctx, "__cv_fill", 7, |_, a, ctx| {
-        let (path, spec, t, op) = (arg_str(a, 1, ctx)?, arg_str(a, 3, ctx)?, arg_str(a, 4, ctx)?, arg_str(a, 6, ctx)?);
-        cv::fill(arg_id(a, 0).max(0) as usize, &path, a.get(2).map(|v| v.to_boolean()).unwrap_or(false), &spec, &t, arg_num(a, 5, ctx), &op);
+    native!(t, "__cv_fill", 7, |a| {
+        let (path, spec, t, op) = (arg_str(a, 1), arg_str(a, 3), arg_str(a, 4), arg_str(a, 6));
+        cv::fill(arg_id(a, 0).max(0) as usize, &path, a.get(2).map(|v| v.truthy()).unwrap_or(false), &spec, &t, arg_num(a, 5), &op);
         with(|st| st.dirty = true);
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // (id, path, paint, paint transform, alpha, op, width, cap, join, miter, dash, dash offset)
-    native!(ctx, "__cv_stroke", 12, |_, a, ctx| {
-        let (path, spec, t, op) = (arg_str(a, 1, ctx)?, arg_str(a, 2, ctx)?, arg_str(a, 3, ctx)?, arg_str(a, 5, ctx)?);
-        let (cap, join, dash) = (arg_str(a, 7, ctx)?, arg_str(a, 8, ctx)?, arg_str(a, 10, ctx)?);
-        cv::stroke(arg_id(a, 0).max(0) as usize, &path, &spec, &t, arg_num(a, 4, ctx), &op, arg_num(a, 6, ctx), &cap, &join, arg_num(a, 9, ctx), &dash, arg_num(a, 11, ctx));
+    native!(t, "__cv_stroke", 12, |a| {
+        let (path, spec, t, op) = (arg_str(a, 1), arg_str(a, 2), arg_str(a, 3), arg_str(a, 5));
+        let (cap, join, dash) = (arg_str(a, 7), arg_str(a, 8), arg_str(a, 10));
+        cv::stroke(arg_id(a, 0).max(0) as usize, &path, &spec, &t, arg_num(a, 4), &op, arg_num(a, 6), &cap, &join, arg_num(a, 9), &dash, arg_num(a, 11));
         with(|st| st.dirty = true);
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__cv_clip", 2, |_, a, ctx| {
-        cv::clip(arg_id(a, 0).max(0) as usize, &arg_str(a, 1, ctx)?);
-        Ok(JsValue::undefined())
+    native!(t, "__cv_clip", 2, |a| {
+        cv::clip(arg_id(a, 0).max(0) as usize, &arg_str(a, 1));
+        Ok(Val::Undef)
     });
     // (id, key, sx, sy, sw, sh, transform, alpha, op, smoothing)
-    native!(ctx, "__cv_image", 10, |_, a, ctx| {
-        let (key, t, op) = (arg_str(a, 1, ctx)?, arg_str(a, 6, ctx)?, arg_str(a, 8, ctx)?);
-        cv::draw_image(arg_id(a, 0).max(0) as usize, &key, arg_num(a, 2, ctx), arg_num(a, 3, ctx), arg_num(a, 4, ctx), arg_num(a, 5, ctx), &t, arg_num(a, 7, ctx), &op, a.get(9).map(|v| v.to_boolean()).unwrap_or(true));
+    native!(t, "__cv_image", 10, |a| {
+        let (key, t, op) = (arg_str(a, 1), arg_str(a, 6), arg_str(a, 8));
+        cv::draw_image(arg_id(a, 0).max(0) as usize, &key, arg_num(a, 2), arg_num(a, 3), arg_num(a, 4), arg_num(a, 5), &t, arg_num(a, 7), &op, a.get(9).map(|v| v.truthy()).unwrap_or(true));
         with(|st| st.dirty = true);
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // natural size of an image source: "w,h"
-    native!(ctx, "__cv_source_size", 1, |_, a, ctx| {
-        let (w, h) = cv::source_size(&arg_str(a, 0, ctx)?);
+    native!(t, "__cv_source_size", 1, |a| {
+        let (w, h) = cv::source_size(&arg_str(a, 0));
         Ok(s(format!("{w},{h}")))
     });
     // (text, size, family, bold, italic) -> width
-    native!(ctx, "__cv_measure", 5, |_, a, ctx| {
-        let (text, family) = (arg_str(a, 0, ctx)?, arg_str(a, 2, ctx)?);
-        let size = arg_num(a, 1, ctx);
-        let (bold, italic) = (a.get(3).map(|v| v.to_boolean()).unwrap_or(false), a.get(4).map(|v| v.to_boolean()).unwrap_or(false));
-        Ok(JsValue::from(with_fonts(|f| cv::measure(f, &text, size, &family, bold, italic)) as f64))
+    native!(t, "__cv_measure", 5, |a| {
+        let (text, family) = (arg_str(a, 0), arg_str(a, 2));
+        let size = arg_num(a, 1);
+        let (bold, italic) = (a.get(3).map(|v| v.truthy()).unwrap_or(false), a.get(4).map(|v| v.truthy()).unwrap_or(false));
+        Ok(Val::from(with_fonts(|f| cv::measure(f, &text, size, &family, bold, italic)) as f64))
     });
     // (id, text, x, y, size, family, bold, italic, maxWidth, paint, ctm, alpha, op)
-    native!(ctx, "__cv_text", 13, |_, a, ctx| {
-        let (text, family, spec, ctm, op) = (arg_str(a, 1, ctx)?, arg_str(a, 5, ctx)?, arg_str(a, 9, ctx)?, arg_str(a, 10, ctx)?, arg_str(a, 12, ctx)?);
-        let (x, y, size, max_w, alpha) = (arg_num(a, 2, ctx), arg_num(a, 3, ctx), arg_num(a, 4, ctx), arg_num(a, 8, ctx), arg_num(a, 11, ctx));
-        let (bold, italic) = (a.get(6).map(|v| v.to_boolean()).unwrap_or(false), a.get(7).map(|v| v.to_boolean()).unwrap_or(false));
+    native!(t, "__cv_text", 13, |a| {
+        let (text, family, spec, ctm, op) = (arg_str(a, 1), arg_str(a, 5), arg_str(a, 9), arg_str(a, 10), arg_str(a, 12));
+        let (x, y, size, max_w, alpha) = (arg_num(a, 2), arg_num(a, 3), arg_num(a, 4), arg_num(a, 8), arg_num(a, 11));
+        let (bold, italic) = (a.get(6).map(|v| v.truthy()).unwrap_or(false), a.get(7).map(|v| v.truthy()).unwrap_or(false));
         let id = arg_id(a, 0).max(0) as usize;
         with_fonts(|f| cv::text(f, id, &text, x, y, size, &family, bold, italic, max_w, &spec, &ctm, alpha, &op));
         with(|st| st.dirty = true);
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__cv_get", 5, |_, a, ctx| {
-        Ok(s(cv::get_image_data(arg_id(a, 0).max(0) as usize, arg_num(a, 1, ctx) as i32, arg_num(a, 2, ctx) as i32, arg_num(a, 3, ctx) as u32, arg_num(a, 4, ctx) as u32)))
+    native!(t, "__cv_get", 5, |a| {
+        Ok(s(cv::get_image_data(arg_id(a, 0).max(0) as usize, arg_num(a, 1) as i32, arg_num(a, 2) as i32, arg_num(a, 3) as u32, arg_num(a, 4) as u32)))
     });
     // (id, bytes, dx, dy, w, h)
-    native!(ctx, "__cv_put", 6, |_, a, ctx| {
-        let bytes = arg_str(a, 1, ctx)?;
-        cv::put_image_data(arg_id(a, 0).max(0) as usize, &bytes, arg_num(a, 2, ctx) as i32, arg_num(a, 3, ctx) as i32, arg_num(a, 4, ctx) as u32, arg_num(a, 5, ctx) as u32);
+    native!(t, "__cv_put", 6, |a| {
+        let bytes = arg_str(a, 1);
+        cv::put_image_data(arg_id(a, 0).max(0) as usize, &bytes, arg_num(a, 2) as i32, arg_num(a, 3) as i32, arg_num(a, 4) as u32, arg_num(a, 5) as u32);
         with(|st| st.dirty = true);
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__cv_png", 1, |_, a, _| Ok(s(cv::png_base64(arg_id(a, 0).max(0) as usize))));
+    native!(t, "__cv_png", 1, |a| Ok(s(cv::png_base64(arg_id(a, 0).max(0) as usize))));
 }
 
-fn register(ctx: &mut Context) {
-    register_canvas(ctx);
-    native!(ctx, "__dom_kind", 1, |_, a, _| {
+fn register(t: &mut Vec<(&'static str, usize, Native)>) {
+    register_canvas(t);
+    native!(t, "__dom_kind", 1, |a| {
         let id = arg_id(a, 0);
         Ok(with(|st| match st.dom.valid(id) {
             Some(i) if st.dom.nodes[i].tag == "#comment" => 8.0,
@@ -1019,31 +1064,31 @@ fn register(ctx: &mut Context) {
         })
         .into())
     });
-    native!(ctx, "__dom_tag", 1, |_, a, _| Ok(s(with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.nodes[i].tag.clone()).unwrap_or_default()))));
-    native!(ctx, "__dom_parent", 1, |_, a, _| {
+    native!(t, "__dom_tag", 1, |a| Ok(s(with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.nodes[i].tag.clone()).unwrap_or_default()))));
+    native!(t, "__dom_parent", 1, |a| {
         Ok(with(|st| st.dom.valid(arg_id(a, 0)).and_then(|i| st.dom.nodes[i].parent).map(|p| p as f64).unwrap_or(-1.0)).into())
     });
-    native!(ctx, "__dom_children", 1, |_, a, ctx| {
+    native!(t, "__dom_children", 1, |a| {
         let list = with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.nodes[i].children.clone()).unwrap_or_default());
-        Ok(ids(list, ctx))
+        Ok(ids(list))
     });
-    native!(ctx, "__dom_text", 1, |_, a, _| Ok(s(with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.text_content(i)).unwrap_or_default()))));
-    native!(ctx, "__dom_set_text", 2, |_, a, ctx| {
-        let text = arg_str(a, 1, ctx)?;
+    native!(t, "__dom_text", 1, |a| Ok(s(with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.text_content(i)).unwrap_or_default()))));
+    native!(t, "__dom_set_text", 2, |a| {
+        let text = arg_str(a, 1);
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 st.dom.set_text(i, text);
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_get_attr", 2, |_, a, ctx| {
-        let name = arg_str(a, 1, ctx)?.to_ascii_lowercase();
-        Ok(with(|st| st.dom.valid(arg_id(a, 0)).and_then(|i| st.dom.attr(i, &name).map(|v| s(v)))).unwrap_or_else(JsValue::null))
+    native!(t, "__dom_get_attr", 2, |a| {
+        let name = arg_str(a, 1).to_ascii_lowercase();
+        Ok(with(|st| st.dom.valid(arg_id(a, 0)).and_then(|i| st.dom.attr(i, &name).map(|v| s(v)))).unwrap_or(Val::Null))
     });
-    native!(ctx, "__dom_set_attr", 3, |_, a, ctx| {
-        let (name, value) = (arg_str(a, 1, ctx)?.to_ascii_lowercase(), arg_str(a, 2, ctx)?);
+    native!(t, "__dom_set_attr", 3, |a| {
+        let (name, value) = (arg_str(a, 1).to_ascii_lowercase(), arg_str(a, 2));
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 if st.dom.attr(i, &name) != Some(value.as_str()) {
@@ -1052,10 +1097,10 @@ fn register(ctx: &mut Context) {
                 }
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_remove_attr", 2, |_, a, ctx| {
-        let name = arg_str(a, 1, ctx)?.to_ascii_lowercase();
+    native!(t, "__dom_remove_attr", 2, |a| {
+        let name = arg_str(a, 1).to_ascii_lowercase();
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 let before = st.dom.nodes[i].attrs.len();
@@ -1064,25 +1109,25 @@ fn register(ctx: &mut Context) {
                 st.dirty |= before != st.dom.nodes[i].attrs.len();
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_attr_names", 1, |_, a, ctx| {
+    native!(t, "__dom_attr_names", 1, |a| {
         let names: Vec<String> = with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.nodes[i].attrs.iter().map(|(k, _)| k.clone()).collect()).unwrap_or_default());
-        Ok(JsArray::from_iter(names.into_iter().map(s), ctx).into())
+        Ok(list(names.into_iter().map(s)))
     });
-    native!(ctx, "__dom_create", 1, |_, a, ctx| {
-        let tag = arg_str(a, 0, ctx)?.to_ascii_lowercase();
+    native!(t, "__dom_create", 1, |a| {
+        let tag = arg_str(a, 0).to_ascii_lowercase();
         Ok(with(|st| st.dom.create(&tag, None) as f64).into())
     });
-    native!(ctx, "__dom_create_text", 1, |_, a, ctx| {
-        let text = arg_str(a, 0, ctx)?;
+    native!(t, "__dom_create_text", 1, |a| {
+        let text = arg_str(a, 0);
         Ok(with(|st| st.dom.create("#text", Some(text)) as f64).into())
     });
-    native!(ctx, "__dom_create_comment", 1, |_, a, ctx| {
-        let text = arg_str(a, 0, ctx)?;
+    native!(t, "__dom_create_comment", 1, |a| {
+        let text = arg_str(a, 0);
         Ok(with(|st| st.dom.create("#comment", Some(text)) as f64).into())
     });
-    native!(ctx, "__dom_insert", 3, |_, a, _| {
+    native!(t, "__dom_insert", 3, |a| {
         with(|st| {
             if let (Some(p), Some(c)) = (st.dom.valid(arg_id(a, 0)), st.dom.valid(arg_id(a, 1))) {
                 let before = st.dom.valid(arg_id(a, 2));
@@ -1090,18 +1135,18 @@ fn register(ctx: &mut Context) {
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_remove", 1, |_, a, _| {
+    native!(t, "__dom_remove", 1, |a| {
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 st.dom.detach(i);
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_clear", 1, |_, a, _| {
+    native!(t, "__dom_clear", 1, |a| {
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 st.dom.version += 1;
@@ -1111,10 +1156,10 @@ fn register(ctx: &mut Context) {
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // attach a shadow root (a fragment) to a host
-    native!(ctx, "__dom_attach_shadow", 2, |_, a, _| {
+    native!(t, "__dom_attach_shadow", 2, |a| {
         with(|st| {
             if let (Some(h), Some(r)) = (st.dom.valid(arg_id(a, 0)), st.dom.valid(arg_id(a, 1))) {
                 st.dom.version += 1;
@@ -1123,72 +1168,72 @@ fn register(ctx: &mut Context) {
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // an element's shadow root, or a shadow root's host (-1 if none)
-    native!(ctx, "__dom_shadow", 1, |_, a, _| {
+    native!(t, "__dom_shadow", 1, |a| {
         Ok(with(|st| st.dom.valid(arg_id(a, 0)).and_then(|i| st.dom.nodes[i].shadow).map(|p| p as f64).unwrap_or(-1.0)).into())
     });
-    native!(ctx, "__dom_set_template_content", 2, |_, a, _| {
+    native!(t, "__dom_set_template_content", 2, |a| {
         with(|st| {
             if let (Some(t), Some(f)) = (st.dom.valid(arg_id(a, 0)), st.dom.valid(arg_id(a, 1))) {
                 st.dom.version += 1;
                 st.dom.nodes[t].content = Some(f);
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_html", 2, |_, a, _| {
-        let outer = a.get(1).is_some_and(|v| v.to_boolean());
+    native!(t, "__dom_html", 2, |a| {
+        let outer = a.get(1).is_some_and(|v| v.truthy());
         Ok(s(with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.html(i, outer)).unwrap_or_default())))
     });
-    native!(ctx, "__dom_set_html", 2, |_, a, ctx| {
-        let html = arg_str(a, 1, ctx)?;
+    native!(t, "__dom_set_html", 2, |a| {
+        let html = arg_str(a, 1);
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 st.dom.set_html(i, &html);
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_query", 3, |_, a, ctx| {
-        let selector = arg_str(a, 1, ctx)?;
-        let all = a.get(2).is_some_and(|v| v.to_boolean());
+    native!(t, "__dom_query", 3, |a| {
+        let selector = arg_str(a, 1);
+        let all = a.get(2).is_some_and(|v| v.truthy());
         let list = with(|st| st.dom.valid(arg_id(a, 0)).map(|i| st.dom.query(i, &selector, all)).unwrap_or_default());
-        Ok(ids(list, ctx))
+        Ok(ids(list))
     });
-    native!(ctx, "__dom_matches", 2, |_, a, ctx| {
-        let selector = arg_str(a, 1, ctx)?;
+    native!(t, "__dom_matches", 2, |a| {
+        let selector = arg_str(a, 1);
         Ok(with(|st| st.dom.valid(arg_id(a, 0)).is_some_and(|i| st.dom.matches(i, &selector))).into())
     });
-    native!(ctx, "__dom_find_tag", 1, |_, a, ctx| {
-        let tag = arg_str(a, 0, ctx)?;
+    native!(t, "__dom_find_tag", 1, |a| {
+        let tag = arg_str(a, 0);
         Ok(with(|st| st.dom.find_tag(&tag).map(|i| i as f64).unwrap_or(-1.0)).into())
     });
-    native!(ctx, "__dom_title", 0, |_, _, _| {
+    native!(t, "__dom_title", 0, |_a| {
         Ok(s(with(|st| {
             st.title.clone().unwrap_or_else(|| st.dom.find_tag("title").map(|t| st.dom.text_content(t).trim().to_string()).unwrap_or_default())
         })))
     });
-    native!(ctx, "__dom_set_title", 1, |_, a, ctx| {
-        let title = arg_str(a, 0, ctx)?;
+    native!(t, "__dom_set_title", 1, |a| {
+        let title = arg_str(a, 0);
         with(|st| st.title = Some(title));
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__dom_focus", 1, |_, a, _| {
+    native!(t, "__dom_focus", 1, |a| {
         with(|st| st.focus = st.dom.valid(arg_id(a, 0)));
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__page_url", 0, |_, _, _| {
+    native!(t, "__page_url", 0, |_a| {
         Ok(s(with(|st| {
             let base = st.url.as_ref().map(|u| u.to_string()).unwrap_or_default();
             if st.hash.is_empty() { base } else { format!("{base}#{}", st.hash) }
         })))
     });
-    native!(ctx, "__page_set_url", 1, |_, a, ctx| {
+    native!(t, "__page_set_url", 1, |a| {
         // history.pushState / replaceState / location.hash: same document, new URL
-        let target = arg_str(a, 0, ctx)?;
+        let target = arg_str(a, 0);
         with(|st| {
             let (address, hash) = match target.split_once('#') {
                 Some((a, h)) => (a.to_string(), h.to_string()),
@@ -1207,27 +1252,27 @@ fn register(ctx: &mut Context) {
             }
             st.hash = hash;
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__page_navigate", 2, |_, a, ctx| {
-        let target = arg_str(a, 0, ctx)?;
+    native!(t, "__page_navigate", 2, |a| {
+        let target = arg_str(a, 0);
         let form = match a.get(1) {
-            Some(v) if !v.is_undefined() => Some(v.to_string(ctx)?.to_std_string_escaped()),
-            _ => None,
+            Some(Val::Undef) | None => None,
+            Some(v) => Some(v.text()),
         };
         with(|st| {
             st.navigate = Some(target);
             st.form = form;
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // [x, y, width, height] of an element's box in the page, or null when it has none
-    native!(ctx, "__dom_rect", 1, |_, a, ctx| {
-        let id = a.first().and_then(|v| v.as_number()).unwrap_or(-1.0);
+    native!(t, "__dom_rect", 1, |a| {
+        let id = a.first().and_then(|v| v.num()).unwrap_or(-1.0);
         if id < 0.0 {
-            return Ok(JsValue::null());
+            return Ok(Val::Null);
         }
-        let Some((_, height)) = geometry() else { return Ok(JsValue::null()) };
+        let Some((_, height)) = geometry() else { return Ok(Val::Null) };
         let rect = if id == 0.0 {
             // the document: the whole page
             Some(crate::layout::Rect { x: 0.0, y: 0.0, w: GEOMETRY.with(|g| g.borrow().as_ref().map(|g| g.width).unwrap_or(0.0)), h: height })
@@ -1235,18 +1280,18 @@ fn register(ctx: &mut Context) {
             rect_of(id as usize)
         };
         Ok(match rect {
-            Some(r) => JsArray::from_iter([r.x, r.y, r.w, r.h].map(|v| JsValue::from(v as f64)), ctx).into(),
-            None => JsValue::null(),
+            Some(r) => list([r.x, r.y, r.w, r.h].map(|v| Val::from(v as f64))),
+            None => Val::Null,
         })
     });
     // the computed style of an element, as CSS text values
-    native!(ctx, "__computed_style", 1, |_, a, ctx| {
+    native!(t, "__computed_style", 1, |a| {
         use crate::style::{AlignItems, Display, FlexDirection, Justify, Position};
-        let id = a.first().and_then(|v| v.as_number()).unwrap_or(-1.0);
+        let id = a.first().and_then(|v| v.num()).unwrap_or(-1.0);
         if id < 0.0 {
-            return Ok(JsValue::null());
+            return Ok(Val::Null);
         }
-        let Some((st, _)) = computed_style(id as usize) else { return Ok(JsValue::null()) };
+        let Some((st, _)) = computed_style(id as usize) else { return Ok(Val::Null) };
         let rect = rect_of(id as usize);
         let px = |v: f32| format!("{}px", (v * 100.0).round() / 100.0);
         let color = |c: crate::css::Color| if c.a == 255 { format!("rgb({}, {}, {})", c.r, c.g, c.b) } else { format!("rgba({}, {}, {}, {})", c.r, c.g, c.b, (c.a as f32 / 255.0 * 1000.0).round() / 1000.0) };
@@ -1287,19 +1332,14 @@ fn register(ctx: &mut Context) {
             ("right", st.right.map(px).unwrap_or_else(|| "auto".into())), ("bottom", st.bottom.map(px).unwrap_or_else(|| "auto".into())),
         ];
         pairs.push(("line-height", "normal".into()));
-        let out = JsArray::new(ctx)?;
-        for (k, v) in pairs {
-            out.push(JsValue::from(js_string!(k)), ctx)?;
-            out.push(JsValue::from(JsString::from(v.as_str())), ctx)?;
-        }
-        Ok(out.into())
+        Ok(Val::List(pairs.into_iter().flat_map(|(k, v)| [s(k), s(v)]).collect()))
     });
     // WebSocket: open (returns an id), send, close, and the events that arrived
-    native!(ctx, "__ws_open", 2, |_, a, ctx| {
-        let target = arg_str(a, 0, ctx)?;
-        let protocols: Vec<String> = arg_str(a, 1, ctx)?.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+    native!(t, "__ws_open", 2, |a| {
+        let target = arg_str(a, 0);
+        let protocols: Vec<String> = arg_str(a, 1).split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
         let Some(url) = Url::parse(&target).filter(|u| matches!(u.scheme.as_str(), "ws" | "wss")) else {
-            return Err(boa_engine::JsNativeError::syntax().with_message(format!("Failed to construct 'WebSocket': The URL '{target}' is invalid.")).into());
+            return Err(format!("SyntaxError: Failed to construct 'WebSocket': The URL '{target}' is invalid."));
         };
         let started = with(|st| {
             let page = st.url.clone()?;
@@ -1312,40 +1352,37 @@ fn register(ctx: &mut Context) {
             st.sockets.push(Socket { id, out: out_tx, events: ev_rx, closed: false });
             Some(id)
         });
-        Ok(started.map(|id| JsValue::from(id)).unwrap_or(JsValue::from(-1)))
+        Ok(started.map(|id| Val::from(id)).unwrap_or(Val::from(-1)))
     });
-    native!(ctx, "__ws_send", 3, |_, a, ctx| {
-        let id = a.first().and_then(|v| v.as_number()).unwrap_or(-1.0) as u32;
-        let binary = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+    native!(t, "__ws_send", 3, |a| {
+        let id = a.first().and_then(|v| v.num()).unwrap_or(-1.0) as u32;
+        let binary = a.get(1).map(|v| v.truthy()).unwrap_or(false);
         let message = if binary {
-            let bytes = a.get(2).and_then(|v| v.as_object()).map(|o| {
-                let len = o.get(js_string!("length"), ctx).ok().and_then(|l| l.as_number()).unwrap_or(0.0) as usize;
-                (0..len).map(|i| o.get(i, ctx).ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u8).collect::<Vec<u8>>()
-            }).unwrap_or_default();
+            let bytes = arg_list(a, 2).iter().map(|v| v.num().unwrap_or(0.0) as u8).collect::<Vec<u8>>();
             SocketOut::Binary(bytes)
         } else {
-            SocketOut::Text(arg_str(a, 2, ctx)?)
+            SocketOut::Text(arg_str(a, 2))
         };
         with(|st| {
             if let Some(s) = st.sockets.iter().find(|s| s.id == id) {
                 let _ = s.out.send(message);
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__ws_close", 3, |_, a, ctx| {
-        let id = a.first().and_then(|v| v.as_number()).unwrap_or(-1.0) as u32;
-        let code = a.get(1).and_then(|v| v.as_number()).unwrap_or(1000.0) as u16;
-        let reason = arg_str(a, 2, ctx).unwrap_or_default();
+    native!(t, "__ws_close", 3, |a| {
+        let id = a.first().and_then(|v| v.num()).unwrap_or(-1.0) as u32;
+        let code = a.get(1).and_then(|v| v.num()).unwrap_or(1000.0) as u16;
+        let reason = arg_str(a, 2);
         with(|st| {
             if let Some(s) = st.sockets.iter().find(|s| s.id == id) {
                 let _ = s.out.send(SocketOut::Close(code, reason));
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__ws_poll", 0, |_, _, ctx| {
-        let mut rows: Vec<JsValue> = Vec::new();
+    native!(t, "__ws_poll", 0, |_a| {
+        let mut rows: Vec<Val> = Vec::new();
         let events: Vec<(u32, SocketEvent)> = with(|st| {
             let mut out = Vec::new();
             for s in &mut st.sockets {
@@ -1360,68 +1397,70 @@ fn register(ctx: &mut Context) {
             out
         });
         for (id, e) in events {
-            let row: Vec<JsValue> = match e {
-                SocketEvent::Open(p) => vec![id.into(), js_string!("open").into(), JsString::from(p.as_str()).into()],
-                SocketEvent::Text(t) => vec![id.into(), js_string!("text").into(), JsString::from(t.as_str()).into()],
-                SocketEvent::Binary(b) => vec![id.into(), js_string!("binary").into(), JsArray::from_iter(b.into_iter().map(|x| JsValue::from(x as u32)), ctx).into()],
-                SocketEvent::Error(m) => vec![id.into(), js_string!("error").into(), JsString::from(m.as_str()).into()],
-                SocketEvent::Close(code, reason) => vec![id.into(), js_string!("close").into(), JsValue::from(code as u32), JsString::from(reason.as_str()).into()],
+            let id = Val::from(id);
+            let row: Vec<Val> = match e {
+                SocketEvent::Open(p) => vec![id, s("open"), s(p)],
+                SocketEvent::Text(t) => vec![id, s("text"), s(t)],
+                SocketEvent::Binary(b) => vec![id, s("binary"), list(b.into_iter().map(|x| Val::from(x as u32)))],
+                SocketEvent::Error(m) => vec![id, s("error"), s(m)],
+                SocketEvent::Close(code, reason) => vec![id, s("close"), Val::from(code as u32), s(reason)],
             };
-            rows.push(JsArray::from_iter(row, ctx).into());
+            rows.push(list(row));
         }
-        Ok(JsArray::from_iter(rows, ctx).into())
+        Ok(list(rows))
     });
-    native!(ctx, "__media_matches", 3, |_, a, ctx| {
-        let query = arg_str(a, 0, ctx)?;
-        let width = a.get(1).and_then(|v| v.as_number()).unwrap_or(1024.0) as f32;
-        let height = a.get(2).and_then(|v| v.as_number()).unwrap_or(768.0) as f32;
-        Ok(JsValue::from(crate::css::Media::parse(&query).matches_viewport(width, height)))
+    native!(t, "__media_matches", 3, |a| {
+        let query = arg_str(a, 0);
+        let width = a.get(1).and_then(|v| v.num()).unwrap_or(1024.0) as f32;
+        let height = a.get(2).and_then(|v| v.num()).unwrap_or(768.0) as f32;
+        Ok(Val::from(crate::css::Media::parse(&query).matches_viewport(width, height)))
     });
-    native!(ctx, "__log", 1, |_, a, ctx| {
-        let line = arg_str(a, 0, ctx)?;
+    native!(t, "__log", 1, |a| {
+        let line = arg_str(a, 0);
         if std::env::var_os("SEPIA_VERBOSE").is_some() {
             eprintln!("js live: {}", line.chars().take(300).collect::<String>());
         }
+        crate::report::js_error(&line);
         with(|st| {
             if st.log.len() < 100_000 {
                 st.log.push(line);
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
-    native!(ctx, "__cookie_get", 0, |_, _, _| {
+    native!(t, "__cookie_get", 0, |_a| {
         let line = with(|st| st.url.as_ref().map(|u| crate::cookies::script_view(&crate::cookies::site_of(&u.host), u)).unwrap_or_default());
         Ok(s(line))
     });
-    native!(ctx, "__cookie_set", 1, |_, a, ctx| {
-        let assignment = arg_str(a, 0, ctx)?;
+    native!(t, "__cookie_set", 1, |a| {
+        let assignment = arg_str(a, 0);
         with(|st| {
             if let Some(u) = st.url.as_ref().filter(|u| u.scheme == "http" || u.scheme == "https") {
                 crate::cookies::store_from_script(&crate::cookies::site_of(&u.host), u, &assignment);
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // CSS for one element (a fetched <link>, a <style>'s CSSOM rules); "" removes it
-    native!(ctx, "__css_set", 2, |_, a, ctx| {
-        let css = arg_str(a, 1, ctx)?;
+    native!(t, "__css_set", 2, |a| {
+        let css = arg_str(a, 1);
         with(|st| {
             if let Some(i) = st.dom.valid(arg_id(a, 0)) {
                 if css.is_empty() { st.dyn_css.remove(&i); } else { st.dyn_css.insert(i, css); }
                 st.dirty = true;
             }
         });
-        Ok(JsValue::undefined())
+        Ok(Val::Undef)
     });
     // url(...)s of a fetched stylesheet made absolute against where it came from
-    native!(ctx, "__css_absolute", 2, |_, a, ctx| {
-        let css = arg_str(a, 0, ctx)?;
-        let base = arg_str(a, 1, ctx)?;
+    native!(t, "__css_absolute", 2, |a| {
+        let css = arg_str(a, 0);
+        let base = arg_str(a, 1);
         Ok(s(match Url::parse(&base) { Some(b) => absolute_urls(&css, &b), None => css }))
     });
     // a stylesheet a script linked: fetched like the page's own stylesheets
-    native!(ctx, "__css_fetch", 1, |_, a, ctx| {
-        let target = arg_str(a, 0, ctx)?;
+    native!(t, "__css_fetch", 1, |a| {
+        let target = arg_str(a, 0);
         let text = with(|st| -> Option<String> {
             let net = st.net.as_ref()?;
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
@@ -1431,12 +1470,12 @@ fn register(ctx: &mut Context) {
             (response.status < 400 && true)
                 .then(|| absolute_urls(&crate::charset::decode(&response.body, &response.content_type(), false, crate::charset::Encoding::Utf8).0, &url))
         });
-        Ok(text.map(s).unwrap_or_else(JsValue::null))
+        Ok(text.map(s).unwrap_or(Val::Null))
     });
     // a <script src> a page's script inserted: fetched like the page's own
     // scripts (any origin, the page's path and cookie partition); text or null
-    native!(ctx, "__script_fetch", 1, |_, a, ctx| {
-        let target = arg_str(a, 0, ctx)?;
+    native!(t, "__script_fetch", 1, |a| {
+        let target = arg_str(a, 0);
         let text = with(|st| -> Option<String> {
             let net = st.net.as_ref()?;
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
@@ -1450,18 +1489,11 @@ fn register(ctx: &mut Context) {
             (response.status < 400 && true)
                 .then(|| crate::charset::decode(&response.body, &response.content_type(), false, crate::charset::Encoding::Utf8).0)
         });
-        Ok(text.map(s).unwrap_or_else(JsValue::null))
+        Ok(text.map(s).unwrap_or(Val::Null))
     });
     // several inserted <script src> at once, fetched in parallel: [text|null, ...]
-    native!(ctx, "__scripts_fetch", 1, |_, a, ctx| {
-        let list = a.get(0).and_then(|v| v.as_object());
-        let mut targets = Vec::new();
-        if let Some(list) = list {
-            let len = list.get(js_string!("length"), ctx)?.to_length(ctx)?.min(256);
-            for i in 0..len {
-                targets.push(list.get(i, ctx)?.to_string(ctx)?.to_std_string_escaped());
-            }
-        }
+    native!(t, "__scripts_fetch", 1, |a| {
+        let targets: Vec<String> = arg_list(a, 0).iter().take(256).map(Val::text).collect();
         let texts: Vec<Option<String>> = with(|st| {
             let Some(net) = st.net.as_ref() else { return targets.iter().map(|_| None).collect() };
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
@@ -1482,42 +1514,15 @@ fn register(ctx: &mut Context) {
                 })
                 .collect()
         });
-        Ok(JsArray::from_iter(texts.into_iter().map(|t| t.map(s).unwrap_or_else(JsValue::null)), ctx).into())
-    });
-    // run a classic script the page inserted; false if it threw
-    native!(ctx, "__script_eval", 2, |_, a, ctx| {
-        let code = arg_str(a, 0, ctx)?;
-        let label = arg_str(a, 1, ctx)?;
-        peek(&code, &label);
-        match ctx.eval(Source::from_bytes(code.as_bytes()).with_path(std::path::Path::new(&label))) {
-            Ok(_) => Ok(JsValue::from(true)),
-            Err(e) => {
-                with(|st| st.log.push(format!("{label}: {e}")));
-                Ok(JsValue::from(false))
-            }
-        }
+        Ok(list(texts.into_iter().map(|t| t.map(s).unwrap_or(Val::Null))))
     });
     // fetch()/XHR without blocking the page: start a request (same rules as
     // __fetch: the page's own site, the browser's header filter) -> its id
-    native!(ctx, "__fetch_start", 6, |_, a, ctx| {
-        let target = arg_str(a, 0, ctx)?;
-        let opt = |i: usize, ctx: &mut Context| -> JsResult<Option<String>> {
-            match a.get(i) {
-                Some(v) if !v.is_undefined() && !v.is_null() => Ok(Some(v.to_string(ctx)?.to_std_string_escaped())),
-                _ => Ok(None),
-            }
-        };
-        let (method, body, content_type) = (opt(1, ctx)?, opt(2, ctx)?, opt(3, ctx)?);
-        let no_cors = a.get(5).is_some_and(|v| v.to_boolean());
-        let mut headers: Vec<(String, String)> = Vec::new();
-        if let Some(list) = a.get(4).and_then(|v| v.as_object()) {
-            let len = list.get(js_string!("length"), ctx)?.to_length(ctx)?.min(64);
-            for i in 0..len {
-                if let Some(pair) = list.get(i, ctx)?.as_object() {
-                    headers.push((pair.get(0, ctx)?.to_string(ctx)?.to_std_string_escaped(), pair.get(1, ctx)?.to_string(ctx)?.to_std_string_escaped()));
-                }
-            }
-        }
+    native!(t, "__fetch_start", 6, |a| {
+        let target = arg_str(a, 0);
+        let (method, body, content_type) = (arg_opt(a, 1), arg_opt(a, 2), arg_opt(a, 3));
+        let no_cors = a.get(5).is_some_and(|v| v.truthy());
+        let headers = arg_pairs(a, 4);
         let started = with(|st| -> Result<u32, String> {
             let net = st.net.as_ref().ok_or("network is off")?;
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
@@ -1556,14 +1561,14 @@ fn register(ctx: &mut Context) {
             Ok(id)
         });
         match started {
-            Ok(id) => Ok(JsValue::from(id)),
-            Err(e) => Err(boa_engine::JsNativeError::typ().with_message(format!("fetch failed: {e}")).into()),
+            Ok(id) => Ok(Val::from(id)),
+            Err(e) => Err(format!("fetch failed: {e}")),
         }
     });
     // an inserted <script src> or <link> stylesheet, fetched in the background like
     // the page's own subresources (any origin, the page's path and cache) -> id
-    native!(ctx, "__resource_start", 1, |_, a, ctx| {
-        let target = arg_str(a, 0, ctx)?;
+    native!(t, "__resource_start", 1, |a| {
+        let target = arg_str(a, 0);
         let id = with(|st| -> Option<u32> {
             let net = st.net.as_ref()?;
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
@@ -1589,12 +1594,12 @@ fn register(ctx: &mut Context) {
             st.inflight.push(Inflight { id, url, keep: true, cors: None, rx });
             Some(id)
         });
-        Ok(id.map(JsValue::from).unwrap_or_else(JsValue::null))
+        Ok(id.map(Val::from).unwrap_or(Val::Null))
     });
     // an image for a script (img.src): fetched and decoded in the background -> id
     // (its answer comes through __fetch_poll as [id, 200, "w,h", url] or [id, null, error])
-    native!(ctx, "__image_start", 1, |_, a, ctx| {
-        let raw = arg_str(a, 0, ctx)?;
+    native!(t, "__image_start", 1, |a| {
+        let raw = arg_str(a, 0);
         let id = with(|st| -> Option<u32> {
             let base = st.url.clone().or_else(|| st.net.as_ref().map(|n| n.origin.clone()));
             let resolved = base.as_ref().and_then(|b| b.resolve(&raw)).map(|u| u.to_string()).unwrap_or_else(|| raw.clone());
@@ -1617,11 +1622,11 @@ fn register(ctx: &mut Context) {
             st.image_loads.push(ImageLoad { id, keys: (raw.clone(), resolved), rx });
             Some(id)
         });
-        Ok(id.map(JsValue::from).unwrap_or_else(JsValue::null))
+        Ok(id.map(Val::from).unwrap_or(Val::Null))
     });
     // answers that arrived: [[id, status, text, url, headers], ...] or [id, null, error]
-    native!(ctx, "__fetch_poll", 0, |_, _, ctx| {
-        let mut images_done: Vec<JsValue> = Vec::new();
+    native!(t, "__fetch_poll", 0, |_a| {
+        let mut images_done: Vec<Val> = Vec::new();
         let loads = with(|st| std::mem::take(&mut st.image_loads));
         let mut waiting = Vec::new();
         for load in loads {
@@ -1639,10 +1644,10 @@ fn register(ctx: &mut Context) {
                         n.push((load.keys.0.clone(), bitmap.clone()));
                         n.push((load.keys.1.clone(), bitmap));
                     });
-                    images_done.push(JsArray::from_iter([JsValue::from(load.id), JsValue::from(200), s(format!("{},{}", w.round(), h.round())), s(load.keys.1.clone()), s("")], ctx).into());
+                    images_done.push(list([Val::from(load.id), Val::from(200), s(format!("{},{}", w.round(), h.round())), s(load.keys.1.clone()), s("")]));
                 }
                 Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    images_done.push(JsArray::from_iter([JsValue::from(load.id), JsValue::null(), s("image failed")], ctx).into());
+                    images_done.push(list([Val::from(load.id), Val::Null, s("image failed")]));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => waiting.push(load),
             }
@@ -1682,39 +1687,22 @@ fn register(ctx: &mut Context) {
                         .filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie") && !k.eq_ignore_ascii_case("set-cookie2"))
                         .map(|(k, v)| format!("{}: {v}\r\n", k.to_ascii_lowercase()))
                         .collect();
-                    JsArray::from_iter([JsValue::from(id), JsValue::from(resp.status as f64), s(text), s(resp.final_url.clone()), s(headers)], ctx)
+                    list([Val::from(id), Val::from(resp.status as f64), s(text), s(resp.final_url.clone()), s(headers)])
                 }
-                Err(e) => JsArray::from_iter([JsValue::from(id), JsValue::null(), s(e)], ctx),
+                Err(e) => list([Val::from(id), Val::Null, s(e)]),
             };
-            rows.push(JsValue::from(row));
+            rows.push(Val::from(row));
         }
         rows.extend(images_done);
-        Ok(JsArray::from_iter(rows, ctx).into())
+        Ok(list(rows))
     });
-    native!(ctx, "__fetch", 5, |_, a, ctx| {
+    native!(t, "__fetch", 5, |a| {
         // the page's own site only (its origin and sibling subdomains, same
         // scheme), through the page's chain; returns [status, body, url, content-type]
-        let target = arg_str(a, 0, ctx)?;
-        let opt = |i: usize, ctx: &mut Context| -> JsResult<Option<String>> {
-            match a.get(i) {
-                Some(v) if !v.is_undefined() && !v.is_null() => Ok(Some(v.to_string(ctx)?.to_std_string_escaped())),
-                _ => Ok(None),
-            }
-        };
-        let (method, body, content_type) = (opt(1, ctx)?, opt(2, ctx)?, opt(3, ctx)?);
+        let target = arg_str(a, 0);
+        let (method, body, content_type) = (arg_opt(a, 1), arg_opt(a, 2), arg_opt(a, 3));
         // [[name, value], ...] the script set; net.rs keeps only what may go out
-        let mut headers: Vec<(String, String)> = Vec::new();
-        if let Some(list) = a.get(4).and_then(|v| v.as_object()) {
-            let len = list.get(js_string!("length"), ctx)?.to_length(ctx)?.min(64);
-            for i in 0..len {
-                let pair = list.get(i, ctx)?;
-                if let Some(pair) = pair.as_object() {
-                    let k = pair.get(0, ctx)?.to_string(ctx)?.to_std_string_escaped();
-                    let v = pair.get(1, ctx)?.to_string(ctx)?.to_std_string_escaped();
-                    headers.push((k, v));
-                }
-            }
-        }
+        let headers = arg_pairs(a, 4);
         let result = with(|st| -> Result<(u16, String, String, String), String> {
             let net = st.net.as_ref().ok_or("network is off")?;
             let base = st.url.clone().unwrap_or_else(|| net.origin.clone());
@@ -1750,15 +1738,109 @@ fn register(ctx: &mut Context) {
             Ok((response.status, text, response.final_url.clone(), kind))
         });
         match result {
-            Ok((status, body, url, kind)) => Ok(JsArray::from_iter([JsValue::from(status as f64), s(body), s(url), s(kind)], ctx).into()),
+            Ok((status, body, url, kind)) => Ok(list([Val::from(status as f64), s(body), s(url), s(kind)])),
             Err(e) => {
                 if std::env::var_os("SEPIA_VERBOSE").is_some() {
                     eprintln!("fetch: {} {target} failed: {e} {}", method.as_deref().unwrap_or("GET"), body.as_deref().unwrap_or("").chars().take(1500).collect::<String>());
                 }
-                Err(boa_engine::JsNativeError::typ().with_message(format!("fetch failed: {e}")).into())
+                Err(format!("fetch failed: {e}"))
             }
         }
     });
+}
+
+
+// ---------------------------------------------------------------------------
+// Boa: the engine the host functions run under today (V8 next, same natives)
+// ---------------------------------------------------------------------------
+
+/// A Boa value as a `Val`: arrays become lists (four levels deep), other
+/// objects their string (what the host functions always took them as).
+fn boa_to_val(v: &JsValue, ctx: &mut Context, depth: u8) -> JsResult<Val> {
+    if v.is_undefined() {
+        return Ok(Val::Undef);
+    }
+    if v.is_null() {
+        return Ok(Val::Null);
+    }
+    if let Some(b) = v.as_boolean() {
+        return Ok(Val::Bool(b));
+    }
+    if let Some(n) = v.as_number() {
+        return Ok(Val::Num(n));
+    }
+    if let Some(s) = v.as_string() {
+        return Ok(Val::Str(s.to_std_string_escaped()));
+    }
+    if let Some(o) = v.as_object() {
+        if depth < 4 && o.is_array() {
+            let len = o.get(js_string!("length"), ctx)?.to_length(ctx)?;
+            let mut items = Vec::with_capacity(len.min(1 << 16) as usize);
+            for i in 0..len {
+                items.push(boa_to_val(&o.get(i, ctx)?, ctx, depth + 1)?);
+            }
+            return Ok(Val::List(items));
+        }
+    }
+    Ok(Val::Str(v.to_string(ctx)?.to_std_string_escaped()))
+}
+
+fn boa_from_val(v: Val, ctx: &mut Context) -> JsValue {
+    match v {
+        Val::Undef => JsValue::undefined(),
+        Val::Null => JsValue::null(),
+        Val::Bool(b) => JsValue::from(b),
+        Val::Num(n) => JsValue::from(n),
+        Val::Str(s) => JsValue::from(JsString::from(s)),
+        Val::List(items) => {
+            let items: Vec<JsValue> = items.into_iter().map(|v| boa_from_val(v, ctx)).collect();
+            JsArray::from_iter(items, ctx).into()
+        }
+    }
+}
+
+/// A host function's error as the JS error its text names (TypeError by default).
+fn boa_error(message: String) -> boa_engine::JsError {
+    use boa_engine::JsNativeError as E;
+    let (kind, rest) = message.split_once(": ").filter(|(k, _)| k.ends_with("Error")).unwrap_or(("TypeError", message.as_str()));
+    let error = match kind {
+        "SyntaxError" => E::syntax(),
+        "RangeError" => E::range(),
+        "ReferenceError" => E::reference(),
+        _ => E::typ(),
+    };
+    let rest = if kind == "TypeError" && !message.starts_with("TypeError: ") { message.clone() } else { rest.to_string() };
+    error.with_message(rest).into()
+}
+
+/// Give the page's global object every host function.
+fn install(ctx: &mut Context) {
+    for (name, len, f) in natives() {
+        let call = NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let vals = args.iter().map(|a| boa_to_val(a, ctx, 0)).collect::<JsResult<Vec<Val>>>()?;
+            match f(&vals) {
+                Ok(v) => Ok(boa_from_val(v, ctx)),
+                Err(m) => Err(boa_error(m)),
+            }
+        });
+        ctx.register_global_builtin_callable(JsString::from(name), len, call).expect("register native");
+    }
+    // engine-specific: run a classic script the page inserted; false if it threw
+    let eval = NativeFunction::from_fn_ptr(|_, a, ctx| {
+        let code = match a.first() { Some(v) => v.to_string(ctx)?.to_std_string_escaped(), None => String::new() };
+        let label = match a.get(1) { Some(v) => v.to_string(ctx)?.to_std_string_escaped(), None => String::new() };
+        peek(&code, &label);
+        match ctx.eval(Source::from_bytes(code.as_bytes()).with_path(std::path::Path::new(&label))) {
+            Ok(_) => Ok(JsValue::from(true)),
+            Err(e) => {
+                let line = format!("{label}: {e}");
+                crate::report::js_error(&line);
+                with(|st| st.log.push(line));
+                Ok(JsValue::from(false))
+            }
+        }
+    });
+    ctx.register_global_builtin_callable(js_string!("__script_eval"), 2, eval).expect("register native");
 }
 
 // ---------------------------------------------------------------------------
@@ -2424,7 +2506,7 @@ impl Session {
             limits.set_recursion_limit(100_000);
             limits.set_stack_size_limit(64 * 1024 * 1024);
         }
-        register(&mut ctx);
+        install(&mut ctx);
         let viewport = format!("globalThis.__viewport = [{width}, 800]; globalThis.__verbose = {}; globalThis.__persona = {};", std::env::var_os("SEPIA_VERBOSE").is_some(), persona_json(&persona));
         let _ = ctx.eval(Source::from_bytes(&viewport));
         if let Err(e) = ctx.eval(Source::from_bytes(PRELUDE)) {
@@ -2501,7 +2583,7 @@ impl Session {
                 let result = run_module(&mut ctx, &loader, code, path);
                 slow(label);
                 if let Err(e) = result {
-                    with(|st| st.log.push(format!("{label}: {e}")));
+                    { let line = format!("{label}: {e}"); crate::report::js_error(&line); with(|st| st.log.push(line)); }
                 }
                 continue;
             }
@@ -2515,7 +2597,7 @@ impl Session {
             slow(label);
             if let Err(e) = result {
                 let at = if std::env::var_os("SEPIA_VERBOSE").is_some() { near(scripts, &e.to_string()) } else { String::new() };
-                with(|st| st.log.push(format!("{label}: {e}{at}")));
+                { crate::report::js_error(&format!("{label}: {e}")); with(|st| st.log.push(format!("{label}: {e}{at}"))); }
             }
             let _ = ctx.run_jobs();
         }
@@ -2839,7 +2921,7 @@ impl Session {
             }
         };
         if let Err(e) = self.ctx.eval(Source::from_bytes(&call)) {
-            with(|st| st.log.push(format!("event: {e}")));
+            { let line = format!("event: {e}"); crate::report::js_error(&line); with(|st| st.log.push(line)); }
         }
         self.settle_for(Duration::from_millis(100));
         let (dirty, navigate, form, jump, focus, title) = with(|st| {
