@@ -550,6 +550,17 @@ fn run_cli(args: Args, resolver_setting: Option<resolver::Resolver>) {
         }
     }
 
+    // SEPIA_DRAWS=1: the boxes and pictures drawn, in paint order (debugging)
+    if std::env::var_os("SEPIA_DRAWS").is_some() {
+        for (i, draw) in page.draws.iter().enumerate() {
+            match draw {
+                layout::Draw::Image { rect, image, tile, .. } => eprintln!("draw {i} image {:.0},{:.0} {:.0}x{:.0} bitmap={} tile={}", rect.x, rect.y, rect.w, rect.h, image.is_some(), tile.is_some()),
+                layout::Draw::Fill { rect, color, gradient, .. } => eprintln!("draw {i} fill {:.0},{:.0} {:.0}x{:.0} {color:?} gradient={}", rect.x, rect.y, rect.w, rect.h, gradient.is_some()),
+                _ => {}
+            }
+        }
+    }
+
     if args.text {
         let mut line = String::new();
         for piece in &page.text {

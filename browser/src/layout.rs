@@ -1155,9 +1155,10 @@ impl<'a> Layout<'a> {
             }
             "img" => {
                 let alt = node.attr("alt").unwrap_or("").trim().to_string();
-                let bitmap = node
-                    .attr("src")
+                // the srcset / <picture> candidate the loader fetched
+                let bitmap = crate::images::chosen_src(node, ancestors.last().copied())
                     .and_then(|src| self.images.and_then(|map| map.get(src)))
+                    .or_else(|| node.attr("src").and_then(|src| self.images.and_then(|map| map.get(src))))
                     .cloned();
                 match image_size(node, &style, bitmap.as_deref()) {
                     Some((w, h)) => items.push(InlineItem {
@@ -2219,7 +2220,12 @@ impl<'a> Layout<'a> {
         let mut with_node: Vec<&Node> = ancestors.to_vec();
         with_node.push(node);
         let saved_flow = std::mem::replace(&mut self.flow_width, cb_w.max(1.0));
-        let atom = self.atom_of(node, &with_node, &style);
+        let atom = match node.tag.as_str() {
+            // a positioned picture (Next.js `fill`: absolute, 100% x 100%)
+            // is its own box; laid out as a block it would be empty
+            "img" | "svg" => self.replaced_atom(node, ancestors, &style),
+            _ => self.atom_of(node, &with_node, &style),
+        };
         self.flow_width = saved_flow;
         let Some((sub, w, h)) = atom else { return };
         let x = match (style.left, style.right) {
@@ -2245,6 +2251,52 @@ impl<'a> Layout<'a> {
                 container.bottom_fixes.push((ranges.0, ranges.1, ranges.2, b, h));
             }
         }
+    }
+
+    /// A positioned `<img>` / `<svg>` on a page of its own: the picture at
+    /// its used size (object-fit applied), margins around it.
+    fn replaced_atom(&self, node: &Node, ancestors: &[&Node], style: &Style) -> Option<(Page, f32, f32)> {
+        if style.display == Display::None || style.hidden {
+            return None;
+        }
+        let bitmap: Option<Arc<Bitmap>> = match node.tag.as_str() {
+            "img" => crate::images::chosen_src(node, ancestors.last().copied())
+                .and_then(|src| self.images.and_then(|map| map.get(src)))
+                .or_else(|| node.attr("src").and_then(|src| self.images.and_then(|map| map.get(src))))
+                .cloned(),
+            _ => None,
+        };
+        let (w, h) = match node.tag.as_str() {
+            "svg" => {
+                let (nw, nh) = crate::svg::natural_size(node);
+                match (style.width, style.height) {
+                    (Some(w), Some(h)) => (w, h),
+                    (Some(w), None) => (w, w * nh / nw.max(0.01)),
+                    (None, Some(h)) => (h * nw / nh.max(0.01), h),
+                    (None, None) => (nw, nh),
+                }
+            }
+            _ => image_size(node, style, bitmap.as_deref())?,
+        };
+        if w < 0.5 || h < 0.5 {
+            return None;
+        }
+        let rect = Rect { x: style.margin.left, y: style.margin.top, w, h };
+        let mut page = Page::default();
+        let draw = match node.tag.as_str() {
+            "svg" => {
+                let scale = 3.0f32.min(1024.0 / w.max(h));
+                let drawn = crate::svg::render_node_cached(node, (w * scale).round() as usize, (h * scale).round() as usize, (w, h), style.color, style.svg_fill, style.svg_stroke);
+                Some(Draw::Image { rect, image: Some(drawn), alt: String::new(), tile: None })
+            }
+            _ => bitmap
+                .as_ref()
+                .filter(|_| style.object_fit != crate::style::ObjectFit::Fill)
+                .and_then(|b| object_fit_draw(b, rect, style))
+                .or_else(|| Some(Draw::Image { rect, image: bitmap.clone(), alt: node.attr("alt").unwrap_or("").to_string(), tile: None })),
+        };
+        page.draws.extend(draw);
+        Some((page, w + style.margin.horizontal(), h + style.margin.vertical()))
     }
 
     /// Lay out a cell's contents alone at `width`: (page at the origin, height).
@@ -3835,8 +3887,9 @@ fn image_size(node: &Node, style: &Style, bitmap: Option<&Bitmap>) -> Option<(f3
             .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
     };
-    let w = attr("width").or(style.width.filter(|v| *v > 0.0));
-    let h = attr("height").or(style.height.filter(|v| *v > 0.0));
+    // CSS sizes win over the width/height attributes (presentational hints)
+    let w = style.width.filter(|v| *v > 0.0).or(attr("width"));
+    let h = style.height.filter(|v| *v > 0.0).or(attr("height"));
     let natural = bitmap.map(|b| b.natural_size());
     let size = match (w, h, natural) {
         (Some(w), Some(h), _) => (w, h),
@@ -4295,6 +4348,31 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(below > 60.0 && below < 85.0, "text starts under the tallest float: {below}");
+    }
+
+    #[test]
+    fn positioned_images_fill_their_container() {
+        // Next.js `fill`: the picture is absolute at 100% x 100% of a sized box;
+        // and srcset picks the candidate a 1200px viewport would load
+        let bmp = Arc::new(crate::images::Bitmap::new(40, 20, vec![255; 40 * 20 * 4]));
+        let mut map = ImageMap::new();
+        map.insert("https://x.test/640.png".to_string(), bmp);
+        crate::images::set_viewport(1200.0);
+        let doc = parse_document(
+            "<body style='margin:0'><div style='position:relative;width:300px;height:150px'>\
+               <img src='https://x.test/2400.png' srcset='https://x.test/320.png 320w, https://x.test/640.png 640w, https://x.test/2400.png 2400w'\
+                    sizes='(max-width: 768px) 100vw, 640px' style='position:absolute;inset:0;width:100%;height:100%;object-fit:cover'>\
+             </div></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 1200.0).with_images(&map).build(&doc);
+        let pictures: Vec<Rect> = page.draws.iter().filter_map(|d| match d {
+            Draw::Image { rect, image: Some(_), .. } => Some(*rect),
+            _ => None,
+        }).collect();
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert_eq!((pictures[0].x, pictures[0].y, pictures[0].w, pictures[0].h), (0.0, 0.0, 300.0, 150.0));
     }
 
     #[test]

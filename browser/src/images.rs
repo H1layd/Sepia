@@ -582,3 +582,110 @@ pub mod tests {
         assert_eq!(out, vec![128, 128, 128, 255]);
     }
 }
+
+/// The viewport width responsive images are chosen for (set per page).
+static VIEWPORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1200);
+
+pub fn set_viewport(width: f32) {
+    VIEWPORT.store(width.max(1.0) as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The address an `<img>` shows, chosen as a browser does: from the
+/// `<source>`s of its `<picture>` (the first whose media matches and whose
+/// type this browser decodes), else its own srcset, else its src. With `w`
+/// descriptors the smallest candidate at least as wide as the slot `sizes`
+/// gives (at 1 device pixel per CSS pixel); with `x`, the 1x one.
+/// The page loader and the layout both ask this, so they agree on the key.
+pub fn chosen_src<'n>(img: &'n crate::dom::Node, parent: Option<&'n crate::dom::Node>) -> Option<&'n str> {
+    let viewport = VIEWPORT.load(std::sync::atomic::Ordering::Relaxed) as f32;
+    let sizes = img.attr("sizes");
+    if let Some(picture) = parent.filter(|p| p.tag == "picture") {
+        for source in picture.children.iter().filter(|c| c.tag == "source") {
+            let media_ok = source.attr("media").is_none_or(|m| crate::css::Media::parse(m).matches_viewport(viewport, 800.0));
+            let type_ok = source.attr("type").is_none_or(|t| decodable_type(t));
+            if media_ok && type_ok {
+                if let Some(pick) = source.attr("srcset").and_then(|set| pick_candidate(set, source.attr("sizes").or(sizes), viewport)) {
+                    return Some(pick);
+                }
+            }
+        }
+    }
+    if let Some(pick) = img.attr("srcset").and_then(|set| pick_candidate(set, sizes, viewport)) {
+        return Some(pick);
+    }
+    img.attr("src").map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Formats `decode` reads, by MIME type.
+fn decodable_type(mime: &str) -> bool {
+    matches!(mime.trim().to_ascii_lowercase().as_str(), "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "image/svg+xml" | "image/x-icon" | "image/vnd.microsoft.icon" | "")
+}
+
+fn pick_candidate<'a>(srcset: &'a str, sizes: Option<&str>, viewport: f32) -> Option<&'a str> {
+    // "url 640w, url 1280w" or "url 1x, url 2x" (commas inside URLs are rare;
+    // a candidate is split at ", " or a comma followed by its URL)
+    let mut candidates: Vec<(&str, Option<f32>, Option<f32>)> = Vec::new();
+    for part in srcset.split(',') {
+        let mut words = part.split_whitespace();
+        let Some(url) = words.next() else { continue };
+        let (mut w, mut x) = (None, None);
+        for d in words {
+            if let Some(n) = d.strip_suffix('w').and_then(|n| n.parse::<f32>().ok()) {
+                w = Some(n);
+            } else if let Some(n) = d.strip_suffix('x').and_then(|n| n.parse::<f32>().ok()) {
+                x = Some(n);
+            }
+        }
+        candidates.push((url, w, x));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.iter().any(|c| c.1.is_some()) {
+        let slot = slot_width(sizes, viewport);
+        let mut widths: Vec<(&str, f32)> = candidates.iter().filter_map(|c| c.1.map(|w| (c.0, w))).collect();
+        widths.sort_by(|a, b| a.1.total_cmp(&b.1));
+        return widths.iter().find(|c| c.1 >= slot).or(widths.last()).map(|c| c.0);
+    }
+    // density: the 1x candidate (no descriptor means 1x), else the smallest
+    candidates.iter().find(|c| c.2.unwrap_or(1.0) == 1.0).or_else(|| candidates.iter().min_by(|a, b| a.2.unwrap_or(1.0).total_cmp(&b.2.unwrap_or(1.0)))).map(|c| c.0)
+}
+
+/// The slot `sizes` gives at this viewport: the first entry whose media
+/// condition holds, its length in px (vw of the viewport); 100vw without one.
+fn slot_width(sizes: Option<&str>, viewport: f32) -> f32 {
+    let Some(sizes) = sizes else { return viewport };
+    for entry in crate::css::split_top_level(sizes, ',') {
+        let entry = entry.trim();
+        let (condition, length) = match entry.rfind(|c: char| c.is_whitespace()) {
+            Some(at) if entry.starts_with('(') => (Some(&entry[..at]), entry[at..].trim()),
+            _ => (None, entry),
+        };
+        if condition.is_some_and(|c| !crate::css::Media::parse(c).matches_viewport(viewport, 800.0)) {
+            continue;
+        }
+        if length == "auto" {
+            return viewport;
+        }
+        if let Some(px) = crate::style::parse_length(length, 16.0, viewport).or_else(|| length.strip_suffix("vw").and_then(|v| v.parse::<f32>().ok()).map(|v| v * viewport / 100.0)) {
+            return px;
+        }
+    }
+    viewport
+}
+
+#[cfg(test)]
+mod srcset_tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_candidate_a_browser_would() {
+        let set = "a-320.jpg 320w, a-640.jpg 640w, a-1280.jpg 1280w, a-2400.jpg 2400w";
+        assert_eq!(pick_candidate(set, Some("(max-width: 768px) 100vw, (max-width: 1180px) 50vw, 640px"), 1200.0), Some("a-640.jpg"));
+        assert_eq!(pick_candidate(set, Some("(max-width: 768px) 100vw, 50vw"), 1000.0), Some("a-640.jpg"));
+        assert_eq!(pick_candidate(set, None, 1200.0), Some("a-1280.jpg"));
+        assert_eq!(pick_candidate(set, Some("100px"), 1200.0), Some("a-320.jpg"));
+        assert_eq!(pick_candidate("b.jpg, b2.jpg 2x", None, 1200.0), Some("b.jpg"));
+        assert_eq!(pick_candidate("c2.jpg 2x, c1.jpg 1x", None, 1200.0), Some("c1.jpg"));
+    }
+}

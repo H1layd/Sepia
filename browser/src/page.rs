@@ -72,6 +72,7 @@ pub fn open(
     form: Option<&str>,
 ) -> Result<(Loaded, Option<Session>, Option<LateImages>), String> {
     let started = Instant::now();
+    images::set_viewport(width);
     let mut current = url.clone();
     let mut body = form.map(str::to_string);
     let mut visited = Vec::new();
@@ -197,21 +198,22 @@ fn worth_fetching(_node: &dom::Node, _url: &Url) -> bool {
 /// set, no Referer, no cookies), six at a time, within one overall budget.
 /// Returns the images and (found, loaded) counts.
 fn fetch_images(document: &dom::Node, base: &Url, how: &ImageFetch) -> (ImageMap, usize, usize) {
-    fn collect<'n>(node: &'n dom::Node, out: &mut Vec<(&'n str, &'n dom::Node)>) {
+    fn collect<'n>(node: &'n dom::Node, parent: Option<&'n dom::Node>, out: &mut Vec<(&'n str, &'n dom::Node)>) {
         if matches!(node.tag.as_str(), "template" | "noscript") { return; }
         if node.tag == "img" {
-            if let Some(src) = node.attr("src").map(str::trim).filter(|s| !s.is_empty()) {
+            // srcset / <picture>: the candidate a browser would load
+            if let Some(src) = images::chosen_src(node, parent) {
                 if !out.iter().any(|(s, _)| *s == src) {
                     out.push((src, node));
                 }
             }
         }
         for child in &node.children {
-            collect(child, out);
+            collect(child, Some(node), out);
         }
     }
     let mut sources = Vec::new();
-    collect(document, &mut sources);
+    collect(document, None, &mut sources);
     sources.truncate(MAX_IMAGES);
 
     let mut images = ImageMap::new();
