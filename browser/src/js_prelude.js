@@ -242,7 +242,7 @@
     get nodeName() { const t = __dom_tag(this.__sepiaNode); return t.startsWith('#') ? t : t.toUpperCase(); }
     get parentNode() { return wrap(__dom_parent(this.__sepiaNode)); }
     get parentElement() { const p = parentId(this.__sepiaNode); return p >= 0 && __dom_kind(p) === 1 ? wrap(p) : null; }
-    get childNodes() { return __dom_children(this.__sepiaNode).map(wrap); }
+    get childNodes() { return nodeList(__dom_children(this.__sepiaNode).map(wrap)); }
     get firstChild() { return wrap(__dom_children(this.__sepiaNode)[0] ?? -1); }
     get lastChild() { const c = __dom_children(this.__sepiaNode); return wrap(c[c.length - 1] ?? -1); }
     get nextSibling() { return siblingOf(this, 1, false); }
@@ -335,7 +335,7 @@
     constructor(data = '', handle) { super(handle === nodeHandle ? data : __dom_create_comment(String(data))); wrappers.set(this.__sepiaNode, this); }
   }
 
-  class ClassList {
+  class DOMTokenList {
     constructor(el, attr = 'class') { this.el = el; this.attr = attr; }
     get __list() { return (this.el.getAttribute(this.attr) || '').split(/\s+/).filter(Boolean); }
     __set(list) { this.el.setAttribute(this.attr, list.join(' ')); }
@@ -354,31 +354,84 @@
     toString() { return this.value; }
   }
 
+  // CSSOM's CSSStyleDeclaration: one interface for an element's inline
+  // style and getComputedStyle's answer; methods live on the prototype as in
+  // every browser, camelCase properties go through a proxy
+  const STYLE = Symbol('style');
+  const cssName = k => {
+    k = String(k);
+    if (k.startsWith('--')) return k;
+    if (k === 'cssFloat') return 'float';
+    if (/^(webkit|moz|ms|o)[A-Z]/.test(k)) k = '-' + k;
+    return k.replace(/[A-Z]/g, c => '-' + c.toLowerCase()).toLowerCase();
+  };
+  const splitImportant = v => { const m = /^(.*?)\s*!\s*important\s*$/i.exec(v); return m ? [m[1], 'important'] : [v, '']; };
+  class CSSStyleDeclaration {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    getPropertyValue(k) { const v = this[STYLE].get(cssName(k)); return v == null ? '' : splitImportant(v)[0]; }
+    getPropertyPriority(k) { const v = this[STYLE].get(cssName(k)); return v == null ? '' : splitImportant(v)[1]; }
+    setProperty(k, v, priority) {
+      const impl = this[STYLE];
+      if (!impl.write) throw new DOMException("Failed to execute 'setProperty' on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.", 'NoModificationAllowedError');
+      k = cssName(k); v = v == null ? '' : String(v).trim();
+      if (v === '') return void impl.remove(k);
+      impl.write(k, String(priority || '').toLowerCase() === 'important' ? v + ' !important' : v);
+    }
+    removeProperty(k) {
+      const impl = this[STYLE];
+      if (!impl.write) throw new DOMException("Failed to execute 'removeProperty' on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.", 'NoModificationAllowedError');
+      k = cssName(k); const old = this.getPropertyValue(k); impl.remove(k); return old;
+    }
+    item(i) { return this[STYLE].keys()[i >>> 0] ?? ''; }
+    get length() { return this[STYLE].keys().length; }
+    get cssText() { return this[STYLE].text(); }
+    set cssText(v) {
+      const impl = this[STYLE];
+      if (!impl.write) throw new DOMException("Failed to set the 'cssText' property on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.", 'NoModificationAllowedError');
+      impl.setText(String(v));
+    }
+    get cssFloat() { return this.getPropertyValue('float'); }
+    set cssFloat(v) { this.setProperty('float', v); }
+    get parentRule() { return null; }
+    get [Symbol.toStringTag]() { return 'CSSStyleDeclaration'; }
+    [Symbol.iterator]() { return this[STYLE].keys()[Symbol.iterator](); }
+  }
+  G.CSSStyleDeclaration = CSSStyleDeclaration;
+  const makeStyle = impl => {
+    const target = Object.create(CSSStyleDeclaration.prototype);
+    Object.defineProperty(target, STYLE, { value: impl });
+    return new Proxy(target, {
+      get(t, k, receiver) {
+        if (typeof k !== 'string' || k in t) return Reflect.get(t, k, receiver);
+        if (/^\d+$/.test(k)) return impl.keys()[+k];
+        return receiver.getPropertyValue(k);
+      },
+      set(t, k, v, receiver) {
+        if (typeof k !== 'string' || k in t) return Reflect.set(t, k, v, receiver);
+        if (!impl.write) return true;
+        receiver.setProperty(k, v);
+        return true;
+      },
+    });
+  };
+
   function styleObject(el) {
     const read = () => {
-      const out = {};
+      const out = new Map();
       for (const part of (el.getAttribute('style') || '').split(';')) {
         const i = part.indexOf(':');
-        if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+        if (i > 0) { const k = part.slice(0, i).trim(); out.set(k.startsWith('--') ? k : k.toLowerCase(), part.slice(i + 1).trim()); }
       }
       return out;
     };
-    const write = o => el.setAttribute('style', Object.entries(o).filter(([, v]) => v !== '' && v != null).map(([k, v]) => `${k}: ${v}`).join('; '));
-    const api = {
-      setProperty(k, v) { const o = read(); o[k] = v; write(o); },
-      removeProperty(k) { const o = read(); const v = o[k]; delete o[k]; write(o); return v || ''; },
-      getPropertyValue(k) { return read()[k] || ''; },
-    };
-    return new Proxy(api, {
-      get(t, k) {
-        if (k in t) return t[k];
-        if (k === 'cssText') return el.getAttribute('style') || '';
-        return typeof k === 'string' ? (read()[camelToKebab(k)] || '') : undefined;
-      },
-      set(t, k, v) {
-        if (k === 'cssText') { el.setAttribute('style', String(v)); return true; }
-        const o = read(); o[camelToKebab(String(k))] = v == null ? '' : String(v); write(o); return true;
-      },
+    const save = o => el.setAttribute('style', [...o].filter(([, v]) => v !== '' && v != null).map(([k, v]) => `${k}: ${v}`).join('; '));
+    return makeStyle({
+      get: k => read().get(k),
+      keys: () => [...read().keys()],
+      text: () => el.getAttribute('style') || '',
+      setText: v => el.setAttribute('style', v),
+      write: (k, v) => { const o = read(); o.set(k, v); save(o); },
+      remove: k => { const o = read(); if (o.delete(k)) save(o); },
     });
   }
 
@@ -392,8 +445,8 @@
     set id(v) { this.setAttribute('id', v); }
     get className() { return this.getAttribute('class') || ''; }
     set className(v) { this.setAttribute('class', v); }
-    get classList() { return new ClassList(this); }
-    get relList() { return new ClassList(this, 'rel'); }
+    get classList() { return new DOMTokenList(this); }
+    get relList() { return new DOMTokenList(this, 'rel'); }
     attachShadow(init = {}) {
       if (__dom_shadow(this.__sepiaNode) >= 0) throw new DOMException('Shadow root cannot be created on a host which already hosts a shadow tree.', 'NotSupportedError');
       const mode = init.mode === 'closed' ? 'closed' : 'open';
@@ -556,7 +609,7 @@
   // working), with the DOM's own prototype for instanceof and item()
   class NodeList extends Array { item(i) { return this[i] ?? null; } }
   class HTMLCollection extends Array { item(i) { return this[i] ?? null; } namedItem(n) { return this.find(e => e.id === n || e.getAttribute('name') === n) ?? null; } }
-  G.NodeList = NodeList; G.HTMLCollection = HTMLCollection;
+  G.NodeList = NodeList; G.HTMLCollection = HTMLCollection; G.DOMTokenList = DOMTokenList;
   function nodeList(arr) { Object.setPrototypeOf(arr, NodeList.prototype); return arr; }
   // the elements under a viewport point, topmost first (by layout boxes;
   // the later and deeper box wins, as paint order mostly is)
@@ -808,7 +861,7 @@
     get characterSet() { return 'UTF-8'; }
     get compatMode() { return 'CSS1Compat'; }
     get scrollingElement() { return this.documentElement; }
-    get fonts() { return { ready: Promise.resolve(), load: () => Promise.resolve([]), check: () => true, add() {}, forEach() {} }; }
+    get fonts() { return fontSet; }
     createElement(t) { return wrap(__dom_create(String(t))); }
     createElementNS(_, t) { return this.createElement(t); }
     createTextNode(t) { return wrap(__dom_create_text(String(t))); }
@@ -1930,23 +1983,7 @@
     else values.set('display', 'none');
     const inline = el.style;
     for (let i = 0; i < inline.length; i++) { const k = inline[i]; if (!values.has(k) || k.startsWith('--')) values.set(k, inline.getPropertyValue(k)); }
-    const kebab = k => k.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
-    const decl = {
-      getPropertyValue: k => { k = String(k); return values.get(k) ?? values.get(k.toLowerCase()) ?? ''; },
-      getPropertyPriority: () => '',
-      setProperty() { throw new DOMException('read-only', 'NoModificationAllowedError'); },
-      removeProperty() { throw new DOMException('read-only', 'NoModificationAllowedError'); },
-      item: i => [...values.keys()][i] || '',
-      get length() { return values.size; },
-      get cssText() { return ''; },
-    };
-    return new Proxy(decl, {
-      get(t, k) {
-        if (typeof k !== 'string' || k in t) return t[k];
-        if (/^\d+$/.test(k)) return [...values.keys()][+k];
-        return values.get(kebab(k)) ?? (k === 'cssFloat' ? values.get('float') : '') ?? '';
-      },
-    });
+    return makeStyle({ get: k => values.get(k), keys: () => [...values.keys()], text: () => '', write: null });
   };
   G.CSS = { escape: s => String(s).replace(/([^\w-])/g, '\\$1'), supports: (p, v) => { const t = String(v === undefined ? p : p + ':' + v).trim(); return !/^-(ms|o)-|^selector\(.*:has|^-webkit-box\b/i.test(t); } };
 
@@ -1989,7 +2026,30 @@
       toJSON() { return { brands, mobile: false, platform: h.platform }; },
     };
   }
-  G.screen = { width: 1280, height: 800, availWidth: 1280, availHeight: 800, colorDepth: 24, pixelDepth: 24, orientation: { type: 'landscape-primary', angle: 0 } };
+  G.screen = { width: 1280, height: 800, availWidth: 1280, availHeight: 800, availLeft: 0, availTop: 0, colorDepth: 24, pixelDepth: 24, isExtended: false, orientation: { type: 'landscape-primary', angle: 0 } };
+  // window's platform objects are instances of their interfaces, whose
+  // attributes are accessors on the prototype (WebIDL), not own properties
+  {
+    const iface = name => { const C = { [name]: function () { throw new TypeError('Illegal constructor'); } }[name]; G[name] = C; return C; };
+    const onPrototype = (name, plain) => {
+      const proto = iface(name).prototype;
+      for (const k of Reflect.ownKeys(plain)) {
+        const d = Object.getOwnPropertyDescriptor(plain, k);
+        if (typeof d.value === 'function') Object.defineProperty(proto, k, { value: d.value, writable: true, enumerable: true, configurable: true });
+        else if (d.get || d.set) Object.defineProperty(proto, k, { get: d.get, set: d.set, enumerable: true, configurable: true });
+        else { const v = d.value; Object.defineProperty(proto, k, { get() { return v; }, enumerable: true, configurable: true }); }
+      }
+      Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true });
+      return Object.create(proto);
+    };
+    G.navigator = onPrototype('Navigator', G.navigator);
+    G.screen = onPrototype('Screen', G.screen);
+    for (const [name, obj] of [['Location', location], ['History', history]]) {
+      const proto = iface(name).prototype;
+      Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true });
+      Object.setPrototypeOf(obj, proto);
+    }
+  }
   G.devicePixelRatio = 1;
   G.innerWidth = G.outerWidth = G.__viewport ? G.__viewport[0] : 1024;
   G.innerHeight = G.outerHeight = G.__viewport ? G.__viewport[1] : 800;
@@ -2039,7 +2099,8 @@
     class PerformanceNavigationTiming extends PerformanceResourceTiming {}
     class PerformanceMark extends PerformanceEntry {}
     class PerformanceMeasure extends PerformanceEntry {}
-    Object.assign(G, { PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming, PerformanceMark, PerformanceMeasure });
+    class PerformanceEventTiming extends PerformanceEntry {}
+    Object.assign(G, { PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming, PerformanceMark, PerformanceMeasure, PerformanceEventTiming });
     G.performance.__nav = { name: location.href, entryType: 'navigation', startTime: 0, duration: 0, type: 'navigate', redirectCount: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: 0, transferSize: 0, toJSON() { return this; } };
     Object.setPrototypeOf(G.performance.__nav, PerformanceNavigationTiming.prototype);
   }
@@ -2462,7 +2523,32 @@
     G.caches = new CacheStorage();
   }
   G.BroadcastChannel = class BroadcastChannel extends EventTarget { constructor(name) { super(); this.name = name; } postMessage() {} close() {} };
-  G.MessageChannel = class MessageChannel { constructor() { const a = new EventTarget(), b = new EventTarget(); a.postMessage = d => setTimeout(() => { b.dispatchEvent(Object.assign(new Event('message'), { data: d })); }, 0); b.postMessage = d => setTimeout(() => { a.dispatchEvent(Object.assign(new Event('message'), { data: d })); }, 0); a.start = b.start = a.close = b.close = () => {}; this.port1 = a; this.port2 = b; } };
+  // MessageChannel's two ends: what one posts, the other's 'message' gets
+  class MessagePort extends EventTarget {
+    postMessage(data) { const to = this.__other; if (!to || this.__closed) return; setTimeout(() => { if (!to.__closed) { const e = new MessageEvent('message', { data }); to.dispatchEvent(e); } }, 0); }
+    start() {}
+    close() { this.__closed = true; }
+  }
+  G.MessagePort = MessagePort;
+  // CSS Font Loading: faces a page builds in script count as loaded (the
+  // engine draws with the fonts its own stylesheets bring)
+  class FontFace {
+    constructor(family, source, descriptors = {}) {
+      Object.assign(this, { family: String(family), style: descriptors.style || 'normal', weight: String(descriptors.weight || 'normal'), stretch: descriptors.stretch || 'normal', unicodeRange: descriptors.unicodeRange || 'U+0-10FFFF', variant: 'normal', featureSettings: 'normal', display: descriptors.display || 'auto', status: 'unloaded' });
+      this.loaded = new Promise(resolve => { this.__resolve = resolve; });
+    }
+    load() { this.status = 'loaded'; this.__resolve(this); return this.loaded; }
+  }
+  G.FontFace = FontFace;
+  const fontSet = Object.assign(new EventTarget(), {
+    __faces: new Set(), status: 'loaded', ready: Promise.resolve(),
+    add(f) { this.__faces.add(f); return this; }, delete(f) { return this.__faces.delete(f); }, clear() { this.__faces.clear(); }, has(f) { return this.__faces.has(f); },
+    load: () => Promise.resolve([]), check: () => true,
+    forEach(fn, self) { this.__faces.forEach(f => fn.call(self, f, f, this)); }, get size() { return this.__faces.size; },
+    values() { return this.__faces.values(); }, [Symbol.iterator]() { return this.__faces.values(); },
+  });
+  fontSet.ready = Promise.resolve(fontSet);
+  G.MessageChannel = class MessageChannel { constructor() { const a = new MessagePort(), b = new MessagePort(); a.__other = b; b.__other = a; this.port1 = a; this.port2 = b; } };
   G.postMessage = (data) => setTimeout(() => { const e = new Event('message'); e.data = data; e.origin = location.origin; e.source = G; G.dispatchEvent(e); }, 0);
   G.WeakRef = G.WeakRef || class WeakRef { constructor(t) { this.t = t; } deref() { return this.t; } };
   G.FinalizationRegistry = G.FinalizationRegistry || class FinalizationRegistry { register() {} unregister() {} };
