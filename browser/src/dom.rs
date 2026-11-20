@@ -1,6 +1,5 @@
 //! Document tree built from tokens, with the forgiving bits real HTML needs.
 
-use crate::html::{is_void, tokenize, Token};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
@@ -68,87 +67,89 @@ impl Node {
     }
 }
 
-/// Tags that implicitly close an open element of the same kind.
-fn implicit_close(open: &str, new_tag: &str) -> bool {
-    match (open, new_tag) {
-        ("p", "p") => true,
-        ("li", "li") => true,
-        ("td", "td") | ("td", "th") | ("th", "td") | ("th", "th") => true,
-        ("option", "option") => true,
-        (open, new) if open.starts_with('h') && open.len() == 2 && new.starts_with('h') => true,
-        _ => false,
-    }
-}
-
+/// Parse a whole document with the HTML standard's tree construction
+/// (html5ever, Servo's parser): misnested and unclosed tags, tables and
+/// what is foster-parented out of them, implied html/head/body, raw text
+/// in script/style/textarea, entities, `<template>` contents — as every
+/// browser builds the same tree from the same bytes.
 pub fn parse_document(source: &str) -> Node {
-    let tokens = tokenize(source);
+    use html5ever::tendril::TendrilSink;
+    let dom = html5ever::parse_document(markup5ever_rcdom::RcDom::default(), Default::default()).one(source);
     let mut root = Node::element("#document");
-    let mut stack: Vec<Node> = Vec::new();
-
-    fn append(stack: &mut Vec<Node>, root: &mut Node, node: Node) {
-        match stack.last_mut() {
-            Some(parent) => parent.children.push(node),
-            None => root.children.push(node),
+    for child in dom.document.children.borrow().iter() {
+        if let Some(node) = convert(child) {
+            root.children.push(node);
         }
-    }
-
-    for token in tokens {
-        match token {
-            Token::StartTag { name, attrs, self_closing } => {
-                // A block start closes an open paragraph, including its inline
-                // descendants. Without this recovery later sections become
-                // children of links/emphasis and inherit the wrong geometry.
-                if matches!(name.as_str(), "address" | "article" | "aside" | "blockquote"
-                    | "details" | "div" | "dl" | "fieldset" | "figcaption" | "figure"
-                    | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "header" | "hgroup" | "hr" | "main" | "menu" | "nav" | "ol"
-                    | "p" | "pre" | "section" | "table" | "ul") {
-                    let in_scope = stack.iter().rposition(|n| matches!(n.tag.as_str(), "p" | "table" | "td" | "th" | "button" | "html"));
-                    if let Some(at) = in_scope.filter(|&at| stack[at].tag == "p") {
-                        while stack.len() > at {
-                            let node = stack.pop().unwrap();
-                            append(&mut stack, &mut root, node);
-                        }
-                    }
-                }
-                if let Some(top) = stack.last() {
-                    if implicit_close(&top.tag, &name) {
-                        if let Some(node) = stack.pop() {
-                            append(&mut stack, &mut root, node);
-                        }
-                    }
-                }
-                let mut node = Node::element(&name);
-                node.attrs = attrs;
-                if self_closing || is_void(&name) {
-                    append(&mut stack, &mut root, node);
-                } else {
-                    stack.push(node);
-                }
-            }
-            Token::EndTag { name } => {
-                // Close the nearest matching element; drop unmatched end tags.
-                if let Some(position) = stack.iter().rposition(|n| n.tag == name) {
-                    while stack.len() > position {
-                        if let Some(node) = stack.pop() {
-                            append(&mut stack, &mut root, node);
-                        }
-                    }
-                }
-            }
-            Token::Text(text) => {
-                if !text.is_empty() {
-                    append(&mut stack, &mut root, Node::text_node(&text));
-                }
-            }
-            Token::Comment(data) => append(&mut stack, &mut root, Node::comment_node(&data)),
-            Token::Doctype(_) => {}
-        }
-    }
-    while let Some(node) = stack.pop() {
-        append(&mut stack, &mut root, node);
     }
     root
+}
+
+/// Parse markup set as an element's innerHTML: the fragment algorithm with
+/// that element as context (`<tr>` inside a `<tbody>` stays a row).
+pub fn parse_fragment(source: &str, context: &str) -> Vec<Node> {
+    use html5ever::tendril::TendrilSink;
+    use html5ever::{ns, LocalName, QualName};
+    let context = if context.is_empty() || context.starts_with('#') { "body" } else { context };
+    let name = QualName::new(None, ns!(html), LocalName::from(context));
+    let dom = html5ever::parse_fragment(markup5ever_rcdom::RcDom::default(), Default::default(), name, Vec::new(), true).one(source);
+    // the fragment parser puts its result under one <html> element
+    let document = dom.document.children.borrow();
+    let mut out = Vec::new();
+    for top in document.iter() {
+        let is_html = matches!(&top.data, markup5ever_rcdom::NodeData::Element { name, .. } if &*name.local == "html");
+        if is_html {
+            for child in top.children.borrow().iter() {
+                out.extend(convert(child));
+            }
+        } else {
+            out.extend(convert(top));
+        }
+    }
+    out
+}
+
+/// One html5ever node as ours: names lowercased (the engine's convention),
+/// namespaced attributes as `xlink:href`, template contents as children.
+fn convert(handle: &markup5ever_rcdom::Handle) -> Option<Node> {
+    use markup5ever_rcdom::NodeData;
+    match &handle.data {
+        NodeData::Text { contents } => Some(Node::text_node(&contents.borrow())),
+        NodeData::Comment { contents } => Some(Node::comment_node(contents)),
+        NodeData::Element { name, attrs, template_contents, .. } => {
+            let mut node = Node::element(&name.local.to_ascii_lowercase().to_string());
+            node.attrs = attrs
+                .borrow()
+                .iter()
+                .map(|a| {
+                    let local = a.name.local.to_ascii_lowercase().to_string();
+                    let key = match a.name.prefix.as_deref() {
+                        Some(prefix) => format!("{prefix}:{local}"),
+                        None => local,
+                    };
+                    (key, a.value.to_string())
+                })
+                .collect();
+            let contents = template_contents.borrow();
+            let children = match contents.as_ref() {
+                Some(fragment) => fragment.children.borrow().clone(),
+                None => handle.children.borrow().clone(),
+            };
+            for child in children.iter() {
+                if let Some(c) = convert(child) {
+                    node.children.push(c);
+                }
+            }
+            Some(node)
+        }
+        NodeData::Document => {
+            let mut node = Node::element("#document");
+            for child in handle.children.borrow().iter() {
+                node.children.extend(convert(child));
+            }
+            Some(node)
+        }
+        NodeData::Doctype { .. } | NodeData::ProcessingInstruction { .. } => None,
+    }
 }
 
 /// A page as the HTML parser leaves it in a browser: one `<html>` holding a
@@ -223,7 +224,6 @@ pub fn complete_document(mut doc: Node) -> Node {
 }
 
 /// Body content, or the whole document when there is no body element.
-#[allow(dead_code)] // kept for callers outside the engine
 pub fn body(document: &Node) -> &Node {
     document.find_first("body").unwrap_or(document)
 }
@@ -231,6 +231,41 @@ pub fn body(document: &Node) -> &Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_the_tree_the_html_standard_does() {
+        // text and cells outside a table's cells are foster-parented before it
+        let doc = parse_document("<table>stray<tr><td>cell</td></tr></table>");
+        let b = body(&doc);
+        assert_eq!(b.children[0].text.as_deref(), Some("stray"));
+        assert_eq!(b.children[1].tag, "table");
+        assert_eq!(b.children[1].find_first("tbody").map(|t| t.text_content()), Some("cell".into()));
+        // misnested formatting: the adoption agency algorithm
+        let doc = parse_document("<p><b>bold <i>both</b> italic</i></p>");
+        let p = body(&doc).find_first("p").unwrap();
+        assert_eq!(p.children[0].tag, "b");
+        assert_eq!(p.children[1].tag, "i");
+        assert_eq!(p.children[1].text_content(), " italic");
+        // entities, including ones without a semicolon
+        let doc = parse_document("<p>&copy; &amp;&nbsp;&#x41;&#66; &notit;</p>");
+        assert_eq!(body(&doc).find_first("p").unwrap().text_content(), "© &\u{a0}AB ¬it;");
+        // template contents stay with the template
+        let doc = parse_document("<template id=t><li>a</li></template>");
+        assert_eq!(doc.find_first("template").unwrap().children[0].tag, "li");
+        // raw text: markup inside <textarea> and <title> is text
+        let doc = parse_document("<title>a <b>b</b></title><textarea><p>x</p></textarea>");
+        assert_eq!(doc.find_first("title").unwrap().text_content(), "a <b>b</b>");
+        assert_eq!(doc.find_first("textarea").unwrap().text_content(), "<p>x</p>");
+    }
+
+    #[test]
+    fn inner_html_is_parsed_in_its_element() {
+        // rows set into a <tbody> stay rows (a document parse would drop them)
+        let rows = parse_fragment("<tr><td>1</td></tr><tr><td>2</td></tr>", "tbody");
+        assert_eq!(rows.iter().filter(|n| n.tag == "tr").count(), 2);
+        let items = parse_fragment("<li>a<li>b", "ul");
+        assert_eq!(items.iter().filter(|n| n.tag == "li").count(), 2);
+    }
 
     #[test]
     fn documents_get_html_head_and_body() {
@@ -257,7 +292,7 @@ mod tests {
     #[test]
     fn closes_paragraphs_implicitly() {
         let doc = parse_document("<p>one<p>two");
-        let paragraphs: Vec<&Node> = doc.children.iter().filter(|n| n.tag == "p").collect();
+        let paragraphs: Vec<&Node> = body(&doc).children.iter().filter(|n| n.tag == "p").collect();
         assert_eq!(paragraphs.len(), 2);
         assert_eq!(paragraphs[0].text_content(), "one");
     }
@@ -265,12 +300,13 @@ mod tests {
     #[test]
     fn block_starts_close_paragraphs_through_inline_descendants() {
         let doc = parse_document("<p><em>intro<div>section</div><p>end");
-        assert_eq!(doc.children.len(), 3);
-        assert_eq!(doc.children[0].tag, "p");
-        assert_eq!(doc.children[0].text_content(), "intro");
-        assert_eq!(doc.children[1].tag, "div");
-        assert_eq!(doc.children[1].text_content(), "section");
-        assert_eq!(doc.children[2].text_content(), "end");
+        let b = body(&doc);
+        assert_eq!(b.children.len(), 3);
+        assert_eq!(b.children[0].tag, "p");
+        assert_eq!(b.children[0].text_content(), "intro");
+        assert_eq!(b.children[1].tag, "div");
+        assert_eq!(b.children[1].text_content(), "section");
+        assert_eq!(b.children[2].text_content(), "end");
     }
 
     #[test]

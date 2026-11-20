@@ -2523,7 +2523,8 @@ mod tests {
     fn closed_details_show_only_the_summary() {
         let doc = parse_document("<details><summary>s</summary><p>hidden</p></details><details open><summary>t</summary><p>shown</p></details>");
         let sheet = Stylesheet::default();
-        let ds: Vec<&Node> = doc.children.iter().filter(|n| n.tag == "details").collect();
+        let body_node = crate::dom::body(&doc);
+        let ds: Vec<&Node> = body_node.children.iter().filter(|n| n.tag == "details").collect();
         let p0 = ds[0].find_first("p").unwrap();
         let p1 = ds[1].find_first("p").unwrap();
         let body = default_style("body");

@@ -5018,7 +5018,7 @@ mod tests {
         assert_eq!(color_of_beta(&before), Color::rgb(0, 0, 255));
         // Keep the second node and all ancestor addresses in place. Only a
         // sibling changes, which affects :first-child on the unchanged node.
-        let body = &mut doc.children[0].children[0];
+        let body = &mut doc.children[0].children[1];
         body.children[0].children[0] = Node::text_node(" ");
         let after = Layout::new(&fonts, &sheet, 800.0).build(&doc);
         assert_eq!(color_of_beta(&after), Color::rgb(255, 0, 0));

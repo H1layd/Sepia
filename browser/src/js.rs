@@ -253,10 +253,10 @@ impl Dom {
         for c in std::mem::take(&mut self.nodes[id].children) {
             self.nodes[c].parent = None;
         }
-        let parsed = dom::parse_document(html);
-        // parse_document may wrap a fragment in html/body
-        let source = parsed.find_first("body").filter(|_| !html.to_ascii_lowercase().contains("<body")).unwrap_or(&parsed);
-        for child in &source.children {
+        // the fragment parser, with this element as its context
+        let context = self.nodes[id].tag.clone();
+        let parsed = dom::parse_fragment(html, &context);
+        for child in &parsed {
             let c = self.adopt(child, None);
             self.insert(id, c, None);
         }
