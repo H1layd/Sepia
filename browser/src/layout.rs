@@ -158,6 +158,18 @@ pub struct Page {
     pub boxes: Vec<(Rect, usize)>,
     /// `id` (and `<a name>`) of block boxes with their top: where `#fragment` scrolls
     pub anchors: Vec<(String, f32)>,
+    /// positioned boxes and the draws each made, for paint order (z-index)
+    pub layers: Vec<Layer>,
+}
+
+/// A positioned box's draws `start..end` and its z-index (None: auto).
+/// Positioned boxes paint after the flow around them, ordered by z-index
+/// within their stacking context (`stack`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer {
+    pub start: usize,
+    pub end: usize,
+    pub z: Option<i32>,
 }
 
 pub struct Fonts {
@@ -473,6 +485,11 @@ impl<'a> Layout<'a> {
         // a dark used scheme on the root darkens the canvas, as browsers do
         let dark_root = html_style.as_ref().map_or(body_style.dark, |h| h.dark);
         self.page.background = canvas.0.or_else(|| dark_root.then(|| Color::rgb(18, 18, 18)));
+        if !self.page.layers.is_empty() {
+            let draws = std::mem::take(&mut self.page.draws);
+            self.page.draws = stack(draws, &self.page.layers);
+            self.page.layers.clear();
+        }
         if let Some(gradient) = canvas.1 {
             let rect = Rect { x: 0.0, y: 0.0, w: self.viewport_width, h: self.page.height };
             self.page.draws.insert(0, Draw::Fill { rect, radius: 0.0, color: None, gradient: Some(gradient) });
@@ -865,6 +882,9 @@ impl<'a> Layout<'a> {
                 let (d, l, bx) = (self.page.draws.len(), self.page.links.len(), self.page.boxes.len());
                 self.shift(first_draw..d, first_link..l, first_box..bx, dx, dy);
             }
+        }
+        if style.position != crate::style::Position::Static && self.page.draws.len() > first_draw {
+            self.page.layers.push(Layer { start: first_draw, end: self.page.draws.len(), z: style.z_index });
         }
         self.last_margin_bottom = margin_bottom;
         total + margin.top + margin_bottom
@@ -1464,6 +1484,7 @@ impl<'a> Layout<'a> {
                 if let Some(atom) = &img.atom {
                     let (page, atom_baseline) = (&atom.0, atom.1);
                     let (dx, dy) = (pen_x, baseline - raise(item, img.h, atom_baseline));
+                    self.adopt_layers(&page.layers);
                     for draw in &page.draws {
                         let mut draw = draw.clone();
                         translate(&mut draw, dx, dy);
@@ -1673,6 +1694,90 @@ fn tinted_mask(bitmap: &Arc<crate::images::Bitmap>, color: Color) -> Arc<crate::
     TINTED.with(|t| {
         t.borrow_mut().entry(key).or_insert_with(|| Arc::new(bitmap.tinted(key.1))).clone()
     })
+}
+
+/// Paint order by CSS stacking: inside each stacking context (the page, or
+/// a positioned box with a z-index) its own background first, then its
+/// children with negative z-index, then the flow (blocks, floats, inline
+/// content), then positioned children with z-index auto or 0 in document
+/// order, then positive z-index ascending. A positioned box with
+/// z-index auto is painted as one piece at level 0 (its z-indexed
+/// descendants stay inside it: close to CSS, which would lift them out).
+fn stack(draws: Vec<Draw>, layers: &[Layer]) -> Vec<Draw> {
+    // the layers as a tree: outer ranges first, each child inside its parent
+    let mut sorted: Vec<Layer> = layers.iter().copied().filter(|l| l.end > l.start && l.end <= draws.len()).collect();
+    sorted.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    struct Tree {
+        layer: Layer,
+        children: Vec<usize>,
+    }
+    let mut nodes: Vec<Tree> = Vec::with_capacity(sorted.len());
+    let mut roots: Vec<usize> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for layer in sorted {
+        while let Some(&top) = open.last() {
+            if layer.start >= nodes[top].layer.end {
+                open.pop();
+            } else {
+                break;
+            }
+        }
+        // a range that only overlaps (never expected) is left in the flow
+        if let Some(&top) = open.last() {
+            if layer.end > nodes[top].layer.end {
+                continue;
+            }
+        }
+        let index = nodes.len();
+        nodes.push(Tree { layer, children: Vec::new() });
+        match open.last() {
+            Some(&top) => nodes[top].children.push(index),
+            None => roots.push(index),
+        }
+        open.push(index);
+    }
+    fn order(draws: &[Draw], nodes: &[Tree], start: usize, end: usize, children: &[usize], out: &mut Vec<usize>) {
+        // the context's own background: the fills and shadows it starts with
+        let first_child = children.first().map_or(end, |&c| nodes[c].layer.start);
+        let mut lead = start;
+        while lead < first_child && matches!(draws[lead], Draw::Fill { .. } | Draw::Shadow { .. }) {
+            lead += 1;
+        }
+        out.extend(start..lead);
+        let level = |c: &usize| nodes[*c].layer.z.unwrap_or(0);
+        let mut negative: Vec<usize> = children.iter().copied().filter(|c| level(c) < 0).collect();
+        negative.sort_by_key(level);
+        let mut positive: Vec<usize> = children.iter().copied().filter(|c| level(c) > 0).collect();
+        positive.sort_by_key(level);
+        let zero: Vec<usize> = children.iter().copied().filter(|c| level(c) == 0).collect();
+        let place = |c: usize, out: &mut Vec<usize>| {
+            let n = &nodes[c];
+            order(draws, nodes, n.layer.start, n.layer.end, &n.children, out);
+        };
+        for &c in &negative {
+            place(c, out);
+        }
+        // the flow: everything here outside the positioned children
+        let mut at = lead;
+        for &c in children {
+            let l = nodes[c].layer;
+            if l.start > at {
+                out.extend(at..l.start);
+            }
+            at = at.max(l.end);
+        }
+        if at < end {
+            out.extend(at..end);
+        }
+        for &c in zero.iter().chain(positive.iter()) {
+            place(c, out);
+        }
+    }
+    let mut out = Vec::with_capacity(draws.len());
+    order(&draws, &nodes, 0, draws.len(), &roots, &mut out);
+    debug_assert_eq!(out.len(), draws.len());
+    let mut slots: Vec<Option<Draw>> = draws.into_iter().map(Some).collect();
+    out.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
 /// A replaced element's picture placed in its box by object-fit and
@@ -1917,6 +2022,7 @@ impl<'a> Layout<'a> {
 
     /// Put a sub-layout's page (laid out at the origin) at (x, y) on this one.
     fn append_page(&mut self, sub: Page, x: f32, y: f32) {
+        self.adopt_layers(&sub.layers);
         self.page.draws.extend(sub.draws.into_iter().map(|mut draw| {
             translate(&mut draw, x, y);
             draw
@@ -2339,6 +2445,7 @@ impl<'a> Layout<'a> {
             };
             let dx = cx + cell.border + cell.pad.left;
             let dy = cy + cell.border + cell.pad.top + shift;
+            self.adopt_layers(&page.layers);
             for mut draw in page.draws {
                 translate(&mut draw, dx, dy);
                 self.page.draws.push(draw);
@@ -2468,10 +2575,17 @@ impl<'a> Layout<'a> {
         out
     }
 
+    /// A sub-page's layers, about to be appended to this page's draws.
+    fn adopt_layers(&mut self, layers: &[Layer]) {
+        let at = self.page.draws.len();
+        self.page.layers.extend(layers.iter().map(|l| Layer { start: l.start + at, end: l.end + at, z: l.z }));
+    }
+
     fn paste(&mut self, page: Page, dx: f32, dy: f32) {
         if page.content_right > 0.0 {
             self.page.content_right = self.page.content_right.max(page.content_right + dx);
         }
+        self.adopt_layers(&page.layers);
         for mut draw in page.draws {
             translate(&mut draw, dx, dy);
             self.page.draws.push(draw);
@@ -4052,6 +4166,27 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(below > 60.0 && below < 85.0, "text starts under the tallest float: {below}");
+    }
+
+    #[test]
+    fn z_index_orders_paint_within_stacking_contexts() {
+        let doc = parse_document(
+            "<body style='margin:0;position:relative'>\
+               <div style='position:absolute;top:0;left:0;width:50px;height:50px;background:red;z-index:2'></div>\
+               <div style='position:absolute;top:0;left:0;width:50px;height:50px;background:blue;z-index:1'></div>\
+               <div style='position:absolute;top:60px;left:0;width:50px;height:50px;background:green'></div>\
+               <div style='height:200px;background:yellow'></div>\
+               <div style='position:absolute;top:0;left:0;width:10px;height:10px;background:black;z-index:-1'></div>\
+             </body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 400.0).build(&doc);
+        let at = |c: Color| page.draws.iter().position(|d| matches!(d, Draw::Fill { color: Some(col), .. } if *col == c)).unwrap();
+        let (red, blue, green, yellow, black) = (at(Color::rgb(255, 0, 0)), at(Color::rgb(0, 0, 255)), at(Color::rgb(0, 128, 0)), at(Color::rgb(255, 255, 0)), at(Color::rgb(0, 0, 0)));
+        assert!(black < yellow, "negative z under the flow");
+        assert!(yellow < green, "positioned (z auto) over the flow that follows it");
+        assert!(green < blue && blue < red, "then z-index 1, then 2, whatever the source order");
     }
 
     #[test]

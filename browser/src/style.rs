@@ -280,6 +280,8 @@ pub struct Style {
     /// This box or an ancestor has zero opacity (descendants cannot undo it).
     pub transparent: bool,
     pub position: Position,
+    /// z-index (None: auto)
+    pub z_index: Option<i32>,
     pub left: Option<f32>,
     pub top: Option<f32>,
     pub right: Option<f32>,
@@ -377,6 +379,7 @@ impl Default for Style {
             opacity: 1.0,
             transparent: false,
             position: Position::Static,
+            z_index: None,
             left: None,
             top: None,
             right: None,
@@ -1771,6 +1774,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 _ => Position::Static,
             }
         }
+        "z-index" => style.z_index = value.trim().parse::<i32>().ok(),
         "left" => style.left = parse_length(value, font_size, containing_width),
         "right" => style.right = parse_length(value, font_size, containing_width),
         "overflow" => {
