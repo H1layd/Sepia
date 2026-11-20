@@ -234,173 +234,32 @@ pub struct Declaration {
     pub important: bool,
 }
 
+/// A selector, parsed and matched by the `selectors` crate (selector.rs):
+/// the whole of Selectors Level 4 as Servo and Firefox implement it.
 #[derive(Debug, Clone, PartialEq)]
-pub enum AttrOp {
-    Exists,
-    Equals,
-    /// ~= whitespace-separated list contains
-    Includes,
-    /// |= equals or starts with value-
-    Dash,
-    Prefix,
-    Suffix,
-    Substring,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AttrSelector {
-    pub name: String,
-    pub op: AttrOp,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Pseudo {
-    Root,
-    FirstChild,
-    LastChild,
-    OnlyChild,
-    FirstOfType,
-    LastOfType,
-    Empty,
-    /// :nth-child(an+b); `last` counts from the end
-    Nth { a: i32, b: i32, last: bool, of_type: bool },
-    /// :not(list)
-    Not(Vec<Compound>),
-    /// :is / :where / :matches (list); `zero` = :where (no specificity)
-    Is(Vec<Compound>, bool),
-    /// :link / :any-link: an element with href
-    Link,
-    Disabled,
-    Enabled,
-    Checked,
-    /// interaction states and pseudo-elements: a static page never matches them
-    Never,
-}
-
-/// One compound selector: `div.card#main[href]:first-child`.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Compound {
-    pub tag: Option<String>,
-    pub id: Option<String>,
-    pub classes: Vec<String>,
-    pub attrs: Vec<AttrSelector>,
-    pub pseudos: Vec<Pseudo>,
-    /// `::before` (1) or `::after` (2): the rule styles that generated box
-    pub pseudo_element: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Combinator {
-    Descendant,
-    Child,
-    Adjacent,
-    Sibling,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Selector {
-    /// Compounds outermost first; `links[i]` joins `chain[i]` to `chain[i + 1]`.
-    pub chain: Vec<Compound>,
-    pub links: Vec<Combinator>,
-}
-
-impl Compound {
-    fn specificity(&self) -> (u32, u32, u32) {
-        let mut s = (self.id.is_some() as u32, (self.classes.len() + self.attrs.len()) as u32, self.tag.is_some() as u32);
-        for pseudo in &self.pseudos {
-            match pseudo {
-                Pseudo::Not(list) | Pseudo::Is(list, false) => {
-                    let best = list.iter().map(|c| c.specificity()).max().unwrap_or((0, 0, 0));
-                    s = (s.0 + best.0, s.1 + best.1, s.2 + best.2);
-                }
-                Pseudo::Is(_, true) => {}
-                _ => s.1 += 1,
-            }
-        }
-        s
-    }
-}
+pub struct Selector(pub crate::selector::Parsed);
 
 impl Selector {
+    /// One selector (a list of one); None if invalid.
     pub fn parse(text: &str) -> Option<Selector> {
-        let mut chain = Vec::new();
-        let mut links = Vec::new();
-        let mut pending: Option<Combinator> = None;
-        for token in split_selector(text.trim())? {
-            match token.as_str() {
-                ">" => pending = Some(Combinator::Child),
-                "+" => pending = Some(Combinator::Adjacent),
-                "~" => pending = Some(Combinator::Sibling),
-                compound => {
-                    if !chain.is_empty() {
-                        links.push(pending.take().unwrap_or(Combinator::Descendant));
-                    } else if pending.is_some() {
-                        return None; // leading combinator
-                    }
-                    chain.push(parse_compound(compound)?);
-                }
-            }
-        }
-        if chain.is_empty() || pending.is_some() {
-            return None;
-        }
-        Some(Selector { chain, links })
+        let mut list = Selector::parse_list(text)?;
+        (list.len() == 1).then(|| list.remove(0))
     }
 
-    /// ids × 100 + classes/attributes/pseudo-classes × 10 + types.
+    /// A selector list, as a style rule's prelude: one invalid selector
+    /// makes the whole list invalid (the rule is dropped), as in browsers.
+    pub fn parse_list(text: &str) -> Option<Vec<Selector>> {
+        Some(crate::selector::parse_list(text)?.into_iter().map(Selector).collect())
+    }
+
     pub fn specificity(&self) -> u32 {
-        let (a, b, c) = self.chain.iter().fold((0, 0, 0), |acc, part| {
-            let s = part.specificity();
-            (acc.0 + s.0, acc.1 + s.1, acc.2 + s.2)
-        });
-        a * 100 + b * 10 + c
+        self.0.selector.specificity()
     }
-}
 
-/// Split a complex selector into compounds and combinators, keeping
-/// brackets and parentheses whole.
-fn split_selector(text: &str) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    let flush = |current: &mut String, out: &mut Vec<String>| {
-        if !current.is_empty() {
-            out.push(std::mem::take(current));
-        }
-    };
-    for ch in text.chars() {
-        if let Some(q) = quote {
-            current.push(ch);
-            if ch == q {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => {
-                quote = Some(ch);
-                current.push(ch);
-            }
-            '(' | '[' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' | ']' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            '>' | '+' | '~' if depth == 0 => {
-                flush(&mut current, &mut out);
-                out.push(ch.to_string());
-            }
-            c if c.is_whitespace() && depth == 0 => flush(&mut current, &mut out),
-            c => current.push(c),
-        }
+    /// 0 for an element; 1 ::before, 2 ::after; 3 a part this engine never draws
+    pub fn pseudo_element(&self) -> u8 {
+        self.0.pseudo_element
     }
-    flush(&mut current, &mut out);
-    (depth == 0).then_some(out)
 }
 
 pub fn split_top_level(text: &str, sep: char) -> Vec<String> {
@@ -436,168 +295,6 @@ pub fn split_top_level(text: &str, sep: char) -> Vec<String> {
     out.push(current);
     out
 }
-
-fn ident_end(chars: &[char], mut i: usize) -> usize {
-    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_' || chars[i] == '\\' || !chars[i].is_ascii()) {
-        if chars[i] == '\\' {
-            i += 1;
-        }
-        i += 1;
-    }
-    i.min(chars.len())
-}
-
-fn unescape(s: &str) -> String {
-    s.replace('\\', "")
-}
-
-fn parse_compound(text: &str) -> Option<Compound> {
-    if text.trim().is_empty() { return None; }
-    let chars: Vec<char> = text.chars().collect();
-    let mut compound = Compound::default();
-    let mut i = 0;
-    if i < chars.len() && chars[i] == '*' {
-        i += 1;
-    } else if i < chars.len() && (chars[i].is_alphabetic() || chars[i] == '_') {
-        let end = ident_end(&chars, i);
-        compound.tag = Some(chars[i..end].iter().collect::<String>().to_ascii_lowercase());
-        i = end;
-    }
-    while i < chars.len() {
-        match chars[i] {
-            '.' => {
-                let end = ident_end(&chars, i + 1);
-                if end == i + 1 {
-                    return None;
-                }
-                compound.classes.push(unescape(&chars[i + 1..end].iter().collect::<String>()));
-                i = end;
-            }
-            '#' => {
-                let end = ident_end(&chars, i + 1);
-                if end == i + 1 {
-                    return None;
-                }
-                compound.id = Some(unescape(&chars[i + 1..end].iter().collect::<String>()));
-                i = end;
-            }
-            '[' => {
-                let close = chars[i..].iter().position(|c| *c == ']')? + i;
-                let inner: String = chars[i + 1..close].iter().collect();
-                compound.attrs.push(parse_attr(&inner)?);
-                i = close + 1;
-            }
-            ':' => {
-                let element = i + 1 < chars.len() && chars[i + 1] == ':';
-                let start = if element { i + 2 } else { i + 1 };
-                let end = ident_end(&chars, start);
-                let name: String = chars[start..end].iter().collect::<String>().to_ascii_lowercase();
-                let mut arg = None;
-                i = end;
-                if i < chars.len() && chars[i] == '(' {
-                    let mut depth = 0;
-                    let mut j = i;
-                    while j < chars.len() {
-                        match chars[j] {
-                            '(' => depth += 1,
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    arg = Some(chars[i + 1..j.min(chars.len())].iter().collect::<String>());
-                    i = j + 1;
-                }
-                // ::before / ::after: generated boxes (see Stylesheet::matching_pseudo)
-                if name == "before" || name == "after" {
-                    compound.pseudo_element = if name == "before" { 1 } else { 2 };
-                    continue;
-                }
-                // ::placeholder, ::first-line…: not drawn
-                if element || matches!(name.as_str(), "first-line" | "first-letter") {
-                    compound.pseudos.push(Pseudo::Never);
-                    continue;
-                }
-                compound.pseudos.push(parse_pseudo(&name, arg.as_deref())?);
-            }
-            _ => return None,
-        }
-    }
-    Some(compound)
-}
-
-fn parse_attr(inner: &str) -> Option<AttrSelector> {
-    let inner = inner.trim();
-    let ops = [("~=", AttrOp::Includes), ("|=", AttrOp::Dash), ("^=", AttrOp::Prefix), ("$=", AttrOp::Suffix), ("*=", AttrOp::Substring), ("=", AttrOp::Equals)];
-    for (token, op) in ops {
-        if let Some((name, value)) = inner.split_once(token) {
-            let value = value.trim().trim_end_matches(" i").trim_end_matches(" s").trim().trim_matches(|c| c == '"' || c == '\'');
-            return Some(AttrSelector { name: name.trim().to_ascii_lowercase(), op, value: value.to_string() });
-        }
-    }
-    Some(AttrSelector { name: inner.to_ascii_lowercase(), op: AttrOp::Exists, value: String::new() })
-}
-
-fn parse_nth(arg: &str) -> Option<(i32, i32)> {
-    let s: String = arg.split(" of ").next()?.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
-    match s.as_str() {
-        "odd" => return Some((2, 1)),
-        "even" => return Some((2, 0)),
-        _ => {}
-    }
-    if let Some((a, b)) = s.split_once('n') {
-        let a = match a {
-            "" | "+" => 1,
-            "-" => -1,
-            v => v.parse().ok()?,
-        };
-        let b = if b.is_empty() { 0 } else { b.parse().ok()? };
-        Some((a, b))
-    } else {
-        Some((0, s.parse().ok()?))
-    }
-}
-
-fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Pseudo> {
-    let list = |arg: Option<&str>| -> Option<Vec<Compound>> {
-        // selector lists of compounds; complex selectors inside are not supported
-        split_top_level(arg?, ',').iter().map(|s| parse_compound(s.trim())).collect()
-    };
-    Some(match name {
-        "root" => Pseudo::Root,
-        "first-child" => Pseudo::FirstChild,
-        "last-child" => Pseudo::LastChild,
-        "only-child" => Pseudo::OnlyChild,
-        "first-of-type" => Pseudo::FirstOfType,
-        "last-of-type" => Pseudo::LastOfType,
-        "empty" => Pseudo::Empty,
-        "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
-            let (a, b) = parse_nth(arg?)?;
-            Pseudo::Nth { a, b, last: name.contains("last"), of_type: name.ends_with("of-type") }
-        }
-        "not" => Pseudo::Not(list(arg)?),
-        "is" | "matches" | "any" | "-webkit-any" => Pseudo::Is(list(arg)?, false),
-        "where" => Pseudo::Is(list(arg)?, true),
-        "link" | "any-link" => Pseudo::Link,
-        "disabled" => Pseudo::Disabled,
-        "enabled" => Pseudo::Enabled,
-        "checked" => Pseudo::Checked,
-        // states a page without scripting or a pointer over it never shows
-        "hover" | "focus" | "focus-visible" | "focus-within" | "active" | "visited" | "target" | "placeholder-shown"
-        | "autofill" | "invalid" | "valid" | "required" | "optional" | "read-only" | "read-write" | "indeterminate"
-        | "has" | "lang" | "dir" | "defined" | "fullscreen" | "modal" | "popover-open" | "open" | "closed" | "scope" => Pseudo::Never,
-        _ => return None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Stylesheets
-// ---------------------------------------------------------------------------
 
 /// A media condition, evaluated when matching (the viewport is known then).
 #[derive(Debug, Clone, PartialEq)]
@@ -1121,24 +818,79 @@ impl Stylesheet {
                 }
                 continue;
             }
-            let declarations = parse_declarations(&body);
-            if declarations.is_empty() {
-                continue;
-            }
             let scope = SCOPE.with(|s| s.borrow().clone());
-            for selector_text in split_top_level(&prelude, ',') {
-                let selector_text = match &scope {
+            let selectors: Vec<String> = split_top_level(&prelude, ',')
+                .into_iter()
+                .map(|selector_text| match &scope {
                     Some(root) if selector_text.contains(":scope") => selector_text.replace(":scope", root),
                     Some(root) => format!("{root} {selector_text}"),
                     None => selector_text,
-                };
-                if let Some(selector) = Selector::parse(&selector_text) {
-                    let order = self.rules.len();
-                    self.rules.push(Rule { selector, declarations: declarations.clone(), media: media.clone(), order });
-                } else {
-                    crate::report::css_selector(&selector_text);
+                })
+                .collect();
+            self.parse_style_rule(&selectors.join(", "), &body, media, 0);
+        }
+    }
+
+    /// A style rule: its declarations for `selectors`, and the rules nested
+    /// in it (CSS nesting): `&` stands for the parent list, a nested rule
+    /// without one is a descendant (`.a { .b {} }` is `.a .b`), as the
+    /// standard defines it, through `:is()`; nested @media / @supports
+    /// apply the parent's selector under their condition.
+    fn parse_style_rule(&mut self, selectors: &str, body: &str, media: &Media, depth: usize) {
+        let (declarations_text, nested) = split_nested(body);
+        let declarations = parse_declarations(&declarations_text);
+        if !declarations.is_empty() {
+            match Selector::parse_list(selectors) {
+                Some(list) => {
+                    for selector in list {
+                        let order = self.rules.len();
+                        self.rules.push(Rule { selector, declarations: declarations.clone(), media: media.clone(), order });
+                    }
+                }
+                None => {
+                    for part in split_top_level(selectors, ',') {
+                        if Selector::parse(&part).is_none() {
+                            crate::report::css_selector(&part);
+                        }
+                    }
                 }
             }
+        }
+        if depth > 8 {
+            return;
+        }
+        for (prelude, block) in nested {
+            if let Some(at) = prelude.strip_prefix('@') {
+                let (name, condition) = at.split_once(|c: char| c.is_whitespace() || c == '(').map(|(n, _)| (n, &at[n.len()..])).unwrap_or((at, ""));
+                match name.to_ascii_lowercase().as_str() {
+                    "media" => {
+                        let inner = Media::parse(condition);
+                        let combined = match media {
+                            Media::All => inner,
+                            outer => Media::Both(Box::new(outer.clone()), Box::new(inner)),
+                        };
+                        self.parse_style_rule(selectors, &block, &combined, depth + 1);
+                    }
+                    "supports" | "layer" | "container" | "scope" | "starting-style" if !condition.contains("not ") => {
+                        self.parse_style_rule(selectors, &block, media, depth + 1);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let parent = format!(":is({selectors})");
+            let resolved: Vec<String> = split_top_level(&prelude, ',')
+                .into_iter()
+                .map(|part| {
+                    let part = part.trim().to_string();
+                    if part.contains('&') {
+                        part.replace('&', &parent)
+                    } else {
+                        format!("{parent} {part}")
+                    }
+                })
+                .collect();
+            self.parse_style_rule(&resolved.join(", "), &block, media, depth + 1);
         }
     }
 
@@ -1183,7 +935,7 @@ impl Stylesheet {
 
     /// Whether any rule styles a ::before / ::after box.
     pub fn has_pseudo_rules(&self) -> bool {
-        *self.pseudo_rules.get_or_init(|| self.rules.iter().any(|r| r.selector.chain.last().is_some_and(|c| c.pseudo_element != 0)))
+        *self.pseudo_rules.get_or_init(|| self.rules.iter().any(|r| matches!(r.selector.pseudo_element(), 1 | 2)))
     }
 
     /// The `content` of `node`'s ::before (1) / ::after (2) box, if a rule gives one.
@@ -1204,15 +956,12 @@ impl Stylesheet {
         let index = slot.get_or_init(|| {
             let mut index = RuleIndex { len: self.rules.len(), ..RuleIndex::default() };
             for (i, rule) in self.rules.iter().enumerate() {
-                let Some(last) = rule.selector.chain.last() else { continue };
-                if last.pseudos.iter().any(|p| matches!(p, Pseudo::Never)) { continue; }
-                // each index holds only its own kind of rule
-                if (last.pseudo_element != 0) != (kind != 0) { continue; }
+                // each index holds only its own kind of rule (parts this
+                // engine never draws, ::placeholder say, in none)
+                let pseudo = rule.selector.pseudo_element();
+                if pseudo == 3 || (pseudo != 0) != (kind != 0) { continue; }
                 if content_only && !rule.declarations.iter().any(|d| d.name == "content") { continue; }
-                let key = last.id.as_ref().map(|id| (0, id.clone()))
-                    .or_else(|| last.classes.first().map(|class| (1, class.clone())))
-                    .or_else(|| last.tag.as_ref().map(|tag| (2, tag.clone())));
-                if let Some(key) = key { index.keys.entry(key).or_default().push(i); }
+                if let Some(key) = rule.selector.0.key.clone() { index.keys.entry(key).or_default().push(i); }
                 else { index.universal.push(i); }
             }
             index
@@ -1231,10 +980,12 @@ impl Stylesheet {
         if index.len != self.rules.len() { candidates = (0..self.rules.len()).collect(); }
         candidates.sort_unstable();
         candidates.dedup();
+        // the element's ancestor chain, entered once for all its rules
+        crate::selector::register(node, ancestors);
         let mut hits: Vec<(u32, usize, &Rule)> = candidates.into_iter()
             .filter_map(|i| self.rules.get(i))
-            .filter(|rule| rule.selector.chain.last().map_or(0, |c| c.pseudo_element) == kind)
-            .filter(|rule| rule.media.matches_viewport(self.viewport_width, self.viewport_height) && if kind == 0 { matches_selector(&rule.selector, node, ancestors) } else { matches_for_pseudo(&rule.selector, node, ancestors) })
+            .filter(|rule| rule.selector.pseudo_element() == kind)
+            .filter(|rule| rule.media.matches_viewport(self.viewport_width, self.viewport_height) && if kind == 0 { crate::selector::matches(&rule.selector.0, node) } else { crate::selector::matches_pseudo(&rule.selector.0, node, kind) })
             .map(|rule| (rule.selector.specificity(), rule.order, rule))
             .collect();
         hits.sort_by_key(|(spec, order, _)| (*spec, *order));
@@ -1368,6 +1119,89 @@ fn last_keyframe(body: &str) -> Option<Vec<Declaration>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// A rule body split into its declarations and the rules nested in it
+/// (`prelude { block }` at the top level of the body).
+fn split_nested(body: &str) -> (String, Vec<(String, String)>) {
+    if !body.contains('{') {
+        return (body.to_string(), Vec::new());
+    }
+    let mut declarations = String::new();
+    let mut nested = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    let mut parens = 0i32;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            current.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            '(' | '[' => {
+                parens += 1;
+                current.push(c);
+            }
+            ')' | ']' => {
+                parens -= 1;
+                current.push(c);
+            }
+            ';' if parens <= 0 => {
+                declarations.push_str(&current);
+                declarations.push(';');
+                current.clear();
+            }
+            '{' if parens <= 0 => {
+                // a nested rule: its block runs to the matching brace
+                let mut depth = 1;
+                let start = i + 1;
+                let mut j = start;
+                let mut q: Option<char> = None;
+                while j < chars.len() && depth > 0 {
+                    let d = chars[j];
+                    match q {
+                        Some(qq) => {
+                            if d == qq {
+                                q = None;
+                            }
+                        }
+                        None => match d {
+                            '"' | '\'' => q = Some(d),
+                            '{' => depth += 1,
+                            '}' => depth -= 1,
+                            _ => {}
+                        },
+                    }
+                    j += 1;
+                }
+                let block: String = chars[start..j.saturating_sub(1).max(start)].iter().collect();
+                nested.push((current.trim().to_string(), block));
+                current.clear();
+                i = j;
+                continue;
+            }
+            _ => current.push(c),
+        }
+        i += 1;
+    }
+    declarations.push_str(&current);
+    (declarations, nested)
+}
+
 pub fn parse_declarations(body: &str) -> Vec<Declaration> {
     let mut out = Vec::new();
     for part in split_top_level(body, ';') {
@@ -1400,135 +1234,8 @@ pub fn parse_declarations(body: &str) -> Vec<Declaration> {
 // ---------------------------------------------------------------------------
 
 pub fn matches_selector(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
-    // `p::before` selects a generated box, never the element itself
-    if selector.chain.last().is_some_and(|c| c.pseudo_element != 0) {
-        return false;
-    }
-    let last = selector.chain.len() - 1;
-    match_from(selector, last, node, ancestors)
-}
-
-/// Does `selector` (ending in ::before / ::after) select `node`'s generated box?
-fn matches_for_pseudo(selector: &Selector, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
-    match_from(selector, selector.chain.len() - 1, node, ancestors)
-}
-
-/// Does `selector.chain[..=index]` match with `chain[index]` on `node`?
-fn match_from(selector: &Selector, index: usize, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
-    if !compound_matches(&selector.chain[index], node, ancestors) {
-        return false;
-    }
-    if index == 0 {
-        return true;
-    }
-    match selector.links[index - 1] {
-        Combinator::Descendant => (0..ancestors.len()).rev().any(|i| match_from(selector, index - 1, ancestors[i], &ancestors[..i])),
-        Combinator::Child => match ancestors.split_last() {
-            Some((parent, rest)) => match_from(selector, index - 1, parent, rest),
-            None => false,
-        },
-        Combinator::Adjacent => previous_elements(node, ancestors).first().is_some_and(|prev| match_from(selector, index - 1, prev, ancestors)),
-        Combinator::Sibling => previous_elements(node, ancestors).iter().any(|prev| match_from(selector, index - 1, prev, ancestors)),
-    }
-}
-
-/// Element siblings before `node`, nearest first.
-fn previous_elements<'n>(node: &crate::dom::Node, ancestors: &[&'n crate::dom::Node]) -> Vec<&'n crate::dom::Node> {
-    let Some(parent) = ancestors.last() else { return Vec::new() };
-    let mut out = Vec::new();
-    for child in &parent.children {
-        if std::ptr::eq(child, node) {
-            out.reverse();
-            return out;
-        }
-        if child.text.is_none() && !child.tag.starts_with('#') {
-            out.push(child);
-        }
-    }
-    Vec::new()
-}
-
-/// (position, count) of `node` among its parent's element children (1-based),
-/// optionally counting only same-tag siblings.
-fn position(node: &crate::dom::Node, ancestors: &[&crate::dom::Node], of_type: bool) -> Option<(usize, usize)> {
-    let parent = ancestors.last()?;
-    let mut index = None;
-    let mut count = 0;
-    for child in parent.children.iter().filter(|c| c.text.is_none() && !c.tag.starts_with('#') && (!of_type || c.tag == node.tag)) {
-        count += 1;
-        if std::ptr::eq(child, node) {
-            index = Some(count);
-        }
-    }
-    index.map(|i| (i, count))
-}
-
-fn compound_matches(compound: &Compound, node: &crate::dom::Node, ancestors: &[&crate::dom::Node]) -> bool {
-    if node.text.is_some() || node.tag.starts_with('#') {
-        return false;
-    }
-    if let Some(tag) = &compound.tag {
-        if !node.tag.eq_ignore_ascii_case(tag) {
-            return false;
-        }
-    }
-    if let Some(id) = &compound.id {
-        if node.attr("id") != Some(id.as_str()) {
-            return false;
-        }
-    }
-    if !compound.classes.is_empty() {
-        let classes = node.attr("class").unwrap_or("");
-        if !compound.classes.iter().all(|c| classes.split_whitespace().any(|have| have == c)) {
-            return false;
-        }
-    }
-    for attr in &compound.attrs {
-        let Some(value) = node.attr(&attr.name) else { return false };
-        let want = attr.value.as_str();
-        let ok = match attr.op {
-            AttrOp::Exists => true,
-            AttrOp::Equals => value == want,
-            AttrOp::Includes => value.split_whitespace().any(|v| v == want),
-            AttrOp::Dash => value == want || value.starts_with(&format!("{want}-")),
-            AttrOp::Prefix => !want.is_empty() && value.starts_with(want),
-            AttrOp::Suffix => !want.is_empty() && value.ends_with(want),
-            AttrOp::Substring => !want.is_empty() && value.contains(want),
-        };
-        if !ok {
-            return false;
-        }
-    }
-    for pseudo in &compound.pseudos {
-        let ok = match pseudo {
-            Pseudo::Never => false,
-            Pseudo::Root => node.tag == "html",
-            Pseudo::FirstChild => position(node, ancestors, false).is_some_and(|(i, _)| i == 1),
-            Pseudo::LastChild => position(node, ancestors, false).is_some_and(|(i, n)| i == n),
-            Pseudo::OnlyChild => position(node, ancestors, false).is_some_and(|(_, n)| n == 1),
-            Pseudo::FirstOfType => position(node, ancestors, true).is_some_and(|(i, _)| i == 1),
-            Pseudo::LastOfType => position(node, ancestors, true).is_some_and(|(i, n)| i == n),
-            Pseudo::Empty => node.children.iter().all(|c| c.tag == "#comment" || c.text.as_ref().is_some_and(|t| t.is_empty())),
-            Pseudo::Nth { a, b, last, of_type } => position(node, ancestors, *of_type).is_some_and(|(i, n)| {
-                let k = if *last { (n - i + 1) as i32 } else { i as i32 };
-                if *a == 0 {
-                    k == *b
-                } else {
-                    (k - b) % a == 0 && (k - b) / a >= 0
-                }
-            }),
-            Pseudo::Not(list) => !list.iter().any(|c| compound_matches(c, node, ancestors)),
-            Pseudo::Is(list, _) => list.iter().any(|c| compound_matches(c, node, ancestors)),
-            Pseudo::Link => matches!(node.tag.as_str(), "a" | "area") && node.attr("href").is_some(),
-            Pseudo::Disabled => node.attr("disabled").is_some(),
-            Pseudo::Enabled => matches!(node.tag.as_str(), "button" | "input" | "select" | "textarea") && node.attr("disabled").is_none(),
-            Pseudo::Checked => node.attr("checked").is_some() || node.attr("selected").is_some(),
-        };
-        if !ok {
-            return false;
-        }
-    }
-    true
+    crate::selector::register(node, ancestors);
+    crate::selector::matches(&selector.0, node)
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,11 +1515,32 @@ mod tests {
         let doc = parse_document(r#"<p id="x" class="note">t</p>"#);
         let node = doc.find_first("p").unwrap();
         assert_eq!(values(&sheet, node, &[&doc]).last().unwrap(), "pink");
-        assert_eq!(sheet.rules[0].selector.specificity(), 1);
-        assert_eq!(sheet.rules[2].selector.specificity(), 100);
+        // (id, class, type) order: #x > .note > p
+        let spec: Vec<u32> = sheet.rules.iter().map(|r| r.selector.specificity()).collect();
+        assert!(spec[2] > spec[1] && spec[1] > spec[0], "{spec:?}");
         let later = Stylesheet::parse(".a { color: red } .b { color: blue }");
         let doc = parse_document(r#"<p class="b a">t</p>"#);
         assert_eq!(values(&later, doc.find_first("p").unwrap(), &[&doc]).last().unwrap(), "blue", "source order breaks ties");
+    }
+
+    #[test]
+    fn nested_rules_and_whole_selector_lists() {
+        let sheet = Stylesheet::parse(
+            ".card { color: red; & > h2 { color: blue } .note { color: green } &.wide { margin: 1px } @media (min-width: 100px) { padding: 2px } }\
+             a, b:-moz-focusring { color: pink } article:has(> img) { color: teal }",
+        );
+        let doc = parse_document("<div class='card wide'><h2>t</h2><p class=note>n</p></div><a>x</a><article><img></article>");
+        let body = crate::dom::body(&doc);
+        let html = &doc.children[0];
+        let card = &body.children[0];
+        let chain = [&doc, html, body];
+        let with_card = [&doc, html, body, card];
+        assert_eq!(values(&sheet, &card.children[0], &with_card).last().unwrap(), "blue", "& > h2");
+        assert_eq!(values(&sheet, &card.children[1], &with_card).last().unwrap(), "green", ".card .note");
+        let own = values(&sheet, card, &chain);
+        assert!(own.contains(&"1px".to_string()) && own.contains(&"2px".to_string()), "&.wide and nested @media: {own:?}");
+        assert!(values(&sheet, &body.children[1], &chain).is_empty(), "one invalid selector drops the rule");
+        assert_eq!(values(&sheet, &body.children[2], &chain).last().unwrap(), "teal", ":has()");
     }
 
     #[test]
@@ -1915,7 +1643,7 @@ mod tests {
         let themed = Stylesheet::parse("@import url(/dark.css) (prefers-color-scheme: dark) and (not (prefers-contrast: more)); @import url(x.css) layer(base) supports(display: grid) screen;");
         assert_eq!(themed.imports.len(), 2);
         assert!(themed.imports[1].1.matches_viewport(1200.0, 800.0), "layer() and supports() before the media list");
-        let selectors: Vec<String> = sheet.rules.iter().map(|r| format!("{:?}", r.selector.chain[0].tag.as_deref().or(r.selector.chain[0].classes.first().map(|s| s.as_str())))).collect();
+        let selectors: Vec<String> = sheet.rules.iter().map(|r| format!("{:?}", r.selector.0.key)).collect();
         assert_eq!(sheet.rules.len(), 2, "{selectors:?}");
     }
 

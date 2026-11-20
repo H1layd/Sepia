@@ -24,6 +24,7 @@ mod paint;
 mod persona;
 mod protocols;
 mod report;
+mod selector;
 mod resolver;
 mod style;
 mod url;

@@ -28,7 +28,7 @@ use boa_engine::{js_string, Context, JsResult, JsString, JsValue, NativeFunction
 use crate::jsval::Val;
 
 mod v8engine;
-use crate::css::{matches_selector, split_top_level, Selector, Stylesheet};
+use crate::css::{matches_selector, Selector, Stylesheet};
 use crate::dom::{self, Node};
 use crate::images::ImageMap;
 use crate::layout::{Fonts, Layout, Page};
@@ -331,7 +331,7 @@ impl Dom {
 
     /// Elements under `scope` matching a selector list, in document order.
     fn query(&self, scope: usize, selectors: &str, all: bool) -> Vec<usize> {
-        let list: Vec<Selector> = split_top_level(selectors, ',').iter().filter_map(|s| Selector::parse(s)).collect();
+        let list: Vec<Selector> = Selector::parse_list(selectors).unwrap_or_default();
         if list.is_empty() {
             return Vec::new();
         }
@@ -372,7 +372,7 @@ impl Dom {
     }
 
     fn matches(&self, id: usize, selectors: &str) -> bool {
-        let list: Vec<Selector> = split_top_level(selectors, ',').iter().filter_map(|s| Selector::parse(s)).collect();
+        let list: Vec<Selector> = Selector::parse_list(selectors).unwrap_or_default();
         let (root, path) = self.path(id);
         let tree = self.tree_of(root);
         let mut ancestors: Vec<&Node> = Vec::new();
@@ -3925,6 +3925,32 @@ mod tests {
         );
         let t = text(&s);
         assert!(t.contains(&format!("{}|cookie|v|1280|function", crate::persona::current().browser.user_agent)), "{t} {:?}", s.log());
+    }
+
+    #[test]
+    fn platform_objects_are_instances_of_their_interfaces() {
+        let s = run(
+            "<p id='o' class='a' style='color: red !important'></p>",
+            "const o = document.getElementById('o');
+             const native = f => /\\[native code\\]/.test(Function.prototype.toString.call(f));
+             const st = o.style;
+             st.setProperty('margin-top', '4px'); st.paddingLeft = '2px';
+             const checks = [
+               st instanceof CSSStyleDeclaration, native(CSSStyleDeclaration.prototype.getPropertyValue),
+               st.getPropertyValue('color') === 'red', st.getPropertyPriority('color') === 'important',
+               st.marginTop === '4px', o.getAttribute('style').includes('padding-left: 2px'), st.length === 3,
+               getComputedStyle(o) instanceof CSSStyleDeclaration, Object.prototype.toString.call(st) === '[object CSSStyleDeclaration]',
+               o.classList instanceof DOMTokenList, native(DOMTokenList.prototype.add),
+               o.childNodes instanceof NodeList, navigator instanceof Navigator, !Object.getOwnPropertyNames(navigator).length,
+               typeof navigator.userAgent === 'string', screen instanceof Screen, location instanceof Location, history instanceof History,
+               new MessageChannel().port1 instanceof MessagePort, typeof FontFace === 'function',
+             ];
+             let ro = 'no'; try { getComputedStyle(o).setProperty('color', 'blue'); } catch (e) { ro = e.name; }
+             o.textContent = checks.map((c, i) => c ? '' : 'x' + i).join('') + '|' + ro;",
+        );
+        let t = text(&s);
+        assert!(t.contains("|NoModificationAllowedError"), "{t} {:?}", s.log());
+        assert!(!t.contains('x'), "{t} {:?}", s.log());
     }
 
     #[test]
