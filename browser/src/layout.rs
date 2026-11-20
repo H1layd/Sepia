@@ -653,6 +653,11 @@ impl<'a> Layout<'a> {
             return 0.0;
         }
         let replaced = matches!(node.tag.as_str(), "img" | "svg" | "canvas");
+        let mut style = style;
+        if !replaced && style.display == Display::Inline && self.holds_blocks(node, &ancestors2[..ancestors2.len().saturating_sub(1)], &style, containing_width) {
+            // block-in-inline: its blocks are blocks, so the box is one too
+            style.display = Display::Block;
+        }
         if replaced || matches!(style.display, Display::Inline | Display::InlineBlock) {
             // Inline elements at block level are laid out as their own line.
             self.last_margin_bottom = 0.0;
@@ -987,7 +992,12 @@ impl<'a> Layout<'a> {
                     previous_margin = None;
                 }
             }
-            let child_is_block = child_style.as_ref().is_some_and(|s| !matches!(s.display, Display::Inline | Display::InlineBlock | Display::None));
+            let child_is_block = child_style.as_ref().is_some_and(|s| {
+                !matches!(s.display, Display::Inline | Display::InlineBlock | Display::None)
+                    // block-in-inline: an inline (a custom element, an <a>
+                    // around a card) holding blocks is laid out as a block
+                    || (s.display == Display::Inline && self.holds_blocks(child, ancestors, s, width))
+            });
             if child_is_block {
                 if !items.is_empty() {
                     let used = self.layout_inline(&items, x, cursor, width);
@@ -2756,6 +2766,32 @@ impl<'a> Layout<'a> {
         out
     }
 
+    /// Whether an inline element has block-level boxes inside it (directly
+    /// or through other inlines): CSS then breaks it into block pieces.
+    fn holds_blocks(&self, node: &Node, ancestors: &[&Node], style: &Style, width: f32) -> bool {
+        fn walk(layout: &Layout, node: &Node, ancestors: &mut Vec<*const Node>, chain: &[&Node], style: &Style, width: f32, depth: usize) -> bool {
+            if depth > 6 || matches!(node.tag.as_str(), "img" | "svg" | "canvas" | "button" | "input" | "select" | "textarea") {
+                return false;
+            }
+            let mut with_node: Vec<&Node> = chain.to_vec();
+            with_node.push(node);
+            for child in node.children.iter().filter(|c| c.text.is_none()) {
+                let cs = compute(child, Some(style), layout.sheet, &with_node, width);
+                if cs.display == Display::None || out_of_flow(&cs) || cs.float.is_some() {
+                    continue;
+                }
+                if !matches!(cs.display, Display::Inline | Display::InlineBlock) {
+                    return true;
+                }
+                if cs.display == Display::Inline && walk(layout, child, ancestors, &with_node, &cs, width, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        walk(self, node, &mut Vec::new(), ancestors, style, width, 0)
+    }
+
     /// A sub-page's layers, about to be appended to this page's draws.
     fn adopt_layers(&mut self, layers: &[Layer]) {
         let at = self.page.draws.len();
@@ -4348,6 +4384,30 @@ mod tests {
             _ => None,
         }).unwrap();
         assert!(below > 60.0 && below < 85.0, "text starts under the tallest float: {below}");
+    }
+
+    #[test]
+    fn blocks_inside_an_inline_are_blocks() {
+        // a custom element (inline by default) around positioned blocks:
+        // the absolute child fills its relative parent, not the page
+        let doc = parse_document(
+            "<body style='margin:0'><gu-island><div style='margin-left:40px;position:relative;width:100px;height:50px'>\
+               <div style='position:absolute;top:0;left:0;width:100%;height:100%;background:red'></div></div></gu-island>\
+             <p style='margin:0'>after</p></body>",
+        );
+        let sheet = Stylesheet::default();
+        let fonts = fonts();
+        let page = Layout::new(&fonts, &sheet, 600.0).build(&doc);
+        let red = page.draws.iter().find_map(|d| match d {
+            Draw::Fill { rect, color: Some(c), .. } if *c == Color::rgb(255, 0, 0) => Some(*rect),
+            _ => None,
+        });
+        assert_eq!(red.map(|r| (r.x, r.y, r.w, r.h)), Some((40.0, 0.0, 100.0, 50.0)));
+        let after = page.draws.iter().find_map(|d| match d {
+            Draw::Text { text, baseline, .. } if text.contains("after") => Some(*baseline),
+            _ => None,
+        }).unwrap();
+        assert!(after > 50.0, "the block takes its room: {after}");
     }
 
     #[test]
