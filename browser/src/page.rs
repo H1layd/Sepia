@@ -76,6 +76,8 @@ pub fn open(
     let mut current = url.clone();
     let mut body = form.map(str::to_string);
     let mut visited = Vec::new();
+    // the page a script or form navigated from: its Referer (and Origin on POST)
+    let mut referrer: Option<Url> = None;
     for _ in 0..=8 {
         let key = (current.to_string(), body.clone());
         // a page may reload itself once (it set a cookie, say); twice is a loop
@@ -88,12 +90,13 @@ pub fn open(
         visited.push(key);
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() { return Err("script navigation timed out".into()); }
-        let (loaded, mut session, late) = open_once(&current, chain, resolver, width, fonts, remaining, insecure_tls, defer_images, body.as_deref())?;
+        let (loaded, mut session, late) = open_once(&current, chain, resolver, width, fonts, remaining, insecure_tls, defer_images, body.as_deref(), referrer.as_ref())?;
         let navigation = session.as_mut().and_then(Session::take_startup_navigation);
         let Some((target, form)) = navigation else { return Ok((loaded, session, late)); };
         // Fragments are handled by the document, not a second network load.
         if target.starts_with('#') { return Ok((loaded, session, late)); }
-        current = current.resolve(&target).ok_or_else(|| "unsupported script navigation URL".to_string())?;
+        referrer = Some(loaded.url.clone());
+        current = loaded.url.resolve(&target).or_else(|| current.resolve(&target)).ok_or_else(|| "unsupported script navigation URL".to_string())?;
         body = form;
         // Images requested by the old document may finish on their own, but
         // can no longer update the new page's session or GUI generation.
@@ -113,6 +116,7 @@ fn open_once(
     insecure_tls: bool,
     defer_images: bool,
     form: Option<&str>,
+    referrer: Option<&Url>,
 ) -> Result<(Loaded, Option<Session>, Option<LateImages>), String> {
     let final_site = crate::cookies::site_of(&url.host);
     require_overlay(url, chain)?;
@@ -128,7 +132,7 @@ fn open_once(
         }
         _ => {
             let html_started = Instant::now();
-            let response: Response = fetch_in(url, chain, resolver, timeout, &PageRequest { form, ..PageRequest::get(&final_site) })?;
+            let response: Response = fetch_in(url, chain, resolver, timeout, &PageRequest { form, from: referrer, cors: form.is_some(), ..PageRequest::get(&final_site) })?;
             timing("html", html_started);
             let kind = response.content_type();
             let html = kind.is_empty() || kind.contains("html") || kind.contains("xml");
