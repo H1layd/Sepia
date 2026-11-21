@@ -2755,6 +2755,8 @@ struct FlexItem<'n> {
     /// vertical margins, to find the item's own box when stretching it
     margin_top: f32,
     margin_bottom: f32,
+    /// a declared min-width, as an outer size
+    min_outer: Option<f32>,
 }
 
 impl<'n> FlexItem<'n> {
@@ -2766,6 +2768,7 @@ impl<'n> FlexItem<'n> {
 fn taffy_justify(j: crate::style::Justify) -> taffy::AlignContent {
     use crate::style::Justify;
     match j {
+        Justify::Normal => taffy::AlignContent::NORMAL,
         Justify::Start => taffy::AlignContent::FLEX_START,
         Justify::End => taffy::AlignContent::FLEX_END,
         Justify::Center => taffy::AlignContent::CENTER,
@@ -2939,10 +2942,35 @@ impl<'a> Layout<'a> {
     /// box's; while measuring, 100000 asks for max-content and 1 for min-content.
     fn layout_flex(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
         use crate::style::FlexDirection;
-        use taffy::prelude::{AvailableSpace, Dimension, LengthPercentage, LengthPercentageAuto, NodeId, Size, TaffyTree};
+        use taffy::prelude::LengthPercentage;
         let f = style.flex;
         let row = matches!(f.direction, FlexDirection::Row | FlexDirection::RowReverse);
+        let items = self.taffy_items(node, ancestors, style, x, y, width, row, false);
+        let root = taffy::Style {
+            display: taffy::Display::Flex,
+            flex_direction: match f.direction {
+                FlexDirection::Row => taffy::FlexDirection::Row,
+                FlexDirection::RowReverse => taffy::FlexDirection::RowReverse,
+                FlexDirection::Column => taffy::FlexDirection::Column,
+                FlexDirection::ColumnReverse => taffy::FlexDirection::ColumnReverse,
+            },
+            flex_wrap: if f.wrap { taffy::FlexWrap::Wrap } else { taffy::FlexWrap::NoWrap },
+            justify_content: taffy_justify(f.justify),
+            align_items: taffy_align(f.align),
+            align_content: f.align_content.map_or(taffy::AlignContent::NORMAL, taffy_justify),
+            gap: taffy::Size { width: LengthPercentage::length(f.column_gap), height: LengthPercentage::length(f.row_gap) },
+            ..taffy::Style::default()
+        };
+        self.run_taffy(node, ancestors, style, x, y, width, root, items, !row)
+    }
 
+    /// The in-flow children of a flex or grid container as taffy leaves
+    /// (absolutely positioned ones are placed on the way, `display: none`
+    /// ones skipped), in `order`. A leaf's style describes the item's outer
+    /// (margin) box; `row` says which axis a flex basis is on.
+    #[allow(clippy::too_many_arguments)]
+    fn taffy_items<'n>(&mut self, node: &'n Node, ancestors: &[&'n Node], style: &Style, x: f32, y: f32, width: f32, row: bool, grid: bool) -> Vec<(FlexItem<'n>, taffy::Style)> {
+        use taffy::prelude::{Dimension, LengthPercentageAuto, Size};
         let entries: Vec<(&Node, Option<(Vec<&Node>, Style)>)> = match self.contents_children(node, ancestors, style, width) {
             Some(list) => list.into_iter().map(|(n, chain, parent)| (n, Some((chain, parent)))).collect(),
             None => node.children.iter().map(|c| (c, None)).collect(),
@@ -2954,6 +2982,7 @@ impl<'a> Layout<'a> {
             let mut order = 0;
             let mut right_chrome = 0.0;
             let (mut margin_top, mut margin_bottom) = (0.0, 0.0);
+            let mut min_outer = None;
             match &child.text {
                 Some(text) if text.trim().is_empty() => continue,
                 Some(_) => {}
@@ -2979,8 +3008,16 @@ impl<'a> Layout<'a> {
                     let len = |v: Option<f32>| v.map_or(Dimension::auto(), Dimension::length);
                     let lim = |v: Option<f32>| v.map_or(LengthPercentageAuto::auto(), LengthPercentageAuto::length);
                     leaf.size = Size { width: len(s.width.map(outer_w)), height: len(s.height.map(outer_h)) };
+                    min_outer = s.min_width.map(outer_w);
                     leaf.min_size = Size { width: lim(s.min_width.map(outer_w)), height: lim(s.min_height.map(outer_h)) };
+                    // a grid item's percentages are of its grid area: taffy
+                    // resolves them (border-box or chrome-free boxes exactly)
                     leaf.max_size = Size { width: lim(s.max_width.map(outer_w)), height: lim(s.max_height.map(outer_h)) };
+                    if grid {
+                        if let Some(p) = s.width_percent { leaf.size.width = Dimension::percent(p); }
+                        if let Some(p) = s.min_width_percent { leaf.min_size.width = LengthPercentageAuto::percent(p); }
+                        if let Some(p) = s.max_width_percent { leaf.max_size.width = LengthPercentageAuto::percent(p); }
+                    }
                     leaf.flex_grow = s.flex.grow;
                     leaf.flex_shrink = s.flex.shrink;
                     leaf.flex_basis = match s.flex.basis {
@@ -2990,19 +3027,45 @@ impl<'a> Layout<'a> {
                     leaf.align_self = s.flex.align_self.map(taffy_align);
                     let auto = |on: bool| if on { LengthPercentageAuto::auto() } else { LengthPercentageAuto::length(0.0) };
                     leaf.margin = taffy::Rect { left: auto(s.margin_auto.0), right: auto(s.margin_auto.1), top: auto(false), bottom: auto(false) };
+                    // grid placement: a named area is all four lines
+                    let line = |v: &str| v.parse::<taffy::GridPlacement<String>>().unwrap_or(taffy::GridPlacement::Auto);
+                    if let Some(area) = &s.grid_area {
+                        leaf.grid_row = taffy::Line { start: line(area), end: line(area) };
+                        leaf.grid_column = taffy::Line { start: line(area), end: line(area) };
+                    }
+                    if let Some((a, b)) = &s.grid_row_lines {
+                        leaf.grid_row = taffy::Line { start: line(a), end: line(b) };
+                    }
+                    if let Some((a, b)) = &s.grid_column_lines {
+                        leaf.grid_column = taffy::Line { start: line(a), end: line(b) };
+                    }
                     if s.scroller {
                         leaf.overflow = taffy::Point { x: taffy::Overflow::Hidden, y: taffy::Overflow::Hidden };
                     }
                 }
             }
-            items.push((order, FlexItem { node: child, via, right_chrome, margin_top, margin_bottom }, leaf));
+            items.push((order, FlexItem { node: child, via, right_chrome, margin_top, margin_bottom, min_outer }, leaf));
         }
         // `order` first (stable: equal orders keep document order)
         items.sort_by_key(|(order, _, _)| *order);
+        items.into_iter().map(|(_, item, leaf)| (item, leaf)).collect()
+
+    }
+
+    /// Lay a flex or grid container's items out with taffy and draw them:
+    /// each item is a leaf taffy measures through this engine (its
+    /// min-content and max-content widths, its height at a width). `width`
+    /// is the content box's; while measuring, 100000 asks for max-content
+    /// and 1 for min-content. `relayout` (flex columns): an item given
+    /// another height is laid out again at it; otherwise a taller slot
+    /// stretches the item's box. Returns the content height.
+    #[allow(clippy::too_many_arguments)]
+    fn run_taffy(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32, mut root: taffy::Style, items: Vec<(FlexItem, taffy::Style)>, relayout: bool) -> f32 {
+        use taffy::prelude::{AvailableSpace, Dimension, LengthPercentageAuto, NodeId, Size, TaffyTree};
+        let _ = node;
         if items.is_empty() {
             return 0.0;
         }
-
         let probe = if self.measuring || self.intrinsic {
             if width >= 50_000.0 { Some(AvailableSpace::MaxContent) } else if width <= 1.5 { Some(AvailableSpace::MinContent) } else { None }
         } else {
@@ -3010,21 +3073,6 @@ impl<'a> Layout<'a> {
         };
         let chrome_h = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
         let content_h = |v: Option<f32>| v.map(|h| (h - chrome_h).max(0.0));
-        let mut root = taffy::Style {
-            display: taffy::Display::Flex,
-            flex_direction: match f.direction {
-                FlexDirection::Row => taffy::FlexDirection::Row,
-                FlexDirection::RowReverse => taffy::FlexDirection::RowReverse,
-                FlexDirection::Column => taffy::FlexDirection::Column,
-                FlexDirection::ColumnReverse => taffy::FlexDirection::ColumnReverse,
-            },
-            flex_wrap: if f.wrap { taffy::FlexWrap::Wrap } else { taffy::FlexWrap::NoWrap },
-            justify_content: taffy_justify(f.justify),
-            align_items: taffy_align(f.align),
-            align_content: f.align_content.map_or(taffy::AlignContent::NORMAL, taffy_justify),
-            gap: Size { width: LengthPercentage::length(f.column_gap), height: LengthPercentage::length(f.row_gap) },
-            ..taffy::Style::default()
-        };
         root.size = Size {
             width: if probe.is_some() { Dimension::auto() } else { Dimension::length(width) },
             height: content_h(style.height).map_or(Dimension::auto(), Dimension::length),
@@ -3037,8 +3085,20 @@ impl<'a> Layout<'a> {
         let mut tree: TaffyTree<usize> = TaffyTree::new();
         tree.disable_rounding();
         let leaves: Vec<NodeId> = items.iter().enumerate()
-            .map(|(i, (_, _, leaf))| tree.new_leaf_with_context(leaf.clone(), i).expect("taffy leaf"))
+            .map(|(i, (_, leaf))| {
+                let mut leaf = leaf.clone();
+                // a flex container's min-/max-content width, as Chrome
+                // computes it: each item contributes its width or content,
+                // not its flex-basis (the spec's 9.9.1 algorithm, which taffy
+                // follows, turns a row of `flex: 0 0 300px` slides into a
+                // min-content as wide as all of them)
+                if std::env::var_os("SEPIA_KEEP_BASIS").is_none() && probe.is_some() && root.display == taffy::Display::Flex {
+                    leaf.flex_basis = Dimension::auto();
+                }
+                tree.new_leaf_with_context(leaf, i).expect("taffy leaf")
+            })
             .collect();
+        let grid = root.display == taffy::Display::Grid;
         let container = tree.new_with_children(root, &leaves).expect("taffy container");
         // min-content and max-content widths, measured once per item
         let intrinsic: Vec<std::cell::Cell<Option<(f32, f32)>>> = items.iter().map(|_| std::cell::Cell::new(None)).collect();
@@ -3047,7 +3107,7 @@ impl<'a> Layout<'a> {
             if let Some(w) = intrinsic[i].get() {
                 return w;
             }
-            let item = &items[i].1;
+            let item = &items[i].0;
             let (anc, parent) = item.ctx(ancestors, style);
             let (wide, _) = this.item_page(item.node, anc, parent, 100_000.0, true);
             let (narrow, _) = this.item_page(item.node, anc, parent, 1.0, true);
@@ -3066,9 +3126,16 @@ impl<'a> Layout<'a> {
             // contribution): no layout at that width
             let width_only = input.axis == taffy::RequestedAxis::Horizontal;
             taffy::compute_leaf_layout(input, leaf_style, |_, _| 0.0, |known, space| {
-                let item = &items[i].1;
+                let item = &items[i].0;
                 let (anc, parent) = item.ctx(ancestors, style);
                 let w = known.width.unwrap_or_else(|| {
+                    // a grid sized to its min-content: an item with a
+                    // declared min-width contributes that (Chrome takes the
+                    // item's minimum contribution here, so `min-width: 0`
+                    // lets wide content overflow instead of widening the grid)
+                    if let (true, AvailableSpace::MinContent, Some(m), true) = (grid, space.width, item.min_outer, std::env::var_os("SEPIA_NO_GRIDMIN").is_none()) {
+                        return m;
+                    }
                     let (min, max) = widths(i);
                     match space.width {
                         AvailableSpace::MinContent => min,
@@ -3090,18 +3157,37 @@ impl<'a> Layout<'a> {
             placed.push((i, l.location.x, l.location.y, l.size.width, l.size.height));
         }
         let height = tree.layout(container).map(|l| l.size.height).unwrap_or(0.0);
+        // SEPIA_TRACE_TAFFY=<class fragment>: the containers whose class
+        // has it, with each item's place, size and measured widths
+        if let Ok(want) = std::env::var("SEPIA_TRACE_TAFFY") {
+            if node.attr("class").unwrap_or("").contains(want.as_str()) {
+                eprintln!("TAFFY <{} {:?}> width={width} probe={probe:?} widths_only={widths_only} height={height}", node.tag, node.attr("class"));
+                for &(i, lx, ly, w, h) in &placed {
+                    let n = items[i].0.node;
+                    eprintln!("   item <{} {:?}> at {lx:.0},{ly:.0} {w:.0}x{h:.0} min/max={:?}", n.tag, n.attr("class"), intrinsic[i].get());
+                }
+            }
+        }
         let ranges: Vec<(f32, f32)> = if widths_only { (0..items.len()).map(&widths).collect() } else { Vec::new() };
         for (i, lx, ly, w, h) in placed {
-            let item = &items[i].1;
+            let item = &items[i].0;
             let (anc, parent) = item.ctx(ancestors, style);
-            if widths_only {
-                // the pages already measured at the extremes, else one at w
+            if widths_only && std::env::var_os("SEPIA_PASTE").is_some() {
                 let (min, max) = ranges[i];
                 let at = if w >= max - 0.5 { 100_000.0 } else if w <= min + 0.5 { 1.0 } else { w.max(1.0) };
                 let (page, _) = self.item_page(item.node, anc, parent, at, true);
                 self.paste(page, x + lx, y + ly);
-                // the item's whole outer box counts, right padding and
-                // margin included, though nothing is drawn there
+                self.page.content_right = self.page.content_right.max(x + lx + w.min(max));
+                continue;
+            }
+            if widths_only {
+                // a measuring pass reads only how wide the content is: the
+                // item's outer box (right padding and margin included,
+                // content that overflows a squeezed item not; a percentage
+                // width resolved against the measuring width capped by the
+                // item's own max-content)
+                let (_, max) = ranges[i];
+                let w = if w >= 50_000.0 { max } else { w };
                 self.page.content_right = self.page.content_right.max(x + lx + w);
                 continue;
             }
@@ -3109,12 +3195,12 @@ impl<'a> Layout<'a> {
             // a row item stretched across its line: its box (background,
             // border) grows; laying it out again at every level of nested
             // rows would cost 2^depth
-            if row && item.node.text.is_none() && h > natural + 0.5 {
+            if !relayout && item.node.text.is_none() && h > natural + 0.5 {
                 stretch_box(&mut page, natural, h - natural, item.margin_top, item.margin_bottom);
             }
             // grown or shrunk along a column: the item's box takes that
             // height, and its own content lays out inside it
-            if !row && item.node.text.is_none() && (h - natural).abs() > 0.5 {
+            if relayout && item.node.text.is_none() && (h - natural).abs() > 0.5 {
                 let mut sub = self.sub_layout(false);
                 let ptr = item.node as *const Node;
                 sub.blockify = Some(ptr);
@@ -3288,266 +3374,58 @@ impl<'a> Layout<'a> {
         Some((sub.page, baseline, width, height))
     }
 
-    /// CSS grid, the common subset: `grid-template-columns` with px, %, fr,
-    /// auto, minmax() and repeat() (also auto-fill/auto-fit), `gap`,
-    /// `grid-column: span n` and `1 / -1`, auto-placement row by row,
-    /// `align-items`. Returns the height used.
+    /// A grid container: tracks, placement (lines, names, spans, areas,
+    /// auto-flow, dense), track sizing and alignment by taffy's CSS Grid;
+    /// the items are measured by this engine (see `run_taffy`).
     fn layout_grid(&mut self, node: &Node, ancestors: &[&Node], style: &Style, x: f32, y: f32, width: f32) -> f32 {
-        use crate::style::{AlignItems, GridSpan};
-        let col_gap = style.flex.column_gap;
-        let row_gap = style.flex.row_gap;
-        let mut tracks = parse_tracks(style.grid_columns.as_deref().unwrap_or("1fr"), width, col_gap, style.font_size);
-        let mut named = std::collections::HashMap::<&str, (usize, usize, usize, usize)>::new();
-        if let Some(areas) = &style.grid_areas {
-            let area_columns = areas.first().map_or(1, Vec::len);
-            if tracks.len() < area_columns { tracks.resize(area_columns, Track::Auto); }
-            for (r, row) in areas.iter().enumerate() {
-                for (c, name) in row.iter().enumerate().filter(|(_, name)| name.as_str() != ".") {
-                    let area = named.entry(name).or_insert((r, c, r + 1, c + 1));
-                    area.2 = area.2.max(r + 1); area.3 = area.3.max(c + 1);
-                }
-            }
-        }
-        let names = line_names(style.grid_columns.as_deref().unwrap_or(""));
-        let explicit_rows = style.grid_areas.as_ref().map_or(0, Vec::len);
-        let mut columns = tracks.len().max(1);
-
-        // items and their places
-        struct GridItem<'n> {
-            node: &'n Node,
-            /// for a child of a `display: contents` element: its ancestors and parent style
-            via: Option<(Vec<&'n Node>, Style)>,
-            row: usize,
-            col: usize,
-            span: usize,
-            row_span: usize,
-            area: Option<String>,
-            margin: (f32, f32),
-            align: AlignItems,
-            /// explicit lines: (first track, span) across and down
-            fixed: (Option<(usize, usize)>, Option<(usize, usize)>),
-            order: i32,
-        }
-        let mut items: Vec<GridItem> = Vec::new();
-        let (mut row, mut col) = (0usize, 0usize);
-        let expanded = self.contents_children(node, ancestors, style, width);
-        let entries: Vec<(&Node, Option<(Vec<&Node>, Style)>)> = match expanded {
-            Some(list) => list.into_iter().map(|(n, chain, parent)| (n, Some((chain, parent)))).collect(),
-            None => node.children.iter().map(|c| (c, None)).collect(),
+        use taffy::prelude::LengthPercentage;
+        type Tracks = taffy::GridTemplateTracks<String, taffy::GridTemplateComponent<String>>;
+        let items = self.taffy_items(node, ancestors, style, x, y, width, true, true);
+        let f = style.flex;
+        let mut root = taffy::Style {
+            display: taffy::Display::Grid,
+            gap: taffy::Size { width: LengthPercentage::length(f.column_gap), height: LengthPercentage::length(f.row_gap) },
+            align_items: taffy_align(f.align),
+            justify_content: taffy_justify(f.justify),
+            align_content: f.align_content.map_or(taffy::AlignContent::NORMAL, taffy_justify),
+            grid_auto_flow: match style.grid_flow {
+                (false, false) => taffy::GridAutoFlow::Row,
+                (false, true) => taffy::GridAutoFlow::RowDense,
+                (true, false) => taffy::GridAutoFlow::Column,
+                (true, true) => taffy::GridAutoFlow::ColumnDense,
+            },
+            ..taffy::Style::default()
         };
-        for (child, via) in entries {
-            let (anc, parent): (&[&Node], &Style) = match &via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
-            let mut fixed = (None, None);
-            let mut order = 0;
-            let (span, margin, align, area) = match &child.text {
-                Some(t) if t.trim().is_empty() => continue,
-                Some(_) => (1, (0.0, 0.0), style.flex.align, None),
-                None => {
-                    let s = compute(child, Some(parent), self.sheet, anc, width);
-                    if s.display == Display::None {
-                        continue;
-                    }
-                    if out_of_flow(&s) {
-                        self.place_out_of_flow(child, anc, &s, x, y);
-                        continue;
-                    }
-                    let span = match s.grid_span {
-                        GridSpan::Auto => 1,
-                        GridSpan::Span(n) => n.min(columns),
-                        GridSpan::Full => columns,
-                    };
-                    order = s.order;
-                    fixed = (
-                        s.grid_column_lines.as_ref().and_then(|l| grid_lines(l, &names, columns)),
-                        // rows count from the explicit ones (template areas), as in CSS:
-                        // with none, `-1` is the first line
-                        s.grid_row_lines.as_ref().and_then(|l| grid_lines(l, &[], explicit_rows)),
-                    );
-                    (span, (s.margin.top, s.margin.bottom), s.flex.align_self.unwrap_or(style.flex.align), s.grid_area)
-                }
-            };
-            items.push(GridItem { node: child, via, row: 0, col: 0, span, row_span: 1, area, margin, align, fixed, order });
+        let tracks = |value: &Option<String>| value.as_deref().and_then(|v| v.parse::<Tracks>().map_err(|_| crate::report::miss("css-value", &format!("grid tracks: {}", v.split('(').next().unwrap_or(v)))).ok());
+        if let Some(t) = tracks(&style.grid_columns) {
+            root.grid_template_columns = t.tracks.into_iter().collect();
+            root.grid_template_column_names = t.line_names.into_iter().map(|names| names.into_iter().collect()).collect();
         }
-        if items.is_empty() {
-            return 0.0;
+        if let Some(t) = tracks(&style.grid_rows) {
+            root.grid_template_rows = t.tracks.into_iter().collect();
+            root.grid_template_row_names = t.line_names.into_iter().map(|names| names.into_iter().collect()).collect();
         }
-
-        // Named placements reserve their cells before automatic placement,
-        // regardless of the order in which elements occur in the document.
-        items.sort_by_key(|i| i.order);
-        // explicit lines past the template add implicit (auto) columns
-        let widest = items.iter().filter_map(|i| i.fixed.0.map(|(c, n)| c + n)).max().unwrap_or(0);
-        if widest > columns {
-            tracks.resize(widest, Track::Auto);
-            columns = widest;
-        }
-        let mut occupied = std::collections::HashSet::new();
-        let mut placed = vec![false; items.len()];
-        for (i, item) in items.iter_mut().enumerate() {
-            if let Some(&(r0, c0, r1, c1)) = item.area.as_deref().and_then(|name| named.get(name)) {
-                item.row = r0; item.col = c0; item.span = c1 - c0; item.row_span = r1 - r0;
-                for r in r0..r1 { for c in c0..c1 { occupied.insert((r, c)); } }
-                placed[i] = true;
-            }
-        }
-        // then items with explicit lines (a fixed row and/or column)
-        for (i, item) in items.iter_mut().enumerate() {
-            if placed[i] || (item.fixed.0.is_none() && item.fixed.1.is_none()) { continue; }
-            let (c0, cs) = item.fixed.0.unwrap_or((usize::MAX, item.span));
-            let (r0, rs) = item.fixed.1.unwrap_or((usize::MAX, 1));
-            let free = |r: usize, c: usize, occ: &std::collections::HashSet<(usize, usize)>| (r..r + rs).all(|rr| (c..c + cs).all(|cc| !occ.contains(&(rr, cc))));
-            let (r, c) = match (r0 != usize::MAX, c0 != usize::MAX) {
-                (true, true) => (r0, c0),
-                (false, true) => ((0..).find(|&r| free(r, c0, &occupied)).unwrap_or(0), c0),
-                (true, false) => (r0, (0..columns.saturating_sub(cs) + 1).find(|&c| free(r0, c, &occupied)).unwrap_or(0)),
-                _ => unreachable!(),
-            };
-            item.row = r; item.col = c; item.span = cs.max(1); item.row_span = rs.max(1);
-            for rr in r..r + item.row_span { for cc in c..c + item.span { occupied.insert((rr, cc)); } }
-            placed[i] = true;
-        }
-        for (i, item) in items.iter_mut().enumerate() {
-            if placed[i] { continue; }
-            loop {
-                if col + item.span > columns { row += 1; col = 0; }
-                if (col..col + item.span).all(|c| !occupied.contains(&(row, c))) { break; }
-                col += 1;
-            }
-            item.row = row; item.col = col;
-            for c in col..col + item.span { occupied.insert((row, c)); }
-            col += item.span;
-            if col >= columns { row += 1; col = 0; }
-        }
-
-        // column widths: fixed tracks first, then auto (content), then fr shares
-        let gaps = col_gap * (columns - 1) as f32;
-        let mut widths = vec![0.0f32; columns];
-        let mut auto_need = vec![0.0f32; columns];
-        let mut auto_min = vec![0.0f32; columns];
-        for item in items.iter().filter(|i| i.span == 1) {
-            if matches!(tracks[item.col], Track::Auto | Track::MinMax(_, MaxTrack::Auto)) {
-                let (anc, parent) = match &item.via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
-                let (wide, _) = self.item_page(item.node, anc, parent, 100_000.0, true);
-                let (narrow, _) = self.item_page(item.node, anc, parent, 1.0, true);
-                auto_need[item.col] = auto_need[item.col].max(self.extent(&wide));
-                auto_min[item.col] = auto_min[item.col].max(self.extent(&narrow));
-            }
-        }
-        let mut fr_total = 0.0;
-        let mut used = gaps;
-        for c in 0..columns {
-            match tracks[c] {
-                Track::Px(px) => widths[c] = px,
-                Track::Fr(fr) => fr_total += fr,
-                Track::MinMax(min, MaxTrack::Fr(fr)) => {
-                    widths[c] = min;
-                    fr_total += fr;
-                }
-                // starts at its minimum; grows toward the maximum below, from what is left
-                Track::MinMax(min, MaxTrack::Px(_)) => widths[c] = min,
-                Track::Auto | Track::MinMax(_, MaxTrack::Auto) => widths[c] = auto_need[c],
-            }
-            if !matches!(tracks[c], Track::Fr(_)) {
-                used += widths[c];
-            }
-        }
-        if used > width {
-            // too wide: shrink auto columns toward their min-content
-            let over = used - width;
-            let slack: f32 = (0..columns).filter(|c| matches!(tracks[*c], Track::Auto)).map(|c| widths[c] - auto_min[c]).sum();
-            if slack > 0.0 {
-                for c in (0..columns).filter(|c| matches!(tracks[*c], Track::Auto)) {
-                    let cut = over.min(slack) * (widths[c] - auto_min[c]) / slack;
-                    widths[c] -= cut;
-                    used -= cut;
-                }
-            }
-        }
-        // grow minmax(min, <length>) tracks toward their maximum with the free space
-        {
-            let mut free = (width - used).max(0.0);
-            let growable: Vec<usize> = (0..columns).filter(|c| matches!(tracks[*c], Track::MinMax(_, MaxTrack::Px(_)))).collect();
-            let mut rounds = 0;
-            while free > 0.5 && rounds < 8 {
-                rounds += 1;
-                let open: Vec<usize> = growable.iter().copied().filter(|c| matches!(tracks[*c], Track::MinMax(_, MaxTrack::Px(max)) if widths[*c] < max)).collect();
-                if open.is_empty() {
-                    break;
-                }
-                let share = free / open.len() as f32;
-                for c in open {
-                    if let Track::MinMax(_, MaxTrack::Px(max)) = tracks[c] {
-                        let add = share.min(max - widths[c]);
-                        widths[c] += add;
-                        used += add;
-                        free -= add;
+        let auto = |value: &Option<String>| value.as_deref().and_then(|v| v.parse::<taffy::GridAutoTracks>().ok()).map(|t| t.0.into_iter().collect());
+        if let Some(t) = auto(&style.grid_auto_columns) { root.grid_auto_columns = t; }
+        if let Some(t) = auto(&style.grid_auto_rows) { root.grid_auto_rows = t; }
+        if let Some(rows) = &style.grid_areas {
+            let mut bounds: Vec<(String, u16, u16, u16, u16)> = Vec::new();
+            for (r, row) in rows.iter().enumerate() {
+                for (c, name) in row.iter().enumerate().filter(|(_, n)| n.as_str() != ".") {
+                    let (r, c) = (r as u16 + 1, c as u16 + 1);
+                    match bounds.iter_mut().find(|b| &b.0 == name) {
+                        Some(b) => { b.1 = b.1.min(r); b.2 = b.2.max(r + 1); b.3 = b.3.min(c); b.4 = b.4.max(c + 1); }
+                        None => bounds.push((name.clone(), r, r + 1, c, c + 1)),
                     }
                 }
             }
+            root.grid_template_areas = Some(taffy::GridTemplateAreas {
+                areas: bounds.into_iter().map(|(name, row_start, row_end, column_start, column_end)| taffy::GridTemplateArea { name, row_start, row_end, column_start, column_end }).collect(),
+                row_count: rows.len() as u16,
+                column_count: rows.first().map_or(0, |r| r.len() as u16),
+            });
         }
-        if fr_total > 0.0 {
-            let room = (width - used).max(0.0);
-            for c in 0..columns {
-                match tracks[c] {
-                    Track::Fr(fr) => widths[c] = room * fr / fr_total,
-                    Track::MinMax(min, MaxTrack::Fr(fr)) => widths[c] = (min + (room - 0.0) * fr / fr_total - 0.0).max(min),
-                    _ => {}
-                }
-            }
-        }
-        let mut col_x = vec![0.0f32; columns + 1];
-        for c in 0..columns {
-            col_x[c + 1] = col_x[c] + widths[c] + col_gap;
-        }
-
-        // lay each item out in its cell; rows as tall as their tallest item
-        let rows = items.iter().map(|i| i.row + i.row_span).max().unwrap_or(1);
-        let mut laid: Vec<(Page, f32)> = Vec::with_capacity(items.len());
-        let mut row_h = vec![0.0f32; rows];
-        for item in &items {
-            let w = col_x[item.col + item.span] - col_x[item.col] - col_gap;
-            let (anc, parent) = match &item.via { Some((c, p)) => (c.as_slice(), p), None => (ancestors, style) };
-            let (page, h) = self.item_page(item.node, anc, parent, w.max(1.0), false);
-            if item.row_span == 1 { row_h[item.row] = row_h[item.row].max(h); }
-            laid.push((page, h));
-        }
-        for (item, (_, h)) in items.iter().zip(&laid).filter(|(item, _)| item.row_span > 1) {
-            let used = row_h[item.row..item.row + item.row_span].iter().sum::<f32>() + row_gap * (item.row_span - 1) as f32;
-            let extra = (h - used).max(0.0) / item.row_span as f32;
-            for row in &mut row_h[item.row..item.row + item.row_span] { *row += extra; }
-        }
-        // a grid with a definite height stretches its rows to fill it (align-content: normal)
-        if !self.measuring {
-            let chrome = if style.border_box { style.padding.vertical() + style.border.top + style.border.bottom } else { 0.0 };
-            if let Some(h) = style.height.or(style.min_height).map(|h| h - chrome) {
-                let used = row_h.iter().sum::<f32>() + row_gap * rows.saturating_sub(1) as f32;
-                if h > used + 0.5 && rows > 0 {
-                    let extra = (h - used) / rows as f32;
-                    for r in &mut row_h { *r += extra; }
-                }
-            }
-        }
-        let mut row_y = vec![0.0f32; rows + 1];
-        for r in 0..rows {
-            row_y[r + 1] = row_y[r] + row_h[r] + if r + 1 < rows { row_gap } else { 0.0 };
-        }
-        for (item, (mut page, h)) in items.iter().zip(laid) {
-            let area_height = row_h[item.row..item.row + item.row_span].iter().sum::<f32>() + row_gap * (item.row_span - 1) as f32;
-            let slack = area_height - h;
-            let dy = match item.align {
-                AlignItems::Center => slack / 2.0,
-                AlignItems::End => slack,
-                AlignItems::Stretch => {
-                    if slack > 0.0 && item.node.text.is_none() {
-                        stretch_box(&mut page, h, slack, item.margin.0, item.margin.1);
-                    }
-                    0.0
-                }
-                AlignItems::Start => 0.0,
-            };
-            self.paste(page, x + col_x[item.col], y + row_y[item.row] + dy);
-        }
-        row_y[rows]
+        self.run_taffy(node, ancestors, style, x, y, width, root, items, false)
     }
 }
 
@@ -3567,110 +3445,6 @@ fn descendants<'n>(node: &'n Node, tag: &str) -> Vec<&'n Node> {
         out.extend(descendants(child, tag));
     }
     out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum MaxTrack {
-    Px(f32),
-    Fr(f32),
-    Auto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Track {
-    Px(f32),
-    Fr(f32),
-    Auto,
-    MinMax(f32, MaxTrack),
-}
-
-/// `grid-template-columns` → tracks, with repeat() expanded against `width`.
-fn parse_tracks(value: &str, width: f32, gap: f32, font_size: f32) -> Vec<Track> {
-    fn split(value: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut depth = 0;
-        let mut current = String::new();
-        let mut line_name = false;
-        for c in value.chars() {
-            if c == '[' { line_name = true; continue; }
-            if c == ']' { line_name = false; continue; }
-            if line_name { continue; }
-            match c {
-                '(' => {
-                    depth += 1;
-                    current.push(c);
-                }
-                ')' => {
-                    depth -= 1;
-                    current.push(c);
-                }
-                c if c.is_whitespace() && depth == 0 => {
-                    if !current.is_empty() {
-                        out.push(std::mem::take(&mut current));
-                    }
-                }
-                c => current.push(c),
-            }
-        }
-        if !current.is_empty() {
-            out.push(current);
-        }
-        out
-    }
-    let one = |t: &str| -> Track {
-        let t = t.trim();
-        if let Some(fr) = t.strip_suffix("fr").and_then(|v| v.parse::<f32>().ok()) {
-            Track::Fr(fr)
-        } else if let Some(inner) = t.strip_prefix("minmax(").and_then(|v| v.strip_suffix(')')) {
-            let (lo, hi) = inner.split_once(',').unwrap_or((inner, "auto"));
-            let min = crate::style::parse_length(lo.trim(), font_size, width).unwrap_or(0.0);
-            let hi = hi.trim();
-            let max = if let Some(fr) = hi.strip_suffix("fr").and_then(|v| v.parse::<f32>().ok()) {
-                MaxTrack::Fr(fr)
-            } else if let Some(px) = crate::style::parse_length(hi, font_size, width) {
-                MaxTrack::Px(px)
-            } else {
-                MaxTrack::Auto
-            };
-            Track::MinMax(min, max)
-        } else if let Some(px) = crate::style::parse_length(t, font_size, width) {
-            Track::Px(px)
-        } else {
-            // auto, min-content, max-content, fit-content(): sized by content
-            Track::Auto
-        }
-    };
-    let mut tracks = Vec::new();
-    for token in split(value) {
-        if let Some(inner) = token.strip_prefix("repeat(").and_then(|v| v.strip_suffix(')')) {
-            let Some((count, list)) = inner.split_once(',') else { continue };
-            let list: Vec<Track> = split(list).iter().map(|t| one(t)).collect();
-            if list.is_empty() {
-                continue;
-            }
-            let n = match count.trim() {
-                "auto-fill" | "auto-fit" => {
-                    // as many as fit at their minimum size
-                    let min: f32 = list.iter().map(|t| match t {
-                        Track::Px(p) => *p,
-                        Track::MinMax(m, _) => *m,
-                        _ => 100.0,
-                    }).sum::<f32>().max(1.0);
-                    (((width + gap) / (min + gap)).floor() as usize).max(1)
-                }
-                n => n.parse::<usize>().unwrap_or(1).clamp(1, 64),
-            };
-            for _ in 0..n {
-                tracks.extend(list.iter().copied());
-            }
-        } else {
-            tracks.push(one(&token));
-        }
-    }
-    if tracks.is_empty() {
-        tracks.push(Track::Fr(1.0));
-    }
-    tracks
 }
 
 /// A copy of the tree with `::before` / `::after` children for the elements
@@ -3799,109 +3573,6 @@ fn content_text(value: &str, node: &Node) -> Option<String> {
         }
     }
     Some(out)
-}
-
-/// Line names of a track list (`[a b] 1fr [c] 2fr`): entry i names the line
-/// before track i (the last one, the end line).
-fn line_names(value: &str) -> Vec<Vec<String>> {
-    let mut lines: Vec<Vec<String>> = vec![Vec::new()];
-    let (mut depth, mut in_name) = (0i32, false);
-    let (mut name, mut token) = (String::new(), String::new());
-    let end_token = |token: &mut String, lines: &mut Vec<Vec<String>>| {
-        if token.is_empty() {
-            return;
-        }
-        let tracks = match token.strip_prefix("repeat(").and_then(|t| t.strip_suffix(')')) {
-            Some(inner) => {
-                let (count, list) = inner.split_once(',').unwrap_or(("1", ""));
-                let per = list.split_whitespace().filter(|t| !t.starts_with('[') && !t.ends_with(']')).count().max(1);
-                count.trim().parse::<usize>().unwrap_or(1).min(64) * per
-            }
-            None => 1,
-        };
-        for _ in 0..tracks {
-            lines.push(Vec::new());
-        }
-        token.clear();
-    };
-    for c in value.chars() {
-        if in_name {
-            if c == ']' {
-                let last = lines.last_mut().expect("one line at least");
-                last.extend(name.split_whitespace().map(str::to_string));
-                name.clear();
-                in_name = false;
-            } else {
-                name.push(c);
-            }
-            continue;
-        }
-        match c {
-            '[' if depth == 0 => {
-                end_token(&mut token, &mut lines);
-                in_name = true;
-            }
-            '(' => { depth += 1; token.push(c); }
-            ')' => { depth -= 1; token.push(c); }
-            c if c.is_whitespace() && depth == 0 => end_token(&mut token, &mut lines),
-            c => token.push(c),
-        }
-    }
-    end_token(&mut token, &mut lines);
-    lines
-}
-
-/// `grid-column` / `grid-row` (start, end) against the template's lines:
-/// (first track, span), or None for automatic placement. Numbers count from
-/// 1 (negative from the end), `span N`, line names and `area` (its
-/// `area-start` / `area-end` lines).
-fn grid_lines(pair: &(String, String), names: &[Vec<String>], tracks: usize) -> Option<(usize, usize)> {
-    enum P { Auto, Span(usize), Line(usize) }
-    let lines = tracks + 1;
-    let find = |ident: &str, edge: &str| -> Option<usize> {
-        names.iter().position(|n| n.iter().any(|x| x == ident))
-            .or_else(|| names.iter().position(|n| n.iter().any(|x| *x == format!("{ident}-{edge}"))))
-    };
-    let part = |text: &str, edge: &str| -> P {
-        let t = text.trim();
-        if t.is_empty() || t == "auto" {
-            return P::Auto;
-        }
-        if let Some(rest) = t.strip_prefix("span") {
-            return P::Span(rest.trim().parse::<usize>().unwrap_or(1).max(1));
-        }
-        if let Ok(n) = t.parse::<i64>() {
-            return match n {
-                0 => P::Auto,
-                n if n > 0 => P::Line((n - 1) as usize),
-                n => P::Line((lines as i64 + n).max(0) as usize),
-            };
-        }
-        let ident = t.split_whitespace().next().unwrap_or(t);
-        find(ident, edge).map(P::Line).unwrap_or(P::Auto)
-    };
-    let start = part(&pair.0, "start");
-    // `grid-column: name` alone ends at the name's end line
-    let end = match (&start, pair.1.trim()) {
-        (_, e) if e != "auto" && !e.is_empty() => part(e, "end"),
-        (P::Line(_), _) if !pair.0.trim().starts_with(|c: char| c.is_ascii_digit() || c == '-') && !pair.0.trim().starts_with("span") => {
-            let ident = pair.0.split_whitespace().next().unwrap_or("");
-            find(&format!("{ident}-end"), "end").map(P::Line).unwrap_or(P::Auto)
-        }
-        _ => P::Auto,
-    };
-    // no item spans more than this many tracks (a stray `-1` must not mean billions)
-    const MOST: usize = 1000;
-    let clamp = |(s, n): (usize, usize)| (s.min(MOST), n.clamp(1, MOST));
-    let placed = match (start, end) {
-        (P::Line(s), P::Line(e)) if e != s => Some((s.min(e), (s.max(e) - s.min(e)).max(1))),
-        (P::Line(s), P::Line(_)) | (P::Line(s), P::Auto) => Some((s, 1)),
-        (P::Line(s), P::Span(n)) => Some((s, n)),
-        (P::Span(n), P::Line(e)) => Some((e.saturating_sub(n), n.min(e.max(1)))),
-        (P::Auto, P::Line(e)) => Some((e.saturating_sub(1), 1)),
-        _ => None,
-    };
-    placed.map(clamp)
 }
 
 impl InlineItem {
@@ -4166,19 +3837,37 @@ mod tests {
     }
 
     #[test]
-    fn grid_lines_by_number_and_name() {
-        let names = line_names("[full-start] 1fr [content-start] 2fr [content-end] 1fr [full-end]");
-        assert_eq!(names.len(), 4);
-        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
-        assert_eq!(grid_lines(&pair("content", "auto"), &names, 3), Some((1, 1)));
-        assert_eq!(grid_lines(&pair("full", "auto"), &names, 3), Some((0, 3)));
-        assert_eq!(grid_lines(&pair("2", "-1"), &names, 3), Some((1, 2)));
-        assert_eq!(grid_lines(&pair("1", "span 2"), &names, 3), Some((0, 2)));
-        assert_eq!(grid_lines(&pair("auto", "auto"), &names, 3), None);
-        // rows without a template: `1 / -1` is one row, never billions
-        assert_eq!(grid_lines(&pair("1", "-1"), &[], 0), Some((0, 1)));
-        assert_eq!(grid_lines(&pair("span 999999", "auto"), &[], 0), None);
-        assert_eq!(grid_lines(&pair("2", "span 999999"), &[], 0), Some((1, 1000)));
+    fn grid_by_the_spec() {
+        let fonts = fonts();
+        let sheet = crate::css::Stylesheet::default();
+        let at = |html: &str, word: &str| {
+            let doc = parse_document(html);
+            let page = Layout::new(&fonts, &sheet, 800.0).build(&doc);
+            page.draws.iter().find_map(|d| match d { Draw::Text { x, baseline, text, .. } if text.contains(word) => Some((*x, *baseline)), _ => None }).unwrap()
+        };
+        // lines by name and number
+        let names = "<body style='margin:0'><div style='display:grid;width:800px;grid-template-columns:[full-start] 200px [content-start] 400px [content-end] 200px [full-end]'>";
+        let (x, _) = at(&format!("{names}<div style='grid-column:content'>mid</div></div></body>"), "mid");
+        assert!((x - 200.0).abs() < 1.0, "content area at {x}");
+        let (x, _) = at("<body style='margin:0'><div style='display:grid;width:800px;grid-template-columns:100px [content-start] 300px 300px [content-end] 100px'><div style='grid-column:content;display:flex;justify-content:flex-end'><span>end</span></div></div></body>", "end");
+        assert!(x > 650.0 && x < 700.0, "a named column spans content-start to content-end: {x}");
+        let (x, _) = at(&format!("{names}<div style='grid-column:-2 / -1'>last</div></div></body>"), "last");
+        assert!((x - 600.0).abs() < 1.0, "last column at {x}");
+        // grid-template-rows, in rem
+        let (_, y) = at("<body style='margin:0'><div style='display:grid;grid-template-rows:10rem auto'><div>one</div><div>two</div></div></body>", "two");
+        assert!(y > 160.0 && y < 185.0, "second row at {y}");
+        // grid-auto-flow: column fills down the explicit rows first
+        let (x, y) = at("<body style='margin:0'><div style='display:grid;grid-auto-flow:column;grid-template-rows:50px 50px;grid-auto-columns:100px'><div>a</div><div>b</div><div>c</div></div></body>", "c");
+        assert!((x - 100.0).abs() < 1.0 && y < 40.0, "third item at {x},{y}");
+        // areas with row sizes in the shorthand
+        let (x, y) = at("<body style='margin:0'><div style='display:grid;width:800px;grid-template:\"head head\" 60px \"nav main\" 1fr / 200px 1fr'><div style='grid-area:main'>body</div><div style='grid-area:head'>top</div></div></body>", "body");
+        assert!((x - 200.0).abs() < 1.0 && y > 60.0 && y < 90.0, "main area at {x},{y}");
+        // justify-content: normal stretches an auto column across the grid
+        let (x, _) = at("<body style='margin:0'><div style='display:grid;width:800px'><div style='display:flex;justify-content:center'><span>mid</span></div></div></body>", "mid");
+        assert!(x > 370.0 && x < 400.0, "centred text at {x}");
+        // a percentage width is of the grid area, not of the container
+        let (x, _) = at("<body style='margin:0'><div style='display:grid;width:800px;grid-template-columns:1fr 1fr'><div style='width:100%'>a</div><div>b</div></div></body>", "b");
+        assert!((x - 400.0).abs() < 1.0, "second column at {x}");
     }
 
     #[test]

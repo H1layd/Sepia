@@ -1325,7 +1325,7 @@ fn register(t: &mut Vec<(&'static str, usize, Native)>) {
             ("flex-wrap", if st.flex.wrap { "wrap".into() } else { "nowrap".into() }),
             ("flex-grow", format!("{}", st.flex.grow)), ("flex-shrink", format!("{}", st.flex.shrink)),
             ("align-items", match st.flex.align { AlignItems::Start => "flex-start", AlignItems::End => "flex-end", AlignItems::Center => "center", _ => "normal" }.into()),
-            ("justify-content", match st.flex.justify { Justify::Start => "normal", Justify::End => "flex-end", Justify::Center => "center", Justify::SpaceBetween => "space-between", Justify::SpaceAround => "space-around", Justify::SpaceEvenly => "space-evenly" }.into()),
+            ("justify-content", match st.flex.justify { Justify::Normal => "normal", Justify::Start => "flex-start", Justify::End => "flex-end", Justify::Center => "center", Justify::SpaceBetween => "space-between", Justify::SpaceAround => "space-around", Justify::SpaceEvenly => "space-evenly" }.into()),
             ("text-align", format!("{:?}", st.align).to_ascii_lowercase()),
             ("white-space", if st.pre { "pre".into() } else if st.nowrap { "nowrap".into() } else { "normal".into() }),
             ("overflow", if st.clip_x || st.clip_y { "hidden".into() } else { "visible".into() }),

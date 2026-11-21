@@ -23,7 +23,7 @@ gif = { version = "0.14", default-features = false, features = ["std"] }
 v8 = "=152.2.0"
 html5ever = "=0.40.1"
 selectors = "=0.43.0"
-taffy = { version = "=0.15.1", default-features = false, features = ["std", "flexbox", "grid", "taffy_tree", "content_size"] }
+taffy = { version = "=0.15.1", default-features = false, features = ["std", "flexbox", "grid", "taffy_tree", "content_size", "parse"] }
 cssparser = "0.38"
 precomputed-hash = "0.1"
 markup5ever_rcdom = "=0.40.1"

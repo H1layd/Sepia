@@ -8,7 +8,7 @@
 | 0 | Измерение | датчики отказов в движке (`report.rs`, `SEPIA_REPORT`), сбор по топу Tranco (`scripts/web-crawl.py`), WPT, бенчмарки | одна команда даёт рейтинг и цифры | датчики и сбор — есть; WPT — нет |
 | 1 | V8 вместо Boa | граница движка (`jsval.rs`: хост-функции на `Val`), адаптер V8 (крейт `v8`), модули и микрозадачи, оба движка за `SEPIA_JS`, удаление Boa | на V8 не меньше рабочих сайтов, GitHub за секунды | V8 — движок по умолчанию (`SEPIA_JS=boa` — запасной); Boa ещё не удалён |
 | 2 | Парсинг и стиль | html5ever, cssparser + selectors, вложенность CSS, `@layer`/`@container`, `calc`/`clamp`, современные цвета | отказы парсинга вне топ-20 рейтинга | html5ever, `@import` с условиями, селекторы (крейт `selectors` из Servo) и вложенность CSS — есть; `@layer`/`@container` — дальше |
-| 3 | Вёрстка | taffy (flex, grid), parley (текст, bidi, перенос), таблицы, float, sticky, overflow | медиана визуала по топ-1000 > 80 | — |
+| 3 | Вёрстка | taffy (flex, grid), parley (текст, bidi, перенос), таблицы, float, sticky, overflow | медиана визуала по топ-1000 > 80 | flex и grid — taffy; parley — дальше |
 | 4 | Отрисовка | z-index и контексты наложения, transform, filter, clip-path, resvg, GPU-композитинг (wgpu) | 60 FPS прокрутки, визуал > 85 | z-index — есть |
 | 5 | JS и DOM API | цикл событий по спеке, наблюдатели, Shadow DOM, хранилища, воркеры, WebGL | SPA работают, «нет API» вне топ-20 | — |
 | 6 | Медиа | video/audio (dav1d, openh264, symphonia), MSE | YouTube играет | — |
@@ -49,6 +49,7 @@
 - Сеть: не больше 6 соединений на хост и 32 через прокси, как в Chrome (прокси рвал десятки одновременных CONNECT — на theverge.com терялось 66 картинок).
 - Селекторы — крейт `selectors` (Servo/Firefox): `:has()`, `:is()`/`:not()` со сложными списками, `:nth-child(of S)`, `:host`/`::slotted()`/`::part()`; список с одним неверным селектором отбрасывается целиком, как в Chrome. Вложенность CSS (`&`, вложенные `@media`).
 - JS: настоящие интерфейсы платформы — `CSSStyleDeclaration`, `DOMTokenList`, `Navigator`/`Screen`/`Location`/`History` (свойства на прототипе, как в WebIDL), `MessagePort`, `FontFace`. Скрипт AdShield (theverge, bild.de, welt.de и сотни других) проверяет их нативность и стирал страницу.
+- Вёрстка flex и grid — крейт taffy (алгоритмы CSS Flexbox и CSS Grid): автоматический минимальный размер, `align-content`, reverse-направления; в сетке — шаблон строк, `grid-auto-rows`/`-columns`, `grid-auto-flow` (`dense`, `column`), именованные линии и области, `grid-area: a / b / c / d`, проценты от области. Элементы меряет наш движок; внутренние размеры — как в Chrome (без `flex-basis`, минимальный вклад `min-width` в сетке). A/B против тех же эталонов: медиана 65.6 → 67.2, GitHub +6.6, Guardian +2.2.
 - Картинки: выбор кандидата из `srcset`/`sizes` и `<picture><source>` как в браузере; абсолютно спозиционированные `<img>`/`<svg>` (Next.js `fill`) рисуются; CSS-размер главнее атрибутов `width`/`height`.
 
 Известные расхождения с эталоном Chrome, которые не про движок: эталон часто показывает окно согласия на cookies (Wired, Cloudflare), которого у нас нет — оценка таких сайтов занижена.

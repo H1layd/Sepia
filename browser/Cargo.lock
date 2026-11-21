@@ -694,6 +694,17 @@ dependencies = [
 
 [[package]]
 name = "cssparser"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c9cdaae01d5ed7882b04d795e7f752f46ff52d2fa3b50a20d28c464510bba98"
+dependencies = [
+ "dtoa-short",
+ "itoa",
+ "smallvec",
+]
+
+[[package]]
+name = "cssparser"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11119743ad110e8c1bdccd930d7f5c30c99e5fc76a7b63ec9807e84eef0c5f59"
@@ -2800,7 +2811,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "474a2075f58859e8482495e1a2ae9634754ee383ad09a3c4093b8d9a51910fa3"
 dependencies = [
  "bitflags 2.13.2",
- "cssparser",
+ "cssparser 0.38.0",
  "derive_more",
  "hashbrown 0.17.1",
  "log",
@@ -2823,7 +2834,7 @@ version = "0.1.0"
 dependencies = [
  "boa_engine",
  "brotli-decompressor",
- "cssparser",
+ "cssparser 0.38.0",
  "fontdue",
  "gif",
  "html5ever",
@@ -3181,6 +3192,7 @@ version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31f7bd2d97198df05186f93a3a3c306845f40e8b3c22bf9279cdd7e5cf5fea7d"
 dependencies = [
+ "cssparser 0.37.0",
  "serde",
  "slotmap",
  "smallvec",

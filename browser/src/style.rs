@@ -101,15 +101,6 @@ pub struct Shadow {
     pub color: Color,
 }
 
-/// Grid placement of an item: `grid-column: span n` or `1 / -1`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum GridSpan {
-    Auto,
-    Span(usize),
-    /// spans every column of its row
-    Full,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexDirection {
     Row,
@@ -120,6 +111,8 @@ pub enum FlexDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Justify {
+    /// `normal` (and `stretch`): start in flex, stretched auto tracks in grid
+    Normal,
     Start,
     End,
     Center,
@@ -168,7 +161,7 @@ impl Default for Flex {
         Flex {
             direction: FlexDirection::Row,
             wrap: false,
-            justify: Justify::Start,
+            justify: Justify::Normal,
             align: AlignItems::Stretch,
             row_gap: 0.0,
             column_gap: 0.0,
@@ -349,9 +342,14 @@ pub struct Style {
     pub object_pos: (BgPos, BgPos),
     /// a transform that moves the box a whole box-length or more off its place
     pub moved_away: bool,
-    /// grid-template-columns, resolved at layout (it needs the width)
+    /// grid-template-columns / -rows and grid-auto-columns / -rows as
+    /// written, lengths already in px (see `track_px`)
     pub grid_columns: Option<String>,
-    pub grid_span: GridSpan,
+    pub grid_rows: Option<String>,
+    pub grid_auto_columns: Option<String>,
+    pub grid_auto_rows: Option<String>,
+    /// grid-auto-flow: (column, dense)
+    pub grid_flow: (bool, bool),
     pub grid_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
     /// grid-column / grid-row as written (start, end): lines, names, spans
@@ -362,6 +360,12 @@ pub struct Style {
     pub order: i32,
     /// `height: N%` as a fraction, for when the base is only known at layout
     pub height_percent: Option<f32>,
+    /// width / min-width / max-width written as a plain percentage, as a
+    /// fraction: a grid item's percentages are of its grid area, which only
+    /// the grid layout knows
+    pub width_percent: Option<f32>,
+    pub min_width_percent: Option<f32>,
+    pub max_width_percent: Option<f32>,
     pub grid_row_lines: Option<(String, String)>,
     /// custom properties in scope (inherited), last definition wins
     pub vars: Arc<crate::css::Vars>,
@@ -456,14 +460,20 @@ impl Default for Style {
             object_pos: (BgPos::Frac(0.5), BgPos::Frac(0.5)),
             moved_away: false,
             grid_columns: None,
-            grid_span: GridSpan::Auto,
             grid_areas: None,
             grid_area: None,
             grid_column_lines: None,
             aspect_ratio: None,
             order: 0,
             height_percent: None,
+            width_percent: None,
+            min_width_percent: None,
+            max_width_percent: None,
             grid_row_lines: None,
+            grid_rows: None,
+            grid_auto_columns: None,
+            grid_auto_rows: None,
+            grid_flow: (false, false),
             vars: Arc::new(crate::css::Vars::default()),
             monospace: false,
             width_relative: false,
@@ -647,6 +657,28 @@ fn light_dark(value: &str, dark: bool) -> String {
 }
 
 /// A height-like length: percentages need a definite base, else none.
+/// `grid-row` / `grid-column`: (start, end). Without a `/`, a name is
+/// both ends (`grid-column: content` spans content-start to content-end);
+/// anything else leaves the end auto.
+fn grid_line_pair(value: &str) -> (String, String) {
+    match value.split_once('/') {
+        Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
+        None => {
+            let a = value.trim();
+            let first = a.chars().next().unwrap_or('0');
+            let second = a.chars().nth(1).unwrap_or('0');
+            let name = (first.is_alphabetic() || first == '_' || (first == '-' && !second.is_ascii_digit()))
+                && !a.starts_with("span") && a != "auto";
+            (a.to_string(), if name { a.to_string() } else { "auto".to_string() })
+        }
+    }
+}
+
+/// `N%` alone, as a fraction.
+fn plain_percent(value: &str) -> Option<f32> {
+    value.trim().strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()).map(|p| p / 100.0)
+}
+
 fn height_length(value: &str, font_size: f32) -> Option<f32> {
     if value.contains('%') {
         let base = PERCENT_HEIGHT_BASE.with(|b| b.get())?;
@@ -1413,6 +1445,11 @@ fn initial_value(name: &str, unset: bool) -> Option<&'static str> {
         "position" => "static",
         "opacity" | "flex-shrink" => "1",
         "overflow" | "overflow-x" | "overflow-y" => "visible",
+        "grid-area" | "grid-row" | "grid-column" | "grid-row-start" | "grid-row-end" | "grid-column-start" | "grid-column-end"
+        | "grid-auto-rows" | "grid-auto-columns" => "auto",
+        "grid-template-columns" | "grid-template-rows" | "grid-template-areas" | "grid-template" => "none",
+        "grid-auto-flow" => "row",
+        "justify-content" | "align-content" | "align-items" | "align-self" => "normal",
         // inherited properties: `unset` means inherit, which they already do
         "font-weight" | "font-style" if !unset => "normal",
         _ => return None,
@@ -1635,6 +1672,59 @@ fn parse_valign(value: &str) -> Option<VAlign> {
         "bottom" | "text-bottom" => Some(VAlign::Bottom),
         _ => None,
     }
+}
+
+/// A grid track list with every length other than px and % turned into px
+/// (em, rem, vw, calc() and the other math functions), which is what the
+/// layout's track parser reads. Line names in brackets are left alone.
+pub fn track_px(value: &str, font_size: f32, percent_base: f32) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let ident_before = |out: &str| out.chars().last().is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    while let Some(c) = rest.chars().next() {
+        if c == '[' {
+            let end = rest.find(']').map_or(rest.len(), |i| i + 1);
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        if !ident_before(&out) {
+            if let Some(f) = ["calc(", "min(", "max(", "clamp("].iter().find(|f| rest.starts_with(**f)) {
+                let mut depth = 0;
+                let mut end = rest.len();
+                for (i, ch) in rest.char_indices().skip(f.len() - 1) {
+                    match ch { '(' => depth += 1, ')' => { depth -= 1; if depth == 0 { end = i + 1; break; } } _ => {} }
+                }
+                let expr = &rest[..end];
+                match parse_length(expr, font_size, percent_base) {
+                    Some(px) => out.push_str(&format!("{px}px")),
+                    None => out.push_str(expr),
+                }
+                rest = &rest[end..];
+                continue;
+            }
+            if c.is_ascii_digit() || (c == '.' || c == '-' || c == '+') && rest[1..].starts_with(|d: char| d.is_ascii_digit() || d == '.') {
+                let num = rest.char_indices().skip(1).find(|(_, d)| !(d.is_ascii_digit() || *d == '.')).map_or(rest.len(), |(i, _)| i);
+                let unit = rest[num..].char_indices().find(|(_, d)| !(d.is_ascii_alphabetic() || *d == '%')).map_or(rest.len() - num, |(i, _)| i);
+                let token = &rest[..num + unit];
+                let unit_text = &rest[num..num + unit];
+                match unit_text {
+                    // a unitless 0 is a length (a repeat() count never is 0)
+                    "" if token.trim_start_matches(['+', '-']).chars().all(|d| d == '0' || d == '.') => out.push_str("0px"),
+                    "" | "px" | "fr" | "%" => out.push_str(token),
+                    _ => match parse_length(token, font_size, percent_base) {
+                        Some(px) => out.push_str(&format!("{px}px")),
+                        None => out.push_str(token),
+                    },
+                }
+                rest = &rest[num + unit..];
+                continue;
+            }
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 fn parse_grid_areas(value: &str) -> Option<Vec<Vec<String>>> {
@@ -1931,7 +2021,10 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "box-shadow" => style.shadow = parse_shadow(value, font_size),
         "min-height" => style.min_height = height_length(value, font_size),
         "max-height" => style.max_height = if value == "none" { None } else { height_length(value, font_size) },
-        "min-width" => style.min_width = parse_length(value, font_size, containing_width),
+        "min-width" => {
+            style.min_width = parse_length(value, font_size, containing_width);
+            style.min_width_percent = plain_percent(value);
+        }
         "box-sizing" => style.border_box = value == "border-box",
         "text-transform" => {
             style.text_transform = match value {
@@ -2089,7 +2182,11 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 });
         }
         "top" => style.top = parse_length(value, font_size, containing_width),
-        "grid-template-columns" => style.grid_columns = (value != "none").then(|| value.to_string()),
+        "grid-template-columns" => style.grid_columns = (value != "none").then(|| track_px(value, font_size, containing_width)),
+        "grid-template-rows" => style.grid_rows = (value != "none").then(|| track_px(value, font_size, containing_width)),
+        "grid-auto-columns" => style.grid_auto_columns = Some(track_px(value, font_size, containing_width)),
+        "grid-auto-rows" => style.grid_auto_rows = Some(track_px(value, font_size, containing_width)),
+        "grid-auto-flow" => style.grid_flow = (value.contains("column"), value.contains("dense")),
         "grid-template-areas" => {
             if value == "none" { style.grid_areas = None; }
             else if let Some(areas) = parse_grid_areas(value) { style.grid_areas = Some(areas); }
@@ -2098,7 +2195,28 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             if value == "none" {
                 style.grid_areas = None;
                 style.grid_columns = None;
+                style.grid_rows = None;
             } else if let Some(areas) = parse_grid_areas(value) {
+                // the sizes written after each area string are its row's
+                let mut sizes = Vec::new();
+                let mut quote = None;
+                let mut since = String::new();
+                let mut started = false;
+                for ch in value.split('/').next().unwrap_or("").chars() {
+                    match (quote, ch) {
+                        (Some(q), c) if c == q => { quote = None; since.clear(); }
+                        (Some(_), _) => {}
+                        (None, '\'' | '"') => {
+                            if started { sizes.push(std::mem::take(&mut since)); }
+                            started = true;
+                            quote = Some(ch);
+                        }
+                        (None, c) => since.push(c),
+                    }
+                }
+                sizes.push(since);
+                let rows: Vec<String> = sizes.iter().map(|s| { let t = s.trim(); if t.is_empty() { "auto".to_string() } else { t.to_string() } }).collect();
+                style.grid_rows = Some(track_px(&rows.join(" "), font_size, containing_width));
                 // A slash outside area strings separates rows from columns.
                 let mut quote = None;
                 let mut slash = None;
@@ -2110,14 +2228,41 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                         _ => {}
                     }
                 }
-                style.grid_columns = slash.map(|i| value[i + 1..].trim().to_string());
+                style.grid_columns = slash.map(|i| track_px(value[i + 1..].trim(), font_size, containing_width));
                 style.grid_areas = Some(areas);
-            } else if let Some((_, columns)) = value.split_once('/') {
-                // rows / columns, no areas: the columns are what we lay out by
-                if !columns.contains("auto-flow") {
-                    style.grid_columns = Some(columns.trim().to_string());
-                }
+            } else if let Some((rows, columns)) = value.split_once('/') {
+                // `rows / columns`, either side may be `auto-flow [dense] <auto sizes>`
+                let side = |text: &str, column: bool, style: &mut Style| {
+                    let text = text.trim();
+                    if let Some(rest) = text.strip_prefix("auto-flow").or_else(|| text.strip_prefix("dense auto-flow")) {
+                        let dense = text.contains("dense");
+                        let sizes = rest.trim().trim_start_matches("dense").trim();
+                        style.grid_flow = (column, dense);
+                        if !sizes.is_empty() {
+                            let sizes = track_px(sizes, font_size, containing_width);
+                            if column { style.grid_auto_columns = Some(sizes); } else { style.grid_auto_rows = Some(sizes); }
+                        }
+                    } else {
+                        let tracks = (text != "none").then(|| track_px(text, font_size, containing_width));
+                        if column { style.grid_columns = tracks; } else { style.grid_rows = tracks; }
+                    }
+                };
+                side(rows, false, style);
+                side(columns, true, style);
             }
+        }
+        "grid-area" if value.contains('/') => {
+            // row-start / column-start / row-end / column-end; an omitted
+            // part repeats its start when that is a name, else is auto
+            let parts: Vec<String> = value.split('/').map(|p| p.trim().to_string()).collect();
+            let ident = |v: &str| v.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '-') && !v.starts_with("span") && v != "auto";
+            let get = |i: usize, start: usize| parts.get(i).cloned().unwrap_or_else(|| if i != start && ident(&parts[start.min(parts.len() - 1)]) { parts[start.min(parts.len() - 1)].clone() } else { "auto".to_string() });
+            let row_start = parts[0].clone();
+            let column_start = parts.get(1).cloned().unwrap_or_else(|| if ident(&row_start) { row_start.clone() } else { "auto".to_string() });
+            style.grid_area = None;
+            style.grid_row_lines = Some((row_start, get(2, 0)));
+            let column_end = parts.get(3).cloned().unwrap_or_else(|| if ident(&column_start) { column_start.clone() } else { "auto".to_string() });
+            style.grid_column_lines = Some((column_start, column_end));
         }
         "grid-area" => {
             if value == "auto" { style.grid_area = None; }
@@ -2143,21 +2288,11 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
             } else if name.ends_with("-end") {
                 pair.1 = value.trim().to_string();
             } else {
-                let (a, b) = value.split_once('/').unwrap_or((value, "auto"));
-                *pair = (a.trim().to_string(), b.trim().to_string());
+                *pair = grid_line_pair(value);
             }
         }
         "grid-column" => {
-            let (a, b) = value.split_once('/').unwrap_or((value, "auto"));
-            style.grid_column_lines = (value.trim() != "auto").then(|| (a.trim().to_string(), b.trim().to_string()));
-            let v = value.replace(' ', "");
-            style.grid_span = if v == "1/-1" || v.ends_with("/-1") && v.starts_with('1') {
-                GridSpan::Full
-            } else if let Some(n) = v.strip_prefix("span").and_then(|n| n.split('/').next().and_then(|n| n.parse::<usize>().ok())) {
-                GridSpan::Span(n.max(1))
-            } else {
-                GridSpan::Auto
-            };
+            style.grid_column_lines = (value.trim() != "auto").then(|| grid_line_pair(value));
         }
         "font-size" => {
             if let Some(size) = parse_length(value, font_size, font_size) {
@@ -2196,7 +2331,8 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 "space-between" => Justify::SpaceBetween,
                 "space-around" => Justify::SpaceAround,
                 "space-evenly" => Justify::SpaceEvenly,
-                _ => Justify::Start,
+                "flex-start" | "start" | "left" => Justify::Start,
+                _ => Justify::Normal,
             }
         }
         "align-self" => {
@@ -2409,6 +2545,7 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
         "width" => {
             style.width = parse_length(value, font_size, containing_width);
             style.width_relative = value.contains('%') || value.contains("vw");
+            style.width_percent = plain_percent(value);
         }
         "height" => {
             style.height = height_length(value, font_size);
@@ -2434,7 +2571,10 @@ fn apply(style: &mut Style, name: &str, value: &str, containing_width: f32) {
                 style.text_indent = v;
             }
         }
-        "max-width" => style.max_width = if value == "none" { None } else { parse_length(value, font_size, containing_width) },
+        "max-width" => {
+            style.max_width = if value == "none" { None } else { parse_length(value, font_size, containing_width) };
+            style.max_width_percent = plain_percent(value);
+        }
         "white-space" => {
             style.pre = value == "pre" || value == "pre-wrap" || value == "break-spaces";
             style.nowrap = value == "nowrap" || value == "pre";
